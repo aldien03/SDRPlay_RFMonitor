@@ -20,7 +20,7 @@ export interface ApplicationRestartRequest {
   auditEntryHash: string;
 }
 
-export type RecoverySupervisorState = "live" | "requested" | "recovering" | "failed" | "lockout";
+export type RecoverySupervisorState = "live" | "requested" | "recovering" | "suppressed" | "failed" | "lockout";
 
 export interface RecoverySupervisorStatus {
   schemaVersion: 1;
@@ -46,6 +46,7 @@ export type RecoveryOperationOutcome =
   | "request-accepted"
   | "helper-pending"
   | "verified-recovery"
+  | "suppressed"
   | "cooldown"
   | "lockout"
   | "unavailable";
@@ -101,7 +102,7 @@ export async function readRecoverySupervisorStatus(
     if (
       raw.schemaVersion !== 1
       || !state
-      || !(["live", "requested", "recovering", "failed", "lockout"] as string[]).includes(state)
+      || !(["live", "requested", "recovering", "suppressed", "failed", "lockout"] as string[]).includes(state)
       || !reasonCode
       || !observedAt
       || (sourceValue !== "automatic" && sourceValue !== "manual")
@@ -161,6 +162,7 @@ export function recoveryOperationState(
     maxAttempts: status.maxAttempts,
   };
   if (status.state === "lockout") return { ...common, outcome: "lockout", retryAfterMs: delayUntil(status.lockoutUntil, now) };
+  if (status.state === "suppressed") return { ...common, outcome: "suppressed", retryAfterMs: delayUntil(status.nextAttemptAt, now) };
   if (status.state === "requested" || status.state === "recovering") return { ...common, outcome: "helper-pending", retryAfterMs: delayUntil(status.nextAttemptAt, now) };
   if (status.state === "failed") {
     if (status.nextAttemptAt) return { ...common, outcome: "cooldown", retryAfterMs: delayUntil(status.nextAttemptAt, now) };

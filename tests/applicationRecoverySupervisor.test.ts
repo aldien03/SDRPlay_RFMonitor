@@ -82,6 +82,7 @@ async function harness(mode: "manual" | "automatic" | "invalid-audit", systemctl
       RFMON_APPLICATION_MAX_RECOVERY_ATTEMPTS: "3",
       RFMON_APPLICATION_CONFIRM_ATTEMPTS: "1",
       RFMON_APPLICATION_CONFIRM_INTERVAL_SECONDS: "0",
+      RFMON_APPLICATION_STARTUP_GRACE_SECONDS: "0",
     },
   };
 }
@@ -167,6 +168,16 @@ describe("bounded RF Monitor application recovery", () => {
     expect(await status(files)).toMatchObject({ state: "live", reasonCode: "restart-already-observed", systemdResult: "success" });
   });
 
+  it("suppresses automatic restart while the host is under memory pressure", async () => {
+    const files = await harness("automatic");
+    const memoryState = path.join(files.root, "host-memory-state");
+    await writeFile(memoryState, "critical\n");
+    await run(files, { RFMON_HOST_MEMORY_STATE_FILE: memoryState });
+
+    expect(await readFile(files.calls, "utf8")).toBe("");
+    expect(await status(files)).toMatchObject({ state: "suppressed", reasonCode: "host-memory-pressure", attemptsInWindow: 0 });
+  });
+
   it("keeps the request and reports a bounded pending-job timeout when the new boot never appears", async () => {
     const files = await harness("manual", 0);
     const binSystemctl = path.join(files.root, "bin", "systemctl");
@@ -193,7 +204,7 @@ describe("bounded RF Monitor application recovery", () => {
     expect(service).toContain("StartLimitIntervalSec=3600");
     expect(service).toContain("StartLimitBurst=5");
     expect(service).toContain("Restart=on-failure");
-    expect(timer).toContain("OnCalendar=*-*-* *:*:00/15");
+    expect(timer).toContain("OnCalendar=*-*-* *:*:00,30");
     expect(timer).toContain("Persistent=true");
     const watchdog = await readFile(path.join(repositoryRoot, "deploy/recover-application.sh"), "utf8");
     expect(watchdog).toContain('RFMON_APPLICATION_STALE_CHECKS_BEFORE_RECOVERY:-2');
@@ -202,6 +213,9 @@ describe("bounded RF Monitor application recovery", () => {
     expect(watchdogUnit).toContain("Group=@@SERVICE_GROUP@@");
     expect(watchdogUnit).toContain("TimeoutStartSec=150s");
     expect(watchdog).toContain("RFMON_APPLICATION_CONFIRM_ATTEMPTS:-30");
+    expect(watchdog).toContain("RFMON_APPLICATION_STARTUP_GRACE_SECONDS:-60");
+    expect(watchdog).toContain("host-memory-pressure");
+    expect(watchdog).toContain("flock --nonblock");
     expect(watchdog).toContain("systemctl --no-block restart rf-monitor.service");
   });
 });

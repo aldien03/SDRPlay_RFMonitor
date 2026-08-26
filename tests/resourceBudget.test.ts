@@ -78,8 +78,8 @@ describe("bounded streaming resources", () => {
       reasons: ["rss-pressure"],
       admitLiveClients: false,
       admitExports: false,
-      maxDashboardRateHz: 2,
-      dashboardsStatusOnly: false,
+      maxDashboardRateHz: 0.2,
+      dashboardsStatusOnly: true,
       preserveMonitoringPipeline: true,
     });
     expect(controller.update(healthySample({ rssBytes: RESOURCE_LIMITS.criticalRssBytes }), 2)).toMatchObject({

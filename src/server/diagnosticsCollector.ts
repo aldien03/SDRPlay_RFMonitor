@@ -538,6 +538,9 @@ export class DiagnosticsCollector {
     const hostCpu = this.metrics.hostCpu.snapshot(at);
     const processCpu = this.metrics.processHostNormalized.snapshot(at);
     const runtime = this.runtime;
+    if (runtime?.resources.hostMemory?.state === "critical") add({ id: "host-memory-critical", code: "host-memory-critical", severity: "critical", subsystem: "software", action: "open-system-health" });
+    else if (runtime?.resources.hostMemory?.state === "pressure") add({ id: "host-memory-pressure", code: "host-memory-pressure", severity: "attention", subsystem: "software", action: "open-system-health" });
+    if ((runtime?.streaming.clients ?? 0) >= 4 && (runtime?.streaming.hiddenClients ?? 0) >= 2) add({ id: "multiple-dashboards", code: "multiple-dashboards", severity: "attention", subsystem: "software", value: runtime?.streaming.clients, threshold: 3, unit: "count", action: "open-system-health" });
     if (runtime?.resources.state === "critical") add({ id: "resource-critical", code: "resource-critical", severity: "critical", subsystem: "software", action: "open-system-health" });
     const sustainedHostSample = hostCpu.sampleCount >= 55;
     const sustainedProcessSample = processCpu.sampleCount >= 55;

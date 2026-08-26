@@ -165,7 +165,10 @@ export type ResourcePressureReason =
   | "writer-queue-pressure"
   | "writer-latency-critical"
   | "event-loop-pressure"
-  | "disk-reserve-critical";
+  | "disk-reserve-critical"
+  | "host-memory-pressure"
+  | "host-memory-critical"
+  | "host-oom-kill";
 
 export interface ResourceBudgetSample {
   rssBytes: number;
@@ -176,6 +179,8 @@ export interface ResourceBudgetSample {
   writerOldestAgeMs: number;
   eventLoopDelayP99Ms: number;
   diskBelowReserve: boolean;
+  hostMemoryState?: "normal" | "pressure" | "critical" | "unknown";
+  recentOomKill?: boolean;
 }
 
 export interface ResourceBudgetPolicy {
@@ -185,7 +190,7 @@ export interface ResourceBudgetPolicy {
   admitLiveClients: boolean;
   /** Applies to both new export builds and new download leases. */
   admitExports: boolean;
-  maxDashboardRateHz: 2 | 4;
+  maxDashboardRateHz: 0.2 | 2 | 4;
   dashboardsStatusOnly: boolean;
   /** Acquisition, detection, scheduling, and evidence always retain priority. */
   preserveMonitoringPipeline: true;
@@ -232,6 +237,9 @@ export class ResourceBudgetController {
     if (sample.externalBytes >= RESOURCE_LIMITS.pressureExternalBytes) reasons.add("external-buffer-pressure");
     if (sample.writerOldestAgeMs >= RESOURCE_LIMITS.criticalWriterOldestAgeMs) reasons.add("writer-latency-critical");
     if (sample.diskBelowReserve) reasons.add("disk-reserve-critical");
+    if (sample.hostMemoryState === "critical") reasons.add("host-memory-critical");
+    else if (sample.hostMemoryState === "pressure") reasons.add("host-memory-pressure");
+    if (sample.recentOomKill) reasons.add("host-oom-kill");
 
     const writerPressure = sample.writerQueueItems >= RESOURCE_LIMITS.pressureWriterQueueItems
       || sample.writerQueueBytes >= RESOURCE_LIMITS.pressureWriterQueueBytes;
@@ -248,6 +256,8 @@ export class ResourceBudgetController {
     const rawState: ResourcePressureState = reasons.has("rss-critical")
       || reasons.has("writer-latency-critical")
       || reasons.has("disk-reserve-critical")
+      || reasons.has("host-memory-critical")
+      || reasons.has("host-oom-kill")
       ? "critical"
       : reasons.size
         ? "pressure"
@@ -282,8 +292,8 @@ export class ResourceBudgetController {
       reasons: [...this.reasons],
       admitLiveClients: this.state === "normal",
       admitExports: this.state === "normal",
-      maxDashboardRateHz: this.state === "normal" ? 4 : 2,
-      dashboardsStatusOnly: this.state === "critical",
+      maxDashboardRateHz: this.state === "normal" ? 4 : 0.2,
+      dashboardsStatusOnly: this.state !== "normal",
       preserveMonitoringPipeline: true,
       enteredAt: this.enteredAt,
       healthySince,

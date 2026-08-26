@@ -130,6 +130,9 @@ const ISSUE_TITLES: Record<string, string> = {
   "evidence-unavailable": "Recording is unavailable",
   "host-cpu-event-loop-critical": "Computer is overloaded",
   "host-cpu-high": "Computer CPU is high",
+  "host-memory-pressure": "Computer memory is low",
+  "host-memory-critical": "Computer memory is low",
+  "multiple-dashboards": "Multiple dashboards open",
   "host-network-interface-unavailable": "Network connection is unavailable",
   "network-interface-errors-or-drops": "Network data was dropped",
   "receiver-path-unavailable": "Receiver data stopped",
@@ -173,6 +176,9 @@ const ISSUE_FAMILY: Record<string, DiagnosticIssueFamily> = {
   "receiver-overload": "overload",
   "host-cpu-event-loop-critical": "system",
   "host-cpu-high": "system",
+  "host-memory-pressure": "system",
+  "host-memory-critical": "system",
+  "multiple-dashboards": "system",
   "resource-critical": "system",
   "rf-monitor-cpu-high": "system",
   "signal-learning-paused": "learning",
@@ -294,6 +300,8 @@ function issueStatus(issues: readonly DiagnosticIssue[], cardId: DiagnosticCardI
 }
 
 function issueDetail(issue: HealthDiagnosticIssue): string | undefined {
+  if (issue.code === "host-memory-pressure" || issue.code === "host-memory-critical") return "Close unused browser tabs.";
+  if (issue.code === "multiple-dashboards") return `${issue.value ?? 0} dashboards open. Close unused tabs.`;
   const parts: string[] = [];
   const render = (value: number): string => {
     if (issue.code === "sample-rate-mismatch") return `${(value / 1_000_000).toFixed(1).replace(/\.0$/, "")} MHz`;
@@ -602,6 +610,17 @@ function softwareCard(health: HealthSnapshotV2, issues: readonly DiagnosticIssue
     { id: "sdr-collector", label: "SDRconnect collector", value: simulation ? "Not tested" : availabilityValue(data.sdrconnect.availability), status: simulation ? "not-tested" : availabilityStatus(data.sdrconnect.availability) },
     { id: "sdr-resources", label: "SDRconnect CPU / memory", value: simulation ? "Not tested" : data.sdrconnect.cpuCoreEquivalent ? `${metricValue(data.sdrconnect.cpuCoreEquivalent)} · ${formatBytes(data.sdrconnect.memoryBytes)}` : formatBytes(data.sdrconnect.memoryBytes), status: simulation ? "not-tested" : undefined },
   ];
+  if (data.hostMemory) rows.push(
+    { id: "host-memory-state", label: "Host memory", value: humanize(data.hostMemory.state), status: data.hostMemory.state === "critical" ? "critical" : data.hostMemory.state === "pressure" ? "warning" : data.hostMemory.state === "normal" ? "healthy" : "unknown", detail: `${formatBytes(data.hostMemory.availableBytes)} available · swap ${formatBytes(data.hostMemory.swapFreeBytes)} free` },
+    { id: "host-memory-psi", label: "Memory pressure (10 s)", value: `some ${data.hostMemory.psiSomeAvg10?.toFixed(2) ?? "--"}% · full ${data.hostMemory.psiFullAvg10?.toFixed(2) ?? "--"}%`, detail: data.hostMemory.reasonCodes.join(", ") || "No pressure reason" },
+  );
+  for (const incident of data.stabilityIncidents ?? []) rows.push({
+    id: `stability-${incident.id}`,
+    label: `Stability: ${humanize(incident.kind)}`,
+    value: humanize(incident.state),
+    status: incident.state === "active" ? incident.severity === "critical" ? "critical" : "warning" : "healthy",
+    detail: `${new Date(incident.updatedAt).toLocaleString()} · ${incident.reasonCodes.join(", ") || "resolved"}`,
+  });
   return { id: "software", title: "Software and memory", summary: "RF Monitor, host, event loop, and SDRconnect resource use.", status: issueStatus(issues, "software", "healthy"), rows };
 }
 
@@ -624,6 +643,12 @@ function networkCard(health: HealthSnapshotV2, issues: readonly DiagnosticIssue[
       { id: `${nic.id}-drops`, label: `NIC ${nic.id} drops`, value: `RX ${counterValue(nic.receiveDrops)} · TX ${counterValue(nic.transmitDrops)}`, status: nic.receiveDrops.delta60s > 0 || nic.transmitDrops.delta60s > 0 ? "warning" : "healthy" },
     );
   }
+  for (const client of data.clients ?? []) rows.push({
+    id: `dashboard-${client.id}`,
+    label: client.id,
+    value: `${humanize(client.visibility)} · ${client.rateHz} Hz · ${client.targetCount} feeds`,
+    detail: `${formatDuration(client.ageMs)} open · ${formatBytes(client.queuedBytes)} queued${client.lastDeliveredFrameAt ? ` · last frame ${new Date(client.lastDeliveredFrameAt).toLocaleTimeString()}` : ""}`,
+  });
   if (!data.interfaces.length) rows.push({ id: "no-interfaces", label: "Host interfaces", value: "No interface sample", status: availabilityStatus(data.hostCollector) });
   return { id: "network", title: "Network and NIC", summary: "Application egress, client pressure, host NICs, and managed-switch availability.", status: issueStatus(issues, "network", availabilityStatus(data.hostCollector)), rows };
 }
@@ -715,7 +740,7 @@ function recoveryNotice(health: HealthSnapshotV2): DiagnosticRecoveryNotice | un
   const candidates = ([
     ["receiver", health.recovery.receiver],
     ["software", health.recovery.application],
-  ] as const).filter(([, operation]) => operation.requestId || operation.requestedAt);
+  ] as const).filter(([, operation]) => operation.requestId || operation.requestedAt || operation.outcome === "suppressed" || operation.outcome === "lockout");
   const selected = [...candidates].sort((left, right) => (right[1].requestedAt ?? "").localeCompare(left[1].requestedAt ?? ""))[0];
   if (!selected) return undefined;
   const [kind, operation] = selected;
@@ -730,6 +755,12 @@ function recoveryNotice(health: HealthSnapshotV2): DiagnosticRecoveryNotice | un
     state: "verified",
     label: kind === "receiver" ? "Receiver retry verified" : "Software restart verified",
     detail: kind === "receiver" ? "Fresh RF data confirmed recovery." : "New service boot confirmed. Check RF data and Recording before closing.",
+  };
+  if (operation.outcome === "suppressed") return {
+    kind,
+    state: "attention",
+    label: operation.reasonCode === "host-memory-pressure" ? "Recovery paused" : kind === "receiver" ? "Receiver starting" : "Recovery paused",
+    detail: operation.reasonCode === "host-memory-pressure" ? "Waiting for computer memory." : "Wait.",
   };
   return {
     kind,

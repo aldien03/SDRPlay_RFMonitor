@@ -181,6 +181,14 @@ describe("health API v2", () => {
     const eightClientHealth = await fetch(`${origin}/api/health`).then((result) => result.json()) as HealthSnapshotV2;
     expect(eightClientHealth.network.dashboards).toBe(8);
     expect(eightClientHealth.network.queuedBytes).toBeLessThanOrEqual(8 * 256 * 1024);
+    expect(eightClientHealth.network.clients).toHaveLength(8);
+    expect(eightClientHealth.network.clients?.[0]).toMatchObject({
+      id: expect.stringMatching(/^dashboard-\d+$/),
+      visibility: "visible",
+      rateHz: 2,
+      bufferedBytes: expect.any(Number),
+      queuedBytes: expect.any(Number),
+    });
 
     const ninth = new WebSocket(`ws://127.0.0.1:${port}/live`, { headers: { Origin: origin } });
     const rejectedStatus = await new Promise<number>((resolve, reject) => {

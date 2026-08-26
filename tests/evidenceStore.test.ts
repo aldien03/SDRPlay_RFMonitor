@@ -824,7 +824,10 @@ describe("evidence store", { timeout: 60_000 }, () => {
     // A second store represents the next process after an unclean stop. There
     // are no retained descriptors or open file handles in EvidenceStore itself.
     const recoveredStore = new EvidenceStore(root);
-    const replacement = await recoveredStore.initialize({ config: { process: "new" }, sdrconnect: {} });
+    const replacement = await recoveredStore.initialize(
+      { config: { process: "new" }, sdrconnect: {} },
+      { cause: "application-recovery", at: "2026-08-26T08:18:14.000Z" },
+    );
     expect(replacement.id).not.toBe(interrupted.id);
     const recoveredEvents = await recoveredStore.listSessionEvents(interrupted.id);
     expect(recoveredEvents[0]).toMatchObject({
@@ -833,8 +836,14 @@ describe("evidence store", { timeout: 60_000 }, () => {
       endReason: "service-restart",
       endedAt: expect.any(String),
     });
-    expect(await readFile(path.join(interrupted.path, "operations.jsonl"), "utf8")).toContain('"evidenceGap":true');
-    expect(JSON.parse(await readFile(path.join(interrupted.path, "session.json"), "utf8"))).toMatchObject({ status: "closed" });
+    const operations = await readFile(path.join(interrupted.path, "operations.jsonl"), "utf8");
+    expect(operations).toContain('"evidenceGap":true');
+    expect(operations).toContain('"interruptionCause":"application-recovery"');
+    expect(JSON.parse(await readFile(path.join(interrupted.path, "session.json"), "utf8"))).toMatchObject({
+      status: "closed",
+      lifecycle: "Incomplete",
+      incompleteReasons: expect.arrayContaining(["interruption:application-recovery"]),
+    });
     await recoveredStore.closeActive();
   });
 

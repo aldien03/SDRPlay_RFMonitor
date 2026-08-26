@@ -79,6 +79,7 @@ async function createHarness(curlMode: "offline" | "recovers", systemctlExit: nu
       RFMON_MAX_RECOVERY_ATTEMPTS: "3",
       RFMON_RECOVERY_CONFIRM_ATTEMPTS: "1",
       RFMON_RECOVERY_CONFIRM_INTERVAL_SECONDS: "0",
+      RFMON_RECEIVER_STARTUP_GRACE_SECONDS: "0",
     },
   };
 }
@@ -200,6 +201,35 @@ describe("bounded SDRconnect recovery supervisor", () => {
     expect(await status(harness)).toMatchObject({ state: "failed", reasonCode: "invalid-request-file", requestRetained: false });
   });
 
+  it("suppresses automatic receiver recovery while host memory is pressured", async () => {
+    const harness = await createHarness("offline", 0);
+    await unlink(harness.requestFile);
+    const memoryState = path.join(harness.root, "host-memory-state");
+    await writeFile(memoryState, "pressure\n");
+    await runRecovery(harness, { RFMON_HOST_MEMORY_STATE_FILE: memoryState });
+
+    expect(await readFile(harness.systemctlCalls, "utf8")).toBe("");
+    expect(await status(harness)).toMatchObject({ state: "suppressed", reasonCode: "host-memory-pressure", attemptsInWindow: 0 });
+  });
+
+  it("resets stale state and waits through a new SDRconnect process epoch", async () => {
+    const harness = await createHarness("offline", 0);
+    const systemctl = path.join(harness.root, "bin", "systemctl");
+    await executable(systemctl, [
+      "#!/usr/bin/env bash",
+      "case \"$*\" in",
+      "  *--property=MainPID*) printf '4321\\n' ;;",
+      "  *--property=ActiveEnterTimestamp*) date '+%Y-%m-%d %H:%M:%S %Z' ;;",
+      "  *) printf '%s\\n' \"$*\" >> \"${MOCK_SYSTEMCTL_CALLS}\" ;;",
+      "esac",
+    ]);
+    await runRecovery(harness, { RFMON_RECEIVER_STARTUP_GRACE_SECONDS: "90" });
+
+    expect(await readFile(harness.systemctlCalls, "utf8")).toBe("");
+    expect(await status(harness)).toMatchObject({ state: "suppressed", reasonCode: "receiver-startup-grace", attemptsInWindow: 0 });
+    expect(await readFile(path.join(harness.stateDir, "process-epoch"), "utf8")).toContain("4321|");
+  });
+
   it("retains an accepted request when systemd rejects the restart", async () => {
     const harness = await createHarness("offline", 1);
 
@@ -310,7 +340,7 @@ describe("recovery deployment contract", () => {
     const installer = await readFile(path.join(repositoryRoot, "deploy/install-ubuntu.sh"), "utf8");
     const serviceSection = installer.slice(installer.indexOf('say "Enabling UTC clock synchronization and services"'));
 
-    expect(timer).toContain("OnCalendar=*-*-* *:*:00/15");
+    expect(timer).toContain("OnCalendar=*-*-* *:*:15,45");
     expect(timer).toContain("Persistent=true");
     expect(timer).not.toContain("OnUnitActiveSec=");
     expect(doctor).toContain("verify-recovery-supervisor.sh");
@@ -322,5 +352,7 @@ describe("recovery deployment contract", () => {
     expect(serviceSection).toContain('--minimum-status-epoch "${recovery_first_trigger_epoch}"');
     expect(serviceSection).toContain("--wait-status 30");
     expect(await readFile(recoveryScript, "utf8")).toContain("RFMON_STALE_CHECKS_BEFORE_RECOVERY:-2");
+    expect(await readFile(recoveryScript, "utf8")).toContain("RFMON_RECEIVER_STARTUP_GRACE_SECONDS:-90");
+    expect(await readFile(recoveryScript, "utf8")).toContain("flock --nonblock");
   });
 });

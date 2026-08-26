@@ -17,6 +17,7 @@ import { AdminAuth, AdminAuthenticationError } from "./adminAuth";
 import { loadConfig, withOperationalSettings } from "./config";
 import { BaselineApprovalUnavailableError, CommittedBaselineRestartRecoveryError, MonitorService } from "./monitorService";
 import { ConcurrentRequestGate, OutboundTrafficMeter, ResourceBudgetController, TokenBucket } from "./resourceBudget";
+import { HostMemoryController } from "./hostMemory";
 import { RevisionConflictError, SettingsStore } from "./settingsStore";
 import { BaselineConflictError, BaselineNotReviewableError } from "./baselineStore";
 import { ExportJobQueue, ExportProtectedBytesError, ExportQueueFullError } from "./exportJobQueue";
@@ -47,6 +48,7 @@ import {
 import type { SyntheticRunMode } from "../shared/syntheticValidation";
 import { detectorQualificationPlan } from "../shared/detectorQualification";
 import { sha256Canonical } from "./syntheticValidation";
+import { StabilityIncidentStore } from "./stabilityIncidentStore";
 
 const streamingStartedAt = Date.now();
 const streamingCounters = {
@@ -62,6 +64,7 @@ const streamingCounters = {
 const outboundTraffic = new OutboundTrafficMeter();
 const globalLiveBudget = new TokenBucket(1024 * 1024, 2 * 1024 * 1024);
 const resourceBudget = new ResourceBudgetController();
+const hostMemoryController = new HostMemoryController();
 const MAX_LIVE_CLIENTS = 8;
 const MAX_NORMAL_HTTP_REQUESTS = 64;
 const normalHttpGate = new ConcurrentRequestGate(MAX_NORMAL_HTTP_REQUESTS);
@@ -71,6 +74,7 @@ const MAX_CONTROL_STATE_BYTES = 128 * 1024;
 const MAX_SYNTHETIC_VALIDATION_RESPONSE_BYTES = 64 * 1024;
 const screenshotBodyGate = new ScreenshotBodyGate();
 let liveControlSequence = 0;
+let liveClientSequence = 0;
 
 function nextLiveControlSequence(): number {
   if (liveControlSequence >= Number.MAX_SAFE_INTEGER) {
@@ -96,6 +100,7 @@ let resourceHealthCache: { at: number; value: ResourceHealth } | undefined;
 let eventLoopSampleTimer: NodeJS.Timeout;
 
 let config = await loadConfig();
+const stabilityIncidents = await StabilityIncidentStore.open(path.join(config.dataRoots.field.root, "stability-incidents.jsonl"));
 const settingsStore = await SettingsStore.create({
   settings: config.operationalSettings,
   catalog: config.bandCatalog,
@@ -339,6 +344,17 @@ async function refreshRecoverySupervisorState(): Promise<void> {
     receiverRecoveryStatus = receiver;
     applicationRecoveryStatus = application;
     if (receiver.availability === "available" && receiver.fresh) monitor.noteRecoverySupervisorStatus(receiver.status);
+    if (application.availability === "available" && application.fresh) monitor.noteApplicationRecoverySupervisorStatus(application.status);
+    if (receiver.availability === "available" && receiver.fresh) {
+      const active = receiver.status.state !== "live";
+      stabilityIncidents.note("receiver-recovery", active, receiver.status.state === "lockout" ? "critical" : "attention", [receiver.status.reasonCode]);
+      stabilityIncidents.note("recovery-lockout", receiver.status.state === "lockout", "critical", [receiver.status.reasonCode]);
+    }
+    if (application.availability === "available" && application.fresh) {
+      const active = application.status.state !== "live";
+      stabilityIncidents.note("application-recovery", active, application.status.state === "lockout" ? "critical" : "attention", [application.status.reasonCode]);
+      if (application.status.state === "lockout") stabilityIncidents.note("recovery-lockout", true, "critical", [application.status.reasonCode]);
+    }
   })().finally(() => { recoveryStatusRefreshInFlight = undefined; });
   return recoveryStatusRefreshInFlight;
 }
@@ -355,6 +371,7 @@ function currentResourceHealth(): ResourceHealth {
   const currentP99 = eventLoopHistogram.percentile(99) / 1_000_000;
   const p50Ms = Math.max(Number.isFinite(currentP50) ? currentP50 : 0, ...eventLoopSamples.map((sample) => sample.p50Ms), 0);
   const p99Ms = Math.max(Number.isFinite(currentP99) ? currentP99 : 0, ...eventLoopSamples.map((sample) => sample.p99Ms), 0);
+  const hostMemory = hostMemoryController.sample(now);
   const policy = resourceBudget.update({
     rssBytes: memory.rss,
     heapUtilization,
@@ -364,7 +381,19 @@ function currentResourceHealth(): ResourceHealth {
     writerOldestAgeMs: writer.oldestAgeMs,
     eventLoopDelayP99Ms: p99Ms,
     diskBelowReserve: storage.availableBytes !== undefined && storage.availableBytes < storage.minimumFreeBytes,
+    hostMemoryState: hostMemory.state,
+    recentOomKill: hostMemory.recentOomKill,
   }, now);
+  const hostPressure = hostMemory.state === "pressure" || hostMemory.state === "critical";
+  stabilityIncidents.note(
+    hostMemory.recentOomKill ? "oom-kill" : "host-memory-pressure",
+    hostPressure,
+    hostMemory.state === "critical" ? "critical" : "attention",
+    hostMemory.reasonCodes,
+    new Date(now),
+  );
+  if (!hostMemory.recentOomKill) stabilityIncidents.note("oom-kill", false, "critical", [], new Date(now));
+  if (!hostPressure) stabilityIncidents.note("host-memory-pressure", false, "attention", [], new Date(now));
   const value: ResourceHealth = {
     state: policy.state,
     reasonCodes: policy.reasons,
@@ -389,6 +418,7 @@ function currentResourceHealth(): ResourceHealth {
     admitLiveClients: policy.admitLiveClients,
     admitExports: policy.admitExports,
     maxDashboardRateHz: policy.maxDashboardRateHz,
+    hostMemory,
     pressureEnteredAt: new Date(policy.enteredAt).toISOString(),
     healthySince: policy.healthySince === undefined ? undefined : new Date(policy.healthySince).toISOString(),
   };
@@ -558,6 +588,8 @@ function streamingHealth(clientCount: number): StreamingHealth {
     outboundBytesPerSecond10s: traffic.liveBytesPerSecond10s,
     outboundBytesPerSecond60s: traffic.liveBytesPerSecond60s,
     startedAt: new Date(streamingStartedAt).toISOString(),
+    visibleClients: [...liveClients.values()].filter((client) => client.subscription.rateHz !== 0.2).length,
+    hiddenClients: [...liveClients.values()].filter((client) => client.subscription.rateHz === 0.2).length,
   };
 }
 
@@ -725,6 +757,8 @@ function healthResponse(): HealthSnapshotV2 & Record<string, unknown> {
       eventLoopDelayP50Ms: resources.eventLoopDelayP50Ms,
       eventLoopDelayP99Ms: resources.eventLoopDelayP99Ms,
       sdrconnect: diagnostics.sdrconnect,
+      hostMemory: resources.hostMemory,
+      stabilityIncidents: stabilityIncidents.list(),
     },
     network: {
       hostCollector: diagnostics.networkCollector,
@@ -737,6 +771,18 @@ function healthResponse(): HealthSnapshotV2 & Record<string, unknown> {
       dashboards: liveServer.clients.size,
       queuedBytes,
       drops: diagnostics.browserDrops,
+      clients: [...liveClients.entries()].map(([socket, state]) => ({
+        id: state.id,
+        connectedAt: new Date(state.connectedAt).toISOString(),
+        ageMs: Math.max(0, Date.now() - state.connectedAt),
+        visibility: state.subscription.rateHz === 0.2 ? "hidden" : "visible",
+        rateHz: state.subscription.rateHz,
+        engineer: state.subscription.engineer,
+        targetCount: state.subscription.visibleTargetIds.length + state.subscription.visibleFeedIds.length,
+        lastDeliveredFrameAt: state.lastDeliveredFrameAt ? new Date(state.lastDeliveredFrameAt).toISOString() : undefined,
+        bufferedBytes: socket.bufferedAmount,
+        queuedBytes: state.pendingFrameBytes + state.controlQueue.pendingBytes + socket.bufferedAmount,
+      })),
     },
     evidence: {
       healthy: snapshot.evidenceHealthy,
@@ -777,8 +823,14 @@ function healthResponse(): HealthSnapshotV2 & Record<string, unknown> {
     normalHttpRequestLimit: normalHttpGate.limit,
     normalHttpRejectedRequests: normalHttpGate.rejected,
     clients: [...liveClients.entries()].map(([socket, state]) => ({
+      id: state.id,
+      connectedAt: new Date(state.connectedAt).toISOString(),
+      ageMs: Math.max(0, Date.now() - state.connectedAt),
+      visibility: state.subscription.rateHz === 0.2 ? "hidden" as const : "visible" as const,
       rateHz: state.subscription.rateHz,
       engineer: state.subscription.engineer,
+      targetCount: state.subscription.visibleTargetIds.length + state.subscription.visibleFeedIds.length,
+      lastDeliveredFrameAt: state.lastDeliveredFrameAt ? new Date(state.lastDeliveredFrameAt).toISOString() : undefined,
       visibleTargets: state.subscription.visibleTargetIds.length + state.subscription.visibleFeedIds.length,
       visibleFeeds: state.subscription.visibleFeedIds.length,
       queuedTargets: state.pendingFrames.size,
@@ -1680,6 +1732,8 @@ const liveServer = new WebSocketServer({
 });
 
 interface LiveClientState {
+  id: string;
+  connectedAt: number;
   subscription: NormalizedLiveSubscription;
   subscriptionSignature: string;
   lastFrameAt: number;
@@ -1692,6 +1746,7 @@ interface LiveClientState {
   pressureSince?: number;
   pendingFrameBytes: number;
   bootstrapConfigurationHash: string;
+  lastDeliveredFrameAt?: number;
 }
 
 const liveClients = new Map<WebSocket, LiveClientState>();
@@ -1808,7 +1863,10 @@ function sendFrame(socket: WebSocket, state: LiveClientState, message: Extract<S
   try {
     const binary = encodeSpectrumEnvelope(message.payload.frame, message.payload.metrics, message.payload.event, message.payload.targetState, message.payload.feedId);
     state.lastFrameAt = Date.now();
-    if (sendTracked(socket, binary)) streamingCounters.spectrumMessages += 1;
+    if (sendTracked(socket, binary)) {
+      streamingCounters.spectrumMessages += 1;
+      state.lastDeliveredFrameAt = Date.now();
+    }
   } catch {
     streamingCounters.budgetDrops += 1;
   }
@@ -1902,6 +1960,8 @@ liveServer.on("connection", (socket) => {
   const initialSubscription = normalizeLiveSubscription({ type: "subscribe", protocolVersion: 2, rateHz: 2, engineer: false })!;
   const bootstrap = compactSnapshot(authoritativeSnapshot().snapshot);
   const state: LiveClientState = {
+    id: `dashboard-${++liveClientSequence}`,
+    connectedAt: Date.now(),
     subscription: initialSubscription,
     subscriptionSignature: liveSubscriptionSignature(initialSubscription),
     lastFrameAt: 0,
@@ -2057,6 +2117,7 @@ async function shutdown(): Promise<void> {
   for (const client of liveServer.clients) client.terminate();
   liveServer.close();
   await productionQualificationStore.flush();
+  await stabilityIncidents.flush();
   await monitor.stop();
   await serverClosed;
   process.exit(0);

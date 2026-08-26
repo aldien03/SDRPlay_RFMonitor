@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
+import { readFile, unlink } from "node:fs/promises";
 import path from "node:path";
 import type { AppConfig } from "./config";
 import { aggregateVisitFrames, centralAnalysisBinBounds, createBaselineFingerprint, detectionRuleFingerprint, DetectionEngine, projectDetectorAnalysisToFrame, type DetectionBaselineReference, type DetectionResult } from "../shared/detection";
@@ -50,7 +51,7 @@ import type {
   SweepCycle,
   SweepSegment,
 } from "../shared/types";
-import { EvidenceStore } from "./evidenceStore";
+import { EvidenceStore, type EvidenceInterruptionContext } from "./evidenceStore";
 import {
   type ScreenshotAdmissionLease,
   validateScreenshotPng,
@@ -111,6 +112,8 @@ export type MonitorAtomicityFaultPoint =
 export interface MonitorServiceOptions {
   /** Deterministic transaction-boundary seam used only by tests. */
   injectAtomicityFault?: (point: MonitorAtomicityFaultPoint) => void | Promise<void>;
+  interruptionContextPath?: string;
+  receiverStartupGraceMs?: number;
 }
 
 export interface BaselineRestartResult {
@@ -326,6 +329,10 @@ export class MonitorService extends EventEmitter {
   private resourcePressureActive = false;
   private resourceDashboardsStatusOnly = false;
   private resourceHealthState: ResourceHealth["state"] = "normal";
+  private hostMemoryPressureActive = false;
+  private receiverRecoveryActive = false;
+  private applicationRecoveryActive = false;
+  private readonly receiverStartupGraceUntil: number;
   private operatorMonitoringState?: OperatorMonitoringState;
   private operatorMonitoringStateSince: string;
   private spectrumFramesAnalyzed = 0;
@@ -369,6 +376,8 @@ export class MonitorService extends EventEmitter {
 
   constructor(private config: AppConfig, private readonly serviceOptions: MonitorServiceOptions = {}) {
     super();
+    const receiverStartupGraceMs = serviceOptions.receiverStartupGraceMs ?? (config.dataDomain === "field" ? 90_000 : 0);
+    this.receiverStartupGraceUntil = performance.now() + Math.max(0, receiverStartupGraceMs);
     this.operatorMonitoringStateSince = config.runtimeIdentity.serviceStartedAt;
     this.detector = new DetectionEngine(config.detectionThresholds);
     this.evidence = new EvidenceStore(config.storageRoot, { dataDomain: config.dataDomain });
@@ -422,7 +431,9 @@ export class MonitorService extends EventEmitter {
       this.emitServiceError(error instanceof Error ? error.message : String(error));
     }
     try {
-      await this.evidence.initialize(this.sessionMetadata());
+      const interruption = await this.consumeInterruptionContext();
+      await this.evidence.initialize(this.sessionMetadata(), interruption);
+      if (interruption?.cause) this.commissioningFaults.add(`application-restart:${interruption.cause}`);
       await this.refreshSessionList();
     } catch (error) {
       this.evidenceHealthy = false;
@@ -1021,12 +1032,16 @@ export class MonitorService extends EventEmitter {
   }
 
   noteResourceHealth(health: ResourceHealth): void {
+    const previousResourceState = this.resourceHealthState;
     const changed = this.resourcePressureActive !== (health.state !== "normal")
       || this.resourceDashboardsStatusOnly !== health.dashboardsStatusOnly;
     this.resourceHealthState = health.state;
     this.resourcePressureActive = health.state !== "normal";
+    this.hostMemoryPressureActive = health.hostMemory?.state === "pressure" || health.hostMemory?.state === "critical";
     this.resourceDashboardsStatusOnly = health.dashboardsStatusOnly;
     if (changed) this.broadcastSnapshot();
+    if (previousResourceState !== "normal" && health.state === "normal") this.restartCommissioningEpoch();
+    if (health.hostMemory?.state === "critical" || health.hostMemory?.recentOomKill) this.commissioningFaults.add("host-memory-critical");
     if (performance.now() < this.commissioningStartedAtMonotonicMs) return;
     if (health.state !== "normal") this.commissioningFaults.add(`resource-${health.state}`);
   }
@@ -3017,6 +3032,9 @@ export class MonitorService extends EventEmitter {
       || this.prehistoryCandidateTargets.has(targetId)
       || receiverMetric.overload
       || this.resourcePressureActive
+      || this.applicationRecoveryActive
+      || this.receiverRecoveryActive
+      || performance.now() < this.receiverStartupGraceUntil
       || !this.evidenceHealthy;
     const result = this.detector.analyzeObservation(outcome.observation, band, {
       freezeTraining,
@@ -3299,6 +3317,10 @@ export class MonitorService extends EventEmitter {
     receiverOverload: boolean,
   ): StoredBaselineRejectionReason {
     if (receiverOverload || result.metrics.overload) return "receiver-overload";
+    if (this.hostMemoryPressureActive) return "host-memory-pressure";
+    if (this.applicationRecoveryActive) return "application-recovery";
+    if (performance.now() < this.receiverStartupGraceUntil) return "receiver-startup-grace";
+    if (this.receiverRecoveryActive) return "receiver-recovery";
     if (this.resourcePressureActive) return "resource-pressure";
     if (!this.evidenceHealthy) return "evidence-unavailable";
     if (this.activeEventsByTarget.has(targetId)) return "target-event";
@@ -3949,6 +3971,11 @@ export class MonitorService extends EventEmitter {
   }
 
   noteRecoverySupervisorStatus(status: RecoverySupervisorStatus): void {
+    const recoveryWasActive = this.receiverRecoveryActive;
+    this.receiverRecoveryActive = status.state === "requested" || status.state === "recovering" || status.state === "suppressed";
+    if (this.receiverRecoveryActive && performance.now() >= this.commissioningStartedAtMonotonicMs) this.commissioningFaults.add("receiver-recovery");
+    if (status.state === "lockout") this.commissioningFaults.add("receiver-recovery-lockout");
+    if (recoveryWasActive && status.state === "live") this.restartCommissioningEpoch();
     let changed = false;
     for (const receiver of this.receiverStates) {
       const previousState = receiver.recoveryState;
@@ -3961,6 +3988,9 @@ export class MonitorService extends EventEmitter {
         receiver.nextRetryAt = status.nextAttemptAt;
       } else if (status.state === "recovering") {
         receiver.recoveryState = receiver.hardwareState === "absent" ? "waiting-for-hardware" : "recovering";
+        receiver.nextRetryAt = status.nextAttemptAt;
+      } else if (status.state === "suppressed") {
+        receiver.recoveryState = status.reasonCode === "receiver-startup-grace" ? "recovering" : "cooldown";
         receiver.nextRetryAt = status.nextAttemptAt;
       } else if (status.state === "lockout") {
         receiver.recoveryState = "manual-required";
@@ -3978,6 +4008,40 @@ export class MonitorService extends EventEmitter {
       if (previousState !== receiver.recoveryState || previousRetryAt !== receiver.nextRetryAt) changed = true;
     }
     if (changed) this.broadcastSnapshot();
+  }
+
+  noteApplicationRecoverySupervisorStatus(status: RecoverySupervisorStatus): void {
+    this.applicationRecoveryActive = status.state === "requested" || status.state === "recovering" || status.state === "suppressed";
+    if (status.state === "lockout") this.commissioningFaults.add("application-recovery-lockout");
+  }
+
+  private restartCommissioningEpoch(): void {
+    this.commissioningEpochId = randomUUID();
+    this.commissioningStartedAtMonotonicMs = performance.now() + MonitorService.COMMISSIONING_WARMUP_MS;
+    this.commissioningStartedAtWallMs = Date.now() + MonitorService.COMMISSIONING_WARMUP_MS;
+    this.commissioningFaults.clear();
+    this.commissioningLastValidCompletionByTarget.clear();
+    this.commissioningValidRevisitsByTarget.clear();
+    this.commissioningOnTimeRevisitsByTarget.clear();
+    this.commissioningEvidenceFramesDroppedAtStart = this.evidenceFramesDropped;
+  }
+
+  private async consumeInterruptionContext(): Promise<EvidenceInterruptionContext | undefined> {
+    const source = this.serviceOptions.interruptionContextPath
+      ?? process.env.RFMON_LAST_INTERRUPTION_FILE
+      ?? "/run/rf-monitor/last-interruption.json";
+    try {
+      const text = await readFile(source, "utf8");
+      if (Buffer.byteLength(text) > 16 * 1024) return undefined;
+      const value = JSON.parse(text) as { schemaVersion?: unknown; cause?: unknown; at?: unknown };
+      if (value.schemaVersion !== 1 || typeof value.cause !== "string" || !/^[a-z0-9-]{1,64}$/.test(value.cause)) return undefined;
+      return { cause: value.cause, ...(typeof value.at === "string" && Number.isFinite(Date.parse(value.at)) ? { at: value.at } : {}) };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") this.emitServiceError("Restart context could not be read");
+      return undefined;
+    } finally {
+      await unlink(source).catch(() => undefined);
+    }
   }
 
   private async refreshReceiverHealth(): Promise<void> {

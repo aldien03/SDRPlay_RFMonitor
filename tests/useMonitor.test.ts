@@ -7,6 +7,7 @@ import {
   baselineRestartRequiresRecovery,
   CanonicalStateFreshnessWatchdog,
   clientBuildMatches,
+  HIDDEN_HISTORY_RELEASE_MS,
   MAX_CLIENT_WATERFALL_ROWS,
   snapshotWithBuildMismatch,
   snapshotWithInvalidOperatorState,
@@ -186,6 +187,10 @@ describe("bounded client waterfall history", () => {
     expect(history).toHaveLength(MAX_CLIENT_WATERFALL_ROWS);
     expect(history[0].id).toBe("sweep-68");
     expect(history.at(-1)?.id).toBe("sweep-99");
+  });
+
+  it("releases hidden-tab graph history after a bounded five minutes", () => {
+    expect(HIDDEN_HISTORY_RELEASE_MS).toBe(5 * 60_000);
   });
 
   it("does not duplicate the current sweep after a reconnect replay", () => {

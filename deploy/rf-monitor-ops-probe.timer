@@ -2,7 +2,7 @@
 Description=Probe RF Monitor uptime and readiness every minute
 
 [Timer]
-OnCalendar=*-*-* *:*:00
+OnCalendar=*-*-* *:*:08
 RandomizedDelaySec=3s
 AccuracySec=5s
 Persistent=true

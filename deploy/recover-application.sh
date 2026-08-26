@@ -18,6 +18,8 @@ STALE_COUNT_FILE="${STATE_DIR}/stale-count"
 ATTEMPTS_FILE="${STATE_DIR}/recovery-attempts"
 LAST_ATTEMPT_FILE="${STATE_DIR}/last-recovery-at"
 LOCK_FILE="${STATE_DIR}/automatic-recovery-locked"
+COORDINATION_LOCK="${RFMON_RECOVERY_COORDINATION_LOCK:-${REQUEST_DIR}/recovery.lock}"
+INTERRUPTION_FILE="${RFMON_LAST_INTERRUPTION_FILE:-${REQUEST_DIR}/last-interruption.json}"
 STALE_CHECKS_BEFORE_RECOVERY="${RFMON_APPLICATION_STALE_CHECKS_BEFORE_RECOVERY:-2}"
 AUTOMATIC_COOLDOWN_SECONDS="${RFMON_APPLICATION_AUTOMATIC_COOLDOWN_SECONDS:-300}"
 MANUAL_COOLDOWN_SECONDS="${RFMON_APPLICATION_MANUAL_COOLDOWN_SECONDS:-120}"
@@ -25,10 +27,11 @@ RECOVERY_WINDOW_SECONDS="${RFMON_APPLICATION_RECOVERY_WINDOW_SECONDS:-3600}"
 MAX_RECOVERY_ATTEMPTS="${RFMON_APPLICATION_MAX_RECOVERY_ATTEMPTS:-3}"
 CONFIRM_ATTEMPTS="${RFMON_APPLICATION_CONFIRM_ATTEMPTS:-30}"
 CONFIRM_INTERVAL_SECONDS="${RFMON_APPLICATION_CONFIRM_INTERVAL_SECONDS:-1}"
+STARTUP_GRACE_SECONDS="${RFMON_APPLICATION_STARTUP_GRACE_SECONDS:-60}"
 
 for numeric_setting in \
   STALE_CHECKS_BEFORE_RECOVERY AUTOMATIC_COOLDOWN_SECONDS MANUAL_COOLDOWN_SECONDS \
-  RECOVERY_WINDOW_SECONDS MAX_RECOVERY_ATTEMPTS CONFIRM_ATTEMPTS CONFIRM_INTERVAL_SECONDS; do
+  RECOVERY_WINDOW_SECONDS MAX_RECOVERY_ATTEMPTS CONFIRM_ATTEMPTS CONFIRM_INTERVAL_SECONDS STARTUP_GRACE_SECONDS; do
   numeric_value="${!numeric_setting}"
   [[ "${numeric_value}" =~ ^[0-9]+$ ]] || { printf 'Invalid numeric application recovery setting %s\n' "${numeric_setting}" >&2; exit 2; }
 done
@@ -110,6 +113,41 @@ read_health() {
   return 0
 }
 
+host_memory_state() {
+  if [[ -n "${RFMON_HOST_MEMORY_STATE_FILE:-}" ]]; then
+    cat "${RFMON_HOST_MEMORY_STATE_FILE}" 2>/dev/null || printf 'unknown\n'
+    return
+  fi
+  local mem_total mem_available swap_total swap_free psi_some psi_full
+  mem_total="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null || true)"
+  mem_available="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null || true)"
+  swap_total="$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo 2>/dev/null || true)"
+  swap_free="$(awk '/^SwapFree:/ {print $2}' /proc/meminfo 2>/dev/null || true)"
+  psi_some="$(awk '/^some / {for (i=1;i<=NF;i++) if ($i ~ /^avg10=/) {sub(/^avg10=/,"",$i); print $i}}' /proc/pressure/memory 2>/dev/null || true)"
+  psi_full="$(awk '/^full / {for (i=1;i<=NF;i++) if ($i ~ /^avg10=/) {sub(/^avg10=/,"",$i); print $i}}' /proc/pressure/memory 2>/dev/null || true)"
+  if [[ ! "${mem_total}" =~ ^[0-9]+$ || ! "${mem_available}" =~ ^[0-9]+$ || ! "${swap_total}" =~ ^[0-9]+$ || ! "${swap_free}" =~ ^[0-9]+$ || -z "${psi_some}" || -z "${psi_full}" ]]; then
+    printf 'unknown\n'
+    return
+  fi
+  awk -v mt="${mem_total}" -v ma="${mem_available}" -v st="${swap_total}" -v sf="${swap_free}" -v ps="${psi_some}" -v pf="${psi_full}" 'BEGIN {
+    available = ma / mt; swap = st == 0 ? 1 : sf / st;
+    if (available < 0.10 || swap < 0.10 || ps >= 25) print "critical";
+    else if (available < 0.20 || swap < 0.25 || ps >= 10 || pf >= 1) print "pressure";
+    else print "normal";
+  }'
+}
+
+application_in_startup_grace() {
+  (( STARTUP_GRACE_SECONDS > 0 )) || return 1
+  local entered
+  entered="$(systemctl show rf-monitor.service --property=ActiveEnterTimestamp --value 2>/dev/null || true)"
+  [[ -n "${entered}" ]] || return 1
+  local entered_epoch
+  entered_epoch="$(date --date="${entered}" +%s 2>/dev/null || printf '0')"
+  [[ "${entered_epoch}" =~ ^[0-9]+$ ]] || return 1
+  (( now - entered_epoch < STARTUP_GRACE_SECONDS ))
+}
+
 prune_attempts() {
   local temporary
   touch "${ATTEMPTS_FILE}"
@@ -165,6 +203,26 @@ if [[ "${manual}" == "true" && "${health_available}" == "true" ]]; then
   fi
 fi
 
+if [[ "${manual}" == "false" ]]; then
+  memory_state="$(host_memory_state)"
+  if [[ "${memory_state}" == "pressure" || "${memory_state}" == "critical" ]]; then
+    atomic_number "${STALE_COUNT_FILE}" 0
+    write_status suppressed host-memory-pressure "$(iso_at "$((now + 120))")"
+    exit 0
+  fi
+  if application_in_startup_grace; then
+    atomic_number "${STALE_COUNT_FILE}" 0
+    write_status suppressed application-startup-grace "$(iso_at "$((now + STARTUP_GRACE_SECONDS))")"
+    exit 0
+  fi
+fi
+
+exec 9>"${COORDINATION_LOCK}"
+if ! flock --nonblock 9; then
+  write_status suppressed recovery-busy "$(iso_at "$((now + 30))")"
+  exit 0
+fi
+
 if [[ -e "${LOCK_FILE}" ]]; then
   locked_at="$(cat "${LOCK_FILE}" 2>/dev/null || printf '%s' "${now}")"
   [[ "${locked_at}" =~ ^[0-9]+$ ]] || locked_at="${now}"
@@ -208,7 +266,14 @@ atomic_number "${LAST_ATTEMPT_FILE}" "${now}"
 atomic_number "${STALE_COUNT_FILE}" 0
 write_status recovering restart-requested "" "" pending
 
+interruption_temporary="$(mktemp "${INTERRUPTION_FILE}.partial.XXXXXX")"
+jq -n --arg at "$(date --utc '+%Y-%m-%dT%H:%M:%SZ')" --arg cause "$([[ "${manual}" == "true" ]] && printf 'manual-application-restart' || printf 'application-recovery')" --arg previousBootId "${observed_boot_id}" \
+  '{schemaVersion:1, at:$at, cause:$cause} + (if $previousBootId == "" then {} else {previousBootId:$previousBootId} end)' > "${interruption_temporary}"
+chmod 0640 "${interruption_temporary}"
+mv -f -- "${interruption_temporary}" "${INTERRUPTION_FILE}"
+
 if ! systemctl --no-block restart rf-monitor.service; then
+  rm -f -- "${INTERRUPTION_FILE}"
   write_status failed systemd-restart-failed "$(iso_at "$((now + cooldown_seconds))")" "" failed
   exit 0
 fi

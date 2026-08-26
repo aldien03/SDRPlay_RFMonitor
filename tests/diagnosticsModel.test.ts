@@ -193,6 +193,40 @@ describe("diagnostics presentation model", () => {
     expect(model.cards.find((card) => card.id === "network")?.status).toBe("warning");
   });
 
+  it("uses terse operator copy for host pressure and keeps raw memory data in Engineer details", () => {
+    const health = healthFixture();
+    health.software.hostMemory = {
+      state: "critical",
+      reasonCodes: ["host-memory-available-critical"],
+      totalBytes: 16 * 1024 * 1024 * 1024,
+      availableBytes: 1024 * 1024 * 1024,
+      swapTotalBytes: 2 * 1024 * 1024 * 1024,
+      swapFreeBytes: 128 * 1024 * 1024,
+      availableRatio: 0.0625,
+      swapFreeRatio: 0.0625,
+      psiSomeAvg10: 26,
+      psiFullAvg10: 2,
+      recentOomKill: false,
+      sampledAt: health.generatedAt,
+    };
+    health.summary = {
+      state: "critical",
+      issues: [{ id: "host-memory-critical", code: "host-memory-critical", severity: "critical", subsystem: "software", active: true, count: 1, firstOccurredAt: health.generatedAt, lastOccurredAt: health.generatedAt, action: "open-system-health" }],
+    };
+    health.recovery = {
+      receiver: { schemaVersion: 1, outcome: "suppressed", reasonCode: "host-memory-pressure" },
+      application: { schemaVersion: 1, outcome: "suppressed", reasonCode: "host-memory-pressure" },
+    };
+
+    const model = buildDiagnosticsModel(health);
+    expect(model.issues[0]).toMatchObject({ title: "Computer memory is low", detail: "Close unused browser tabs." });
+    expect(model.recovery).toMatchObject({ label: "Recovery paused", detail: "Waiting for computer memory." });
+    expect(model.cards.find((card) => card.id === "software")?.rows).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "host-memory-state", value: "Critical" }),
+      expect.objectContaining({ id: "host-memory-psi" }),
+    ]));
+  });
+
   it("reduces the default view to six task-focused operator checks", () => {
     const model = buildDiagnosticsModel(healthFixture());
     expect(model).toMatchObject({ status: "healthy", label: "Normal", headline: "Monitoring is working.", action: "No action needed." });

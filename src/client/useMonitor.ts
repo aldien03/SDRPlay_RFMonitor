@@ -130,6 +130,7 @@ export interface SweepFrameState {
 }
 
 export const MAX_CLIENT_WATERFALL_ROWS = 32;
+export const HIDDEN_HISTORY_RELEASE_MS = 5 * 60_000;
 
 export type LiveFreshnessInput = "snapshot" | "state-delta" | "heartbeat" | "pong" | "subscription-ack" | "error" | "frame" | "spectrum";
 
@@ -799,6 +800,7 @@ export function useMonitor() {
   const pendingControls = useRef<SequencedCanonicalControlMessage[]>([]);
   const controlFlushScheduled = useRef(false);
   const reconnectAttempt = useRef(0);
+  const hiddenReleaseTimer = useRef<number | undefined>(undefined);
   const engineerStream = useRef(false);
   const visibleTargetIds = useRef<string[]>([]);
   const detailTargetIds = useRef<string[]>([]);
@@ -1022,6 +1024,7 @@ export function useMonitor() {
       stopped.current = true;
       socketRef.current?.close();
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+      if (hiddenReleaseTimer.current) clearTimeout(hiddenReleaseTimer.current);
       freshnessWatchdog.current?.stop();
       freshnessWatchdog.current = undefined;
       pendingControls.current = [];
@@ -1031,9 +1034,25 @@ export function useMonitor() {
   }, [connect]);
 
   useEffect(() => {
-    const update = () => sendSubscription();
+    const update = () => {
+      if (hiddenReleaseTimer.current) clearTimeout(hiddenReleaseTimer.current);
+      hiddenReleaseTimer.current = undefined;
+      if (document.hidden) {
+        hiddenReleaseTimer.current = window.setTimeout(() => {
+          hiddenReleaseTimer.current = undefined;
+          setTargetFrames({});
+          setSweepFrames({});
+          setSnapshot((current) => ({ ...current, currentFrame: undefined, currentMetrics: undefined, waterfall: [] }));
+        }, HIDDEN_HISTORY_RELEASE_MS);
+      }
+      sendSubscription();
+    };
     document.addEventListener("visibilitychange", update);
-    return () => document.removeEventListener("visibilitychange", update);
+    return () => {
+      document.removeEventListener("visibilitychange", update);
+      if (hiddenReleaseTimer.current) clearTimeout(hiddenReleaseTimer.current);
+      hiddenReleaseTimer.current = undefined;
+    };
   }, [sendSubscription]);
 
   const setEngineerStream = useCallback((enabled: boolean) => {

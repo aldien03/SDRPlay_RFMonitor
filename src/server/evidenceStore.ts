@@ -187,6 +187,11 @@ export interface EvidenceStoreOptions {
   screenshotScan?: Pick<PersistedScreenshotScanOptions, "maxSessions" | "maxEntries">;
 }
 
+export interface EvidenceInterruptionContext {
+  cause: string;
+  at?: string;
+}
+
 export interface IncidentExportContext {
   immutableExportId?: string;
   minimumFreeBytes?: number;
@@ -720,12 +725,12 @@ export class EvidenceStore {
     return this.active.byteCount >= maxBytes || now - Date.parse(this.active.startedAt) >= maxAgeMs;
   }
 
-  async initialize(metadata: SessionMetadata): Promise<EvidenceSession> {
+  async initialize(metadata: SessionMetadata, interruption?: EvidenceInterruptionContext): Promise<EvidenceSession> {
     await ensureDomainRoot(this.root, this.dataDomain);
     if (this.active) throw new Error("An evidence session is already active");
     await this.recoverRecordingDeletion();
     await this.recoverPartialExports();
-    await this.recoverInterruptedSessions();
+    await this.recoverInterruptedSessions(interruption);
     await this.loadPersistedScreenshotQuota();
     return this.createSession(metadata);
   }
@@ -2635,7 +2640,7 @@ export class EvidenceStore {
     return sizes.reduce((total, details) => total + details.size, 0);
   }
 
-  private async recoverInterruptedSessions(): Promise<void> {
+  private async recoverInterruptedSessions(interruption?: EvidenceInterruptionContext): Promise<void> {
     const sessions = await this.listSessions();
     for (const session of sessions) {
       if (session.lifecycle === "Corrupt") continue;
@@ -2766,9 +2771,11 @@ export class EvidenceStore {
         type: "unclean-session-recovery",
         disposition: "unknown",
         evidenceGap: true,
+        interruptionCause: interruption?.cause ?? "unclean-service-restart",
+        interruptionRecordedAt: interruption?.at,
         affectedEventIds: interruptedEvents.map((event) => event.id),
         recoveredTails,
-        message: "The prior process stopped without closing this session. RF state during the restart gap is unknown.",
+        message: `The prior process stopped without closing this session (${interruption?.cause ?? "unclean-service-restart"}). RF state during the restart gap is unknown.`,
       }))}\n`;
       await appendFile(path.join(session.path, "operations.jsonl"), recoveryLine);
       session.byteCount += Buffer.byteLength(recoveryLine);
@@ -2777,6 +2784,7 @@ export class EvidenceStore {
       session.incompleteReasons = [...new Set([
         ...(session.incompleteReasons ?? []),
         "unclean-service-restart",
+        ...(interruption?.cause ? [`interruption:${interruption.cause}`] : []),
         ...(recoveredJsonlTailCount ? ["quarantined-jsonl-tail"] : []),
         ...rawRecovery.incompleteReasons,
       ])];

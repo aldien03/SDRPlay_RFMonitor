@@ -409,7 +409,7 @@ fi
 describe("shipped supervision policy", () => {
   it("uses persistent bounded schedules and hardened unprivileged services", async () => {
     const schedules = [
-      ["probe", "OnCalendar=*-*-* *:*:00"],
+      ["probe", "OnCalendar=*-*-* *:*:08"],
       ["daily", "OnCalendar=*-*-* 00:20:00"],
       ["weekly", "OnCalendar=Sun *-*-* 01:20:00"],
       ["monthly", "OnCalendar=*-*-01 02:20:00"],

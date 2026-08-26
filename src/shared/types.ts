@@ -17,7 +17,7 @@ export type RecoveryState = "idle" | "waiting-for-hardware" | "requested" | "rec
 
 export interface RecoveryOperationHealth {
   schemaVersion: 1;
-  outcome: "request-accepted" | "helper-pending" | "verified-recovery" | "cooldown" | "lockout" | "unavailable";
+  outcome: "request-accepted" | "helper-pending" | "verified-recovery" | "suppressed" | "cooldown" | "lockout" | "unavailable";
   reasonCode: string;
   requestId?: string;
   requestedAt?: string;
@@ -51,6 +51,10 @@ export type BaselineRejectionReason =
   | "receiver-overload"
   | "target-event"
   | "resource-pressure"
+  | "host-memory-pressure"
+  | "application-recovery"
+  | "receiver-startup-grace"
+  | "receiver-recovery"
   | "evidence-unavailable"
   | "receiver-health-incomplete"
   | "detector-quarantine"
@@ -1133,6 +1137,52 @@ export interface StreamingHealth {
   rejectedClients: number;
   maxBufferedBytes: number;
   startedAt: string;
+  visibleClients?: number;
+  hiddenClients?: number;
+}
+
+export type HostMemoryPressureState = "normal" | "pressure" | "critical" | "unknown";
+
+export interface HostMemoryHealth {
+  state: HostMemoryPressureState;
+  reasonCodes: string[];
+  totalBytes?: number;
+  availableBytes?: number;
+  availableRatio?: number;
+  swapTotalBytes?: number;
+  swapFreeBytes?: number;
+  swapFreeRatio?: number;
+  psiSomeAvg10?: number;
+  psiFullAvg10?: number;
+  recentOomKill: boolean;
+  sampledAt: string;
+  normalSince?: string;
+}
+
+export interface StreamingClientHealth {
+  id: string;
+  connectedAt: string;
+  ageMs: number;
+  visibility: "visible" | "hidden";
+  rateHz: LiveSubscription["rateHz"];
+  engineer: boolean;
+  targetCount: number;
+  lastDeliveredFrameAt?: string;
+  bufferedBytes: number;
+  queuedBytes: number;
+}
+
+export interface StabilityIncident {
+  schemaVersion: 1;
+  id: string;
+  kind: "host-memory-pressure" | "oom-kill" | "application-recovery" | "receiver-recovery" | "receiver-crash" | "recovery-lockout" | "evidence-gap";
+  state: "active" | "resolved";
+  severity: "attention" | "critical";
+  startedAt: string;
+  updatedAt: string;
+  resolvedAt?: string;
+  reasonCodes: string[];
+  count: number;
 }
 
 export interface SchedulerHealth {
@@ -1205,7 +1255,8 @@ export interface ResourceHealth {
   dashboardsStatusOnly: boolean;
   admitLiveClients?: boolean;
   admitExports?: boolean;
-  maxDashboardRateHz?: 2 | 4;
+  maxDashboardRateHz?: 0.2 | 2 | 4;
+  hostMemory?: HostMemoryHealth;
   pressureEnteredAt?: string;
   healthySince?: string;
 }
@@ -1524,6 +1575,8 @@ export interface HealthSnapshotV2 {
       cpuCoreEquivalent?: MetricWindow;
       memoryBytes?: number;
     };
+    hostMemory?: HostMemoryHealth;
+    stabilityIncidents?: StabilityIncident[];
   };
   network: {
     hostCollector: CollectorAvailability;
@@ -1536,6 +1589,7 @@ export interface HealthSnapshotV2 {
     dashboards: number;
     queuedBytes: number;
     drops: DiagnosticCounter;
+    clients?: StreamingClientHealth[];
   };
   evidence: {
     healthy: boolean;

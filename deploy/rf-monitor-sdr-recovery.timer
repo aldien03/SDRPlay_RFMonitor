@@ -2,7 +2,7 @@
 Description=Check RF Monitor receiver health
 
 [Timer]
-OnCalendar=*-*-* *:*:00/15
+OnCalendar=*-*-* *:*:15,45
 AccuracySec=3s
 Persistent=true
 Unit=rf-monitor-sdr-recovery.service
