@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rf-monitor.local/schemas/v6-conducted-campaign-v1.schema.json",
+  "title": "RF Monitor V6 sealed campaign manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "recordType", "frameworkVersion", "campaignId", "createdAt", "protocol", "declaredResult", "files", "evidenceTreeSha256", "protocolWitness", "finalWitness"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "recordType": { "const": "rf-monitor-v6-conducted-campaign" },
+    "frameworkVersion": { "const": "rf-v6-installed-chain-1.0.0" },
+    "campaignId": { "$ref": "#/$defs/id" },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "protocol": { "$ref": "#/$defs/fileReference" },
+    "declaredResult": { "$ref": "#/$defs/fileReference" },
+    "files": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 5000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "bytes", "sha256"],
+        "properties": {
+          "path": { "$ref": "#/$defs/path" },
+          "bytes": { "type": "integer", "minimum": 1, "maximum": 268435456 },
+          "sha256": { "$ref": "#/$defs/hash" }
+        }
+      }
+    },
+    "evidenceTreeSha256": { "$ref": "#/$defs/hash" },
+    "protocolWitness": { "$ref": "#/$defs/witnessEnvelope" },
+    "finalWitness": { "$ref": "#/$defs/witnessEnvelope" }
+  },
+  "$defs": {
+    "hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+    "path": { "type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$" },
+    "fileReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "$ref": "#/$defs/path" },
+        "sha256": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "witnessEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["receiptId", "statement", "statementSha256", "keySha256", "signatureAlgorithm", "signatureBase64"],
+      "properties": {
+        "receiptId": { "$ref": "#/$defs/id" },
+        "statement": { "type": "object" },
+        "statementSha256": { "$ref": "#/$defs/hash" },
+        "keySha256": { "$ref": "#/$defs/hash" },
+        "signatureAlgorithm": { "const": "ed25519" },
+        "signatureBase64": { "type": "string", "minLength": 80, "maxLength": 100 }
+      }
+    }
+  }
+}

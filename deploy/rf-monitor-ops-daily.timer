@@ -1,0 +1,13 @@
+[Unit]
+Description=Archive RF Monitor readiness every day
+
+[Timer]
+OnCalendar=*-*-* 00:20:00
+RandomizedDelaySec=15m
+AccuracySec=1m
+Persistent=true
+Unit=rf-monitor-ops-daily.service
+
+[Install]
+WantedBy=timers.target
+

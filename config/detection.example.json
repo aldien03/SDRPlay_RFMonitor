@@ -1,0 +1,8 @@
+{
+  "widebandDelta": 24,
+  "widebandOccupiedRatio": 0.24,
+  "narrowbandPeakDelta": 66,
+  "narrowbandMaxOccupiedRatio": 0.08,
+  "baselineDriftDelta": 13,
+  "sustainedFrames": 3
+}

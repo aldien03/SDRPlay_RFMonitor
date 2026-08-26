@@ -1,0 +1,11 @@
+[Unit]
+Description=Check RF Monitor application heartbeat
+
+[Timer]
+OnCalendar=*-*-* *:*:00/15
+AccuracySec=3s
+Persistent=true
+Unit=rf-monitor-application-recovery.service
+
+[Install]
+WantedBy=timers.target

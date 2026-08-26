@@ -1,0 +1,53 @@
+[Unit]
+Description=RF Monitor dashboard and evidence logger
+After=network-online.target time-sync.target sdrconnect-headless.service
+Wants=network-online.target time-sync.target
+StartLimitIntervalSec=3600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=@@SERVICE_USER@@
+Group=@@SERVICE_GROUP@@
+WorkingDirectory=@@INSTALL_DIR@@
+EnvironmentFile=@@CONFIG_FILE@@
+Environment=TZ=UTC
+RuntimeDirectory=rf-monitor
+RuntimeDirectoryMode=0750
+ExecStartPre=/bin/sh @@INSTALL_DIR@@/deploy/check-clock-sync.sh
+# Node.js old space is bounded below the application pressure threshold. External
+# spectrum buffers are monitored separately by /api/health.
+ExecStart=@@NODE_BIN@@ --max-old-space-size=384 @@INSTALL_DIR@@/dist/server-node/index.js
+Restart=on-failure
+RestartSec=3
+# Qualification must verify these values on the active installed unit; source
+# templates alone are not evidence that systemd loaded them.
+MemoryHigh=512M
+MemoryMax=768M
+TasksMax=128
+LimitNOFILE=8192
+TimeoutStartSec=120
+TimeoutStopSec=180
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=200
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=@@STORAGE_DIR@@ @@RUNTIME_CONFIG_DIR@@ /run/rf-monitor
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

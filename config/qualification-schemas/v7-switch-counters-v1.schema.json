@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rf-monitor.invalid/schemas/v7-switch-counters-v1.json",
+  "title": "RF Monitor V7 witnessed managed-switch counters v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "kind", "identityDigest", "capturedBeforeAt", "capturedAfterAt", "completedAt", "witness", "outcome", "evidenceSha256", "evidenceFiles", "ports"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "kind": { "const": "rf-monitor-v7-switch-counters" },
+    "identityDigest": { "$ref": "#/$defs/hash" },
+    "capturedBeforeAt": { "type": "string", "format": "date-time" },
+    "capturedAfterAt": { "type": "string", "format": "date-time" },
+    "completedAt": { "type": "string", "format": "date-time" },
+    "witness": { "$ref": "#/$defs/witness" },
+    "outcome": { "const": "PASS" },
+    "evidenceSha256": { "$ref": "#/$defs/hash" },
+    "evidenceFiles": { "$ref": "#/$defs/evidenceFiles" },
+    "ports": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["portId", "egressDropsDelta", "egressDiscardsDelta", "pauseFramesDelta", "inputErrorsDelta", "inputDiscardsDelta", "portResetsDelta", "linkSpeedMbps", "fullDuplex"],
+        "properties": {
+          "portId": { "$ref": "#/$defs/id" },
+          "egressDropsDelta": { "const": 0 },
+          "egressDiscardsDelta": { "const": 0 },
+          "pauseFramesDelta": { "const": 0 },
+          "inputErrorsDelta": { "const": 0 },
+          "inputDiscardsDelta": { "const": 0 },
+          "portResetsDelta": { "const": 0 },
+          "linkSpeedMbps": { "type": "number", "exclusiveMinimum": 0 },
+          "fullDuplex": { "const": true }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$" },
+    "witness": { "type": "object", "additionalProperties": false, "required": ["id", "algorithm", "signedAt", "publicKeySha256", "signatureBase64"], "properties": { "id": { "type": "string", "minLength": 1 }, "algorithm": { "const": "Ed25519" }, "signedAt": { "type": "string", "format": "date-time" }, "publicKeySha256": { "$ref": "#/$defs/hash" }, "signatureBase64": { "type": "string", "minLength": 80, "maxLength": 100 } } },
+    "evidenceFiles": { "type": "array", "minItems": 1, "maxItems": 256, "items": { "type": "object", "additionalProperties": false, "required": ["path", "sha256"], "properties": { "path": { "type": "string", "minLength": 1 }, "sha256": { "$ref": "#/$defs/hash" } } } }
+  }
+}

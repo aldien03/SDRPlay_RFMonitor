@@ -1,0 +1,13 @@
+[Unit]
+Description=Exercise RF Monitor recovery and restore checks every month
+
+[Timer]
+OnCalendar=*-*-01 02:20:00
+RandomizedDelaySec=1h
+AccuracySec=10m
+Persistent=true
+Unit=rf-monitor-ops-monthly.service
+
+[Install]
+WantedBy=timers.target
+

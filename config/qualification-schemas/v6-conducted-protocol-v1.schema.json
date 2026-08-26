@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rf-monitor.local/schemas/v6-conducted-protocol-v1.schema.json",
+  "title": "RF Monitor V6 pre-test conducted-RF protocol",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "recordType", "frameworkVersion", "campaignId", "committedAt", "approvedBindingSha256", "binding", "identities", "v5ReplayVerification", "method", "prerequisites", "equipment", "matrix", "acceptance"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "recordType": { "const": "rf-monitor-v6-conducted-protocol" },
+    "frameworkVersion": { "const": "rf-v6-installed-chain-1.0.0" },
+    "campaignId": { "$ref": "#/$defs/id" },
+    "committedAt": { "type": "string", "format": "date-time" },
+    "approvedBindingSha256": { "$ref": "#/$defs/hash" },
+    "binding": { "$ref": "v6-approved-binding-v1.schema.json" },
+    "identities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["implementerIdentitySha256", "custodyIdentitySha256", "witnessIdentitySha256"],
+      "properties": {
+        "implementerIdentitySha256": { "$ref": "#/$defs/hash" },
+        "custodyIdentitySha256": { "$ref": "#/$defs/hash" },
+        "witnessIdentitySha256": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "v5ReplayVerification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verifierIdentitySha256", "verifierKeySha256"],
+      "properties": {
+        "verifierIdentitySha256": { "$ref": "#/$defs/hash" },
+        "verifierKeySha256": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "method": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dataDomain", "coupling", "radiated", "iq", "input"],
+      "properties": {
+        "dataDomain": { "const": "test" },
+        "coupling": { "const": "conducted-shielded" },
+        "radiated": { "const": false },
+        "iq": { "const": false },
+        "input": { "const": "real-rspdx-normalized-uint8" }
+      }
+    },
+    "prerequisites": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["gate", "decision", "completedAt", "artifactPath", "artifactSha256", "release", "configurationSha256"],
+        "properties": {
+          "gate": { "enum": ["V0", "V1", "V2", "V3", "V4", "V5"] },
+          "decision": { "const": "passed" },
+          "completedAt": { "type": "string", "format": "date-time" },
+          "artifactPath": { "$ref": "#/$defs/path" },
+          "artifactSha256": { "$ref": "#/$defs/hash" },
+          "release": { "type": "object" },
+          "configurationSha256": { "$ref": "#/$defs/hash" }
+        }
+      }
+    },
+    "equipment": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["equipmentId", "role", "modelSha256", "serialSha256", "certificatePath", "certificateSha256", "certificateIdSha256", "calibrated", "calibrationValidFrom", "calibrationValidUntil", "statedUncertainty"],
+        "properties": {
+          "equipmentId": { "$ref": "#/$defs/id" },
+          "role": { "enum": ["signal-generator", "frequency-power-reference", "attenuation-path"] },
+          "modelSha256": { "$ref": "#/$defs/hash" },
+          "serialSha256": { "$ref": "#/$defs/hash" },
+          "certificatePath": { "$ref": "#/$defs/path" },
+          "certificateSha256": { "$ref": "#/$defs/hash" },
+          "certificateIdSha256": { "$ref": "#/$defs/hash" },
+          "calibrated": { "const": true },
+          "calibrationValidFrom": { "type": "string", "format": "date-time" },
+          "calibrationValidUntil": { "type": "string", "format": "date-time" },
+          "statedUncertainty": { "type": "string", "minLength": 1, "maxLength": 256 }
+        }
+      }
+    },
+    "matrix": {
+      "type": "array",
+      "minItems": 360,
+      "maxItems": 360,
+      "items": { "$ref": "#/$defs/case" }
+    },
+    "acceptance": {
+      "const": {
+        "independentRunsPerTargetCase": 10,
+        "unknownCanPass": false,
+        "guardOrShamAlertAllowed": false,
+        "overloadMustBeSeparate": true
+      }
+    }
+  },
+  "$defs": {
+    "hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+    "path": { "type": "string", "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$" },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["caseId", "targetId", "kind", "independentRun", "acquisitionDescriptorPath", "rawTablePath", "evidencePath", "expected"],
+      "properties": {
+        "caseId": { "$ref": "#/$defs/id" },
+        "targetId": { "$ref": "#/$defs/id" },
+        "kind": { "enum": ["target-range", "frequency-accuracy", "wideband", "cw", "multitone", "moving-narrowband", "overload", "guard-only", "sham"] },
+        "independentRun": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "acquisitionDescriptorPath": { "$ref": "#/$defs/path" },
+        "rawTablePath": { "$ref": "#/$defs/path" },
+        "evidencePath": { "$ref": "#/$defs/path" },
+        "expected": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["outcome", "stimulusEnabled", "generatorFrequencyHz", "sourceLevelDbmAtGeneratorPort", "occupiedWidthHz", "maximumAbsoluteFrequencyErrorHz"],
+          "properties": {
+            "outcome": { "enum": ["metadata-match", "alert", "overload", "no-alert"] },
+            "stimulusEnabled": { "type": "boolean" },
+            "generatorFrequencyHz": { "type": ["number", "null"] },
+            "sourceLevelDbmAtGeneratorPort": { "type": ["object", "null"] },
+            "occupiedWidthHz": { "type": ["object", "null"] },
+            "maximumAbsoluteFrequencyErrorHz": { "type": ["number", "null"] }
+          }
+        }
+      }
+    }
+  }
+}

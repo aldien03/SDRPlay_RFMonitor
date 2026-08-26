@@ -1,0 +1,12 @@
+[Unit]
+Description=Probe RF Monitor uptime and readiness every minute
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+RandomizedDelaySec=3s
+AccuracySec=5s
+Persistent=true
+Unit=rf-monitor-ops-probe.service
+
+[Install]
+WantedBy=timers.target

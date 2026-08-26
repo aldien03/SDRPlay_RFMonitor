@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "recordType": "rf-monitor-v6-preparation-worksheet",
+  "acceptedByRunner": false,
+  "campaignId": "REQUIRED_SAFE_CAMPAIGN_ID",
+  "approvedBinding": {
+    "pathOutsideCampaign": "REQUIRED_PATH",
+    "canonicalSha256FromIndependentApproval": "REQUIRED_64_CHARACTER_LOWERCASE_SHA256"
+  },
+  "roles": {
+    "implementerIdentitySha256": "REQUIRED_DISTINCT_64_CHARACTER_LOWERCASE_SHA256",
+    "custodyIdentitySha256": "REQUIRED_DISTINCT_64_CHARACTER_LOWERCASE_SHA256",
+    "witnessIdentitySha256": "REQUIRED_DISTINCT_64_CHARACTER_LOWERCASE_SHA256"
+  },
+  "requiredPrerequisites": ["V0", "V1", "V2", "V3", "V4", "V5"],
+  "prerequisiteWrappers": {
+    "schema": "qualification-schemas/v6-prerequisite-wrapper-v1.schema.json",
+    "V0": ["traceability-report"],
+    "V1": ["validation-record"],
+    "V2": ["qualification-record"],
+    "V3": ["browser-result"],
+    "V4": ["packaged-result", "detector-result", "combined-result"],
+    "V5": ["bundle-manifest", "replay-result", "verification-record"]
+  },
+  "v5IndependentVerification": {
+    "schema": "qualification-schemas/v5-independent-replay-verification-v1.schema.json",
+    "verifierIdentitySha256": "REQUIRED_DISTINCT_64_CHARACTER_LOWERCASE_SHA256",
+    "verifierEd25519SpkiSha256PrewitnessedInProtocol": "REQUIRED_64_CHARACTER_LOWERCASE_SHA256"
+  },
+  "requiredTier1CasesPerTarget": {
+    "target-range": 10,
+    "frequency-accuracy": 10,
+    "wideband": 10,
+    "cw": 10,
+    "multitone": 10,
+    "moving-narrowband": 10,
+    "overload": 10,
+    "guard-only": 10,
+    "sham": 10
+  },
+  "requiredEquipmentRoles": ["signal-generator", "frequency-power-reference", "attenuation-path"],
+  "method": {
+    "dataDomain": "test",
+    "coupling": "conducted-shielded",
+    "radiated": false,
+    "iq": false,
+    "input": "real-rspdx-normalized-uint8"
+  },
+  "stopConditions": [
+    "Any V0-V5 gate is not PASS for the exact frozen candidate and configuration.",
+    "The receiver, serial hash, installed-chain fingerprint, SDRconnect version, fixed gain, sample rate, grid, mask, site, or protected baseline differs from the approved binding.",
+    "Calibration does not cover every exposure timestamp.",
+    "The protocol witness signature was not completed before the first exposure.",
+    "A source would radiate rather than use an authorized shielded conducted connection."
+  ]
+}

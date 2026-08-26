@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rf-monitor.local/schemas/v6-approved-binding-v1.schema.json",
+  "title": "RF Monitor V6 separately approved installed-chain binding",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "recordType", "approvedAt", "release", "configuration", "site", "receiver", "installedChain", "rf", "targets", "baselineSetSha256"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "recordType": { "const": "rf-monitor-v6-approved-binding" },
+    "approvedAt": { "type": "string", "format": "date-time" },
+    "release": { "$ref": "#/$defs/release" },
+    "configuration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["configurationSha256", "catalogVersion", "catalogSha256"],
+      "properties": {
+        "configurationSha256": { "$ref": "#/$defs/hash" },
+        "catalogVersion": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "catalogSha256": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "site": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bindingSha256"],
+      "properties": { "bindingSha256": { "$ref": "#/$defs/hash" } }
+    },
+    "receiver": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["model", "serialSha256"],
+      "properties": {
+        "model": { "enum": ["RSPdx", "RSPdx R2"] },
+        "serialSha256": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "installedChain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fingerprintSha256", "injectionReferencePlaneSha256", "componentSha256"],
+      "properties": {
+        "fingerprintSha256": { "$ref": "#/$defs/hash" },
+        "injectionReferencePlaneSha256": { "$ref": "#/$defs/hash" },
+        "componentSha256": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["antenna", "cable", "filter", "lna", "attenuator", "surgeProtection"],
+          "properties": {
+            "antenna": { "$ref": "#/$defs/hash" },
+            "cable": { "$ref": "#/$defs/hash" },
+            "filter": { "anyOf": [{ "$ref": "#/$defs/hash" }, { "type": "null" }] },
+            "lna": { "anyOf": [{ "$ref": "#/$defs/hash" }, { "type": "null" }] },
+            "attenuator": { "$ref": "#/$defs/hash" },
+            "surgeProtection": { "anyOf": [{ "$ref": "#/$defs/hash" }, { "type": "null" }] }
+          }
+        }
+      }
+    },
+    "rf": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sdrconnectVersion", "fixedGainProfileSha256", "sampleRateHz", "inputBinCount", "analysisStartBin", "analysisEndBin", "spectrumReference", "spectrumBase", "normalizedEncoding", "iq"],
+      "properties": {
+        "sdrconnectVersion": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "fixedGainProfileSha256": { "$ref": "#/$defs/hash" },
+        "sampleRateHz": { "const": 10000000 },
+        "inputBinCount": { "type": "integer", "minimum": 8, "maximum": 65536 },
+        "analysisStartBin": { "type": "integer", "minimum": 0 },
+        "analysisEndBin": { "type": "integer", "minimum": 1 },
+        "spectrumReference": { "type": "number" },
+        "spectrumBase": { "type": "number" },
+        "normalizedEncoding": { "const": "uint8-display-values" },
+        "iq": { "const": false }
+      }
+    },
+    "targets": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": { "$ref": "#/$defs/target" }
+    },
+    "baselineSetSha256": { "$ref": "#/$defs/hash" }
+  },
+  "$defs": {
+    "hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "product", "releaseVersion", "buildId", "sourceDigest", "packageDigest", "dependencyLockDigest"],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "product": { "const": "rf-monitor" },
+        "releaseVersion": { "type": "string", "minLength": 1 },
+        "buildId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+        "sourceDigest": { "$ref": "#/$defs/hash" },
+        "packageDigest": { "$ref": "#/$defs/hash" },
+        "dependencyLockDigest": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["targetId", "centerHz", "captureSpanHz", "analysisSpanHz", "analysisMaskSha256", "baselineId", "baselineDescriptorSha256", "baselineFingerprintSha256"],
+      "properties": {
+        "targetId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+        "centerHz": { "type": "number", "exclusiveMinimum": 0 },
+        "captureSpanHz": { "type": "number", "exclusiveMinimum": 0 },
+        "analysisSpanHz": { "type": "number", "exclusiveMinimum": 0, "maximum": 8000000 },
+        "analysisMaskSha256": { "$ref": "#/$defs/hash" },
+        "baselineId": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$" },
+        "baselineDescriptorSha256": { "$ref": "#/$defs/hash" },
+        "baselineFingerprintSha256": { "$ref": "#/$defs/hash" }
+      }
+    }
+  }
+}

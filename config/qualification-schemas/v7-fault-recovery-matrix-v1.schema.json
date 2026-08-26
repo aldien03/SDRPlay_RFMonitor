@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rf-monitor.invalid/schemas/v7-fault-recovery-matrix-v1.json",
+  "title": "RF Monitor V7 witnessed fault and recovery matrix v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "kind", "identityDigest", "faultPhaseId", "phaseStartedAt", "phaseEndedAt", "completedAt", "witness", "outcome", "acceptance", "cases", "evidenceFiles"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "kind": { "const": "rf-monitor-v7-fault-recovery-matrix" },
+    "identityDigest": { "$ref": "#/$defs/hash" },
+    "faultPhaseId": { "$ref": "#/$defs/id" },
+    "phaseStartedAt": { "type": "string", "format": "date-time" },
+    "phaseEndedAt": { "type": "string", "format": "date-time" },
+    "completedAt": { "type": "string", "format": "date-time" },
+    "witness": { "$ref": "#/$defs/witness" },
+    "outcome": { "const": "PASS" },
+    "acceptance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stalledReceiverDetectionMaxMs", "recoveryStartMaxMs", "receiverRestorationMaxMs", "terminalFailuresVisible", "restartLoops", "evidenceFramesLost"],
+      "properties": {
+        "stalledReceiverDetectionMaxMs": { "type": "number", "minimum": 0, "maximum": 10000 },
+        "recoveryStartMaxMs": { "type": "number", "minimum": 0, "maximum": 30000 },
+        "receiverRestorationMaxMs": { "type": "number", "minimum": 0, "maximum": 120000 },
+        "terminalFailuresVisible": { "const": true },
+        "restartLoops": { "const": 0 },
+        "evidenceFramesLost": { "const": 0 }
+      }
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 42,
+      "maxItems": 42,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "outcome", "executedAt", "evidenceSha256"],
+        "properties": {
+          "id": {
+            "enum": [
+              "usb-removal", "sdrconnect-stop", "sdrconnect-crash", "sdrconnect-hang", "sdrconnect-initialization-failure", "sdrconnect-start-limit-lockout",
+              "rf-monitor-crash", "rf-monitor-event-loop-hang", "tune-timeout", "tune-delayed-confirmation", "tune-mismatched-confirmation", "stale-frame",
+              "rf-rate-gain-configuration-change", "browser-network-interruption", "slow-client", "eight-live-clients", "ninth-live-client-rejected",
+              "disk-reserve", "disk-full", "filesystem-read-only", "evidence-mount-lost", "torn-write", "sudden-power-loss", "wall-clock-jump", "ntp-loss",
+              "corrupt-configuration", "corrupt-baseline", "corrupt-index", "corrupt-evidence-tail", "cpu-pressure", "rss-pressure", "heap-pressure",
+              "external-buffer-pressure", "event-loop-pressure", "writer-queue-pressure", "export-pressure", "nic-switch-errors-drops-pause", "network-link-reset",
+              "upgrade-failure", "rollback", "backup-failure", "bare-host-restore"
+            ]
+          },
+          "outcome": { "const": "PASS" },
+          "executedAt": { "type": "string", "format": "date-time" },
+          "evidenceSha256": { "$ref": "#/$defs/hash" }
+        }
+      }
+    },
+    "evidenceFiles": { "$ref": "#/$defs/evidenceFiles" }
+  },
+  "$defs": {
+    "hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$" },
+    "witness": { "type": "object", "additionalProperties": false, "required": ["id", "algorithm", "signedAt", "publicKeySha256", "signatureBase64"], "properties": { "id": { "type": "string", "minLength": 1 }, "algorithm": { "const": "Ed25519" }, "signedAt": { "type": "string", "format": "date-time" }, "publicKeySha256": { "$ref": "#/$defs/hash" }, "signatureBase64": { "type": "string", "minLength": 80, "maxLength": 100 } } },
+    "evidenceFiles": { "type": "array", "minItems": 1, "maxItems": 256, "items": { "type": "object", "additionalProperties": false, "required": ["path", "sha256"], "properties": { "path": { "type": "string", "minLength": 1 }, "sha256": { "$ref": "#/$defs/hash" } } } }
+  }
+}

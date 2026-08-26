@@ -1,0 +1,29 @@
+[Unit]
+Description=RF Monitor application heartbeat recovery
+After=network.target
+
+[Service]
+Type=oneshot
+Group=@@SERVICE_GROUP@@
+EnvironmentFile=@@CONFIG_FILE@@
+Environment=RFMON_CONFIG_AUDIT_FILE=@@CONFIG_AUDIT_FILE@@
+RuntimeDirectory=rf-monitor-application-recovery
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+ExecStart=/bin/bash @@INSTALL_DIR@@/deploy/recover-application.sh
+TimeoutStartSec=150s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/run/rf-monitor /run/rf-monitor-application-recovery
+UMask=0027

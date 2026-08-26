@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rf-monitor.invalid/schemas/site-qualification-binding-v1.json",
+  "title": "RF Monitor site qualification binding v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "kind", "candidateId", "releaseBuildId", "serverBuildId", "clientBuildId", "sourceDigest", "packageDigest", "dependencyLockDigest", "configurationHash", "catalogVersion", "detectorRuleSetId", "siteBindingHash", "receiverModel", "receiverIdentityHash", "installedChainFingerprintSha256", "qualificationWitnessId", "qualificationWitnessPublicKeySha256", "expectedSampleRateHz", "tier1Targets"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "kind": { "const": "rf-monitor-site-qualification-binding" },
+    "candidateId": { "$ref": "#/$defs/id" },
+    "releaseBuildId": { "$ref": "#/$defs/id" },
+    "serverBuildId": { "$ref": "#/$defs/id" },
+    "clientBuildId": { "$ref": "#/$defs/id" },
+    "sourceDigest": { "$ref": "#/$defs/hash" },
+    "packageDigest": { "$ref": "#/$defs/hash" },
+    "dependencyLockDigest": { "$ref": "#/$defs/hash" },
+    "configurationHash": { "$ref": "#/$defs/hash" },
+    "catalogVersion": { "$ref": "#/$defs/id" },
+    "detectorRuleSetId": { "$ref": "#/$defs/id" },
+    "siteBindingHash": { "$ref": "#/$defs/hash" },
+    "receiverModel": { "enum": ["RSPdx", "RSPdx R2"] },
+    "receiverIdentityHash": { "$ref": "#/$defs/hash", "description": "SHA-256 identity digest derived by RF Monitor from the supported receiver model and physical hardware serial." },
+    "installedChainFingerprintSha256": { "$ref": "#/$defs/hash" },
+    "qualificationWitnessId": { "$ref": "#/$defs/id" },
+    "qualificationWitnessPublicKeySha256": { "$ref": "#/$defs/hash" },
+    "expectedSampleRateHz": { "const": 10000000 },
+    "tier1Targets": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["targetId", "objectiveMs", "baselineFingerprintId"],
+        "properties": {
+          "targetId": { "$ref": "#/$defs/id" },
+          "objectiveMs": { "enum": [2000, 6000] },
+          "baselineFingerprintId": { "$ref": "#/$defs/hash" }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "id": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$" }
+  }
+}

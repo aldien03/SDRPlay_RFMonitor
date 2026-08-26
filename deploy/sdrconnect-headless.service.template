@@ -1,0 +1,44 @@
+[Unit]
+Description=SDRconnect headless WebSocket service
+After=network.target
+Before=rf-monitor.service
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=@@SERVICE_USER@@
+Group=@@SERVICE_GROUP@@
+SupplementaryGroups=plugdev
+WorkingDirectory=@@SDR_STATE_DIR@@
+Environment=HOME=@@SDR_STATE_DIR@@
+ExecStart=@@SDRCONNECT_BIN@@ --websocket_port=@@SDRCONNECT_PORT@@
+Restart=on-failure
+RestartSec=15
+KillSignal=SIGINT
+TimeoutStopSec=30
+# Keep the vendor process bounded independently from RF Monitor.
+MemoryHigh=768M
+MemoryMax=1G
+TasksMax=128
+LimitNOFILE=8192
+NoNewPrivileges=true
+# SDRplay device discovery requires the host temporary namespace.
+PrivateTmp=false
+ProtectHome=true
+ProtectSystem=strict
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+IPAddressDeny=any
+IPAddressAllow=localhost
+ReadWritePaths=@@SDR_STATE_DIR@@
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

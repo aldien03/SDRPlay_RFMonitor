@@ -1,0 +1,28 @@
+[Unit]
+Description=RF Monitor SDRconnect recovery check
+After=rf-monitor.service sdrconnect-headless.service
+
+[Service]
+Type=oneshot
+Group=@@SERVICE_GROUP@@
+EnvironmentFile=@@CONFIG_FILE@@
+RuntimeDirectory=rf-monitor-recovery
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+ExecStart=/bin/bash @@INSTALL_DIR@@/deploy/recover-sdrconnect.sh
+TimeoutStartSec=75s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+ReadWritePaths=/run/rf-monitor /run/rf-monitor-recovery
+UMask=0027

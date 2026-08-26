@@ -1,0 +1,139 @@
+{
+  "schemaVersion": 1,
+  "recordType": "rf-monitor-v5-acquisition-template",
+  "templateOnly": true,
+  "important": "This worksheet is not a valid V5 corpus manifest. Replace every REQUIRED_* value, generate all four-target/by-family criteria and at least 30 independently acquired sessions for each pair, then seal the corpus with an independent truth custodian before running validation.",
+  "corpus": {
+    "corpusId": "REQUIRED_STABLE_CORPUS_ID",
+    "purpose": "external-held-out-qualification",
+    "acquisitionDataDomain": "field",
+    "replayDataDomain": "test"
+  },
+  "frozenCandidate": {
+    "releaseVersion": "REQUIRED_FROM_DIST_RELEASE_JSON",
+    "buildId": "REQUIRED_FROM_DIST_RELEASE_JSON",
+    "sourceDigest": "REQUIRED_LOWERCASE_SHA256",
+    "packageDigest": "REQUIRED_LOWERCASE_SHA256",
+    "dependencyLockDigest": "REQUIRED_LOWERCASE_SHA256",
+    "configurationHash": "REQUIRED_LOWERCASE_SHA256",
+    "catalogVersion": "REQUIRED_EXACT_CATALOG_VERSION",
+    "catalogHash": "REQUIRED_LOWERCASE_SHA256",
+    "detectorVersion": "REQUIRED_EXACT_DETECTOR_VERSION",
+    "detectorRuleSetId": "rf-relative-mad-v1",
+    "detectorRuleHash": "REQUIRED_LOWERCASE_SHA256",
+    "detectorThresholds": "REQUIRED_EXACT_FULL_THRESHOLD_OBJECT"
+  },
+  "custody": {
+    "acquisitionClosedAt": "REQUIRED_ISO_8601_UTC",
+    "detectorFrozenAt": "REQUIRED_ISO_8601_UTC",
+    "criteriaCommittedAt": "REQUIRED_ISO_8601_UTC",
+    "truthCommittedAt": "REQUIRED_ISO_8601_UTC",
+    "unblindedAt": "REQUIRED_ISO_8601_UTC",
+    "corpusSealedAt": "REQUIRED_ISO_8601_UTC",
+    "acquisitionCustodianIdHash": "REQUIRED_DISTINCT_LOWERCASE_SHA256",
+    "truthLabelerIdHash": "REQUIRED_DISTINCT_LOWERCASE_SHA256",
+    "detectorCustodianIdHash": "REQUIRED_DISTINCT_LOWERCASE_SHA256",
+    "independentTruthLabels": true,
+    "holdoutNotUsedForTuning": true,
+    "thresholdsFrozenBeforeUnblinding": true
+  },
+  "externalWitness": {
+    "note": "A separate witness signs the exact precommitment file SHA-256 before unblinding. The runner public key and its SHA-256 pin must be supplied out of band, not copied from this corpus.",
+    "receiptId": "REQUIRED_EXTERNAL_WITNESS_RECEIPT_ID",
+    "keySha256": "REQUIRED_OUT_OF_BAND_PINNED_ED25519_SPKI_SHA256",
+    "signedAt": "REQUIRED_ISO_8601_UTC_BEFORE_UNBLINDING",
+    "unblindingNotBefore": "REQUIRED_ISO_8601_UTC",
+    "statementSha256": "REQUIRED_LOWERCASE_SHA256",
+    "signatureAlgorithm": "ed25519",
+    "signatureBase64": "REQUIRED_DETACHED_SIGNATURE"
+  },
+  "criterionTemplate": {
+    "criterionId": "REQUIRED_TARGET_AND_FAMILY_ID",
+    "targetId": "REQUIRED_ONE_OF_THE_FOUR_TIER1_PHYSICAL_TARGETS",
+    "family": "REQUIRED_WIDEBAND_PULSED_WIDEBAND_CW_MULTITONE_MOVING_NARROWBAND_OVERLOAD_DATA_GAP_CONFIGURATION_CHANGE_MATCHED_POWER_SPOOFING_OR_REPLAY_NUISANCE",
+    "expectedOutcome": "REQUIRED_ALERT_NO_ALERT_OR_UNKNOWN_FROM_THE_FROZEN_FAMILY_MAP",
+    "sessionIds": [
+      "REQUIRED_AT_LEAST_30_PREDECLARED_INDEPENDENT_SESSION_IDS"
+    ],
+    "minimumIndependentSessions": 30,
+    "requiredWilsonLowerBound": "REQUIRED_PREDECLARED_DECIMAL_FOR_ALERT_OR_NO_ALERT_NULL_FOR_UNKNOWN",
+    "maximumUnknownFraction": "REQUIRED_PREDECLARED_DECIMAL",
+    "maximumUnobservedFraction": "REQUIRED_PREDECLARED_DECIMAL",
+    "testedEnvelope": {
+      "envelopeId": "REQUIRED_STABLE_ENVELOPE_ID",
+      "description": "REQUIRED_PLAIN_DESCRIPTION_OF_WHAT_WAS_TESTED",
+      "parameters": {
+        "REQUIRED_MEASURED_OR_CONTROLLED_PARAMETER": "REQUIRED_VALUE_WITH_UNITS"
+      }
+    }
+  },
+  "sessionTemplate": {
+    "sessionId": "REQUIRED_PREDECLARED_SESSION_ID",
+    "acquisitionId": "REQUIRED_UNIQUE_ACQUISITION_ID",
+    "independentSession": true,
+    "source": {
+      "kind": "real-receiver-normalized-fft",
+      "acquisitionDataDomain": "field",
+      "normalizedEncoding": "uint8",
+      "realReceiver": true,
+      "synthetic": false,
+      "simulation": false,
+      "replay": false,
+      "iq": false
+    },
+    "receiver": {
+      "model": "REQUIRED_EXACT_RSPdx_OR_RSPdx_R2",
+      "serialSha256": "REQUIRED_HASH_DO_NOT_STORE_RAW_SERIAL"
+    },
+    "sdrconnect": {
+      "version": "REQUIRED_EXACT_VERSION",
+      "sampleRateReadBackConfirmed": true,
+      "fftValues": "normalized-uint8-display-values"
+    },
+    "rfAndGrid": {
+      "targetId": "REQUIRED_EXACT_PHYSICAL_TARGET",
+      "centerHz": "REQUIRED_EXACT_INTEGER",
+      "captureSpanHz": 10000000,
+      "analysisSpanHz": 8000000,
+      "sampleRateHz": 10000000,
+      "inputBinCount": "REQUIRED_NATIVE_FFT_BIN_COUNT",
+      "analysisStartBin": "REQUIRED_CENTRAL_MASK_START",
+      "analysisEndBin": "REQUIRED_CENTRAL_MASK_END",
+      "analysisMaskHash": "REQUIRED_LOWERCASE_SHA256",
+      "spectrumReference": "REQUIRED_VENDOR_DISPLAY_REFERENCE",
+      "spectrumBase": "REQUIRED_VENDOR_DISPLAY_BASE",
+      "antennaId": "REQUIRED_NONSECRET_STABLE_ID",
+      "gainProfileId": "REQUIRED_NONSECRET_STABLE_ID"
+    },
+    "protectedReferenceBaseline": {
+      "fingerprintId": "REQUIRED_EXACT_FINGERPRINT_ID",
+      "baselineId": "REQUIRED_APPROVED_BASELINE_ID",
+      "learningGenerationId": "REQUIRED_APPROVED_GENERATION_ID",
+      "mediansPath": "REQUIRED_UINT8_RELATIVE_PATH",
+      "madsPath": "REQUIRED_UINT8_RELATIVE_PATH"
+    },
+    "files": {
+      "descriptor": "sessions/SESSION_ID/session.json",
+      "observationIndex": "sessions/SESSION_ID/observations.jsonl",
+      "normalizedFft": "sessions/SESSION_ID/fft.uint8",
+      "truthDisclosure": "sessions/SESSION_ID/truth.json"
+    }
+  },
+  "truthTemplate": {
+    "custodian": "INDEPENDENT_TRUTH_LABELER_ONLY",
+    "commitBeforeUnblinding": true,
+    "commitmentAlgorithm": "sha256-canonical-json",
+    "eventWindowUsesMonotonicMilliseconds": true,
+    "nonce": "REQUIRED_AT_LEAST_32_RANDOM_BYTES_HEX",
+    "note": "Do not send truth files or labels to the detector team until the frozen candidate, criteria, session list, and truth commitments are sealed."
+  },
+  "requiredFinalFiles": [
+    "corpus-manifest.json",
+    "precommitment.json",
+    "one session.json per independent session",
+    "one observations.jsonl per independent session",
+    "one fft.uint8 per independent session",
+    "one independently committed truth.json per independent session",
+    "exact protected reference median and MAD uint8 arrays"
+  ]
+}

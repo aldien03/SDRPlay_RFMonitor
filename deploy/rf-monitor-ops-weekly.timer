@@ -1,0 +1,13 @@
+[Unit]
+Description=Verify RF Monitor evidence and backup every week
+
+[Timer]
+OnCalendar=Sun *-*-* 01:20:00
+RandomizedDelaySec=30m
+AccuracySec=5m
+Persistent=true
+Unit=rf-monitor-ops-weekly.service
+
+[Install]
+WantedBy=timers.target
+

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rf-monitor.invalid/schemas/long-qualification-result-v1.json",
+  "title": "RF Monitor V7 immutable result v1",
+  "type": "object",
+  "required": ["schemaVersion", "kind", "gate", "result", "candidateId", "identityDigest", "startedAt", "endedAt", "elapsedMs", "requiredElapsedMs", "samples", "serviceBootId", "commissioningEpochId", "continuity", "targets", "findings", "limitations"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "kind": { "const": "rf-monitor-long-qualification-result" },
+    "gate": { "const": "V7" },
+    "result": { "enum": ["PASS", "FAIL"] },
+    "candidateId": { "type": "string" },
+    "identityDigest": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "startedAt": { "type": "string", "format": "date-time" },
+    "endedAt": { "type": "string", "format": "date-time" },
+    "elapsedMs": { "type": "number", "minimum": 0 },
+    "requiredElapsedMs": { "const": 86400000 },
+    "samples": { "type": "integer", "minimum": 0, "maximum": 20000 },
+    "serviceBootId": { "type": "string" },
+    "commissioningEpochId": { "type": "string" },
+    "continuity": { "type": "object" },
+    "targets": { "type": "array", "minItems": 4, "maxItems": 4 },
+    "findings": { "type": "array" },
+    "limitations": { "type": "array", "minItems": 1 }
+  }
+}
