@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { compileScanTargets, describeMonitorTarget } from "../src/shared/bands";
-import { coverageStateForGroup, createMonitorFeeds, createMonitorGroups, signalStateForTargets } from "../src/shared/monitorGroups";
+import { captureWindowNaming, coverageStateForGroup, createMonitorFeeds, createMonitorGroups, signalStateForTargets } from "../src/shared/monitorGroups";
 import type { BandPreset, ChannelMonitorState, MonitorTarget, ServiceCoverageSummary } from "../src/shared/types";
 import { FOUR_DX_BAND, GNSS_BANDS, STARTRACK_BAND, TEST_CATALOG } from "./catalogFixture";
 
@@ -62,8 +62,9 @@ describe("monitor groups", () => {
     expect(feeds.find((feed) => feed.id === "survey-startrack")).toMatchObject({ kind: "stitched-sweep", category: "radio" });
     expect(feeds.find((feed) => feed.id === "survey-4dx")).toMatchObject({ kind: "stitched-sweep", category: "radio" });
     const sharedL1 = feeds.find((feed) => feed.bandIds.includes("gps-l1") && feed.bandIds.includes("galileo-e1") && feed.bandIds.includes("beidou-b1c"));
+    const gnssServiceLabel = TEST_CATALOG.services.find((service) => service.id === "gnss")!.label;
     expect(sharedL1).toMatchObject({
-      label: "GPS L1 / Galileo E1 / BeiDou B1C / SBAS L1",
+      label: `${gnssServiceLabel} 1575.420 MHz`,
       shortLabel: "L1 / E1 / B1C",
       kind: "capture-window",
       priority: true,
@@ -113,5 +114,60 @@ describe("monitor groups", () => {
     expect(signalStateForTargets(group.targetIds, states)).toBe("checking");
     expect(coverageStateForGroup(group, states, targets, now, true, true)).toBe("paused");
     expect(coverageStateForGroup(group, states, targets, now, false, false)).toBe("offline");
+  });
+});
+
+describe("captureWindowNaming", () => {
+  it("returns the fallback label with no signalsLabel for a single signal", () => {
+    const result = captureWindowNaming({
+      serviceLabel: "Navigation / GNSS",
+      fallbackLabel: "GLONASS G1",
+      centerHz: 1_602_000_000,
+      signals: [{ label: "GLONASS G1", centerHz: 1_602_000_000 }],
+    });
+    expect(result).toEqual({ label: "GLONASS G1" });
+  });
+
+  it("names a co-frequency window by service and frequency, listing all carried signals", () => {
+    const serviceLabel = TEST_CATALOG.services.find((service) => service.id === "gnss")!.label;
+    const l1Bands = GNSS_BANDS.filter((band) => band.captureTargetId === "gnss-l1-e1-b1c-sbas");
+    expect(l1Bands).toHaveLength(4);
+    const result = captureWindowNaming({
+      serviceLabel,
+      fallbackLabel: "GPS L1 / Galileo E1 / BeiDou B1C / SBAS L1",
+      centerHz: 1_575_420_000,
+      signals: l1Bands.map((band) => ({ label: [band.constellation, band.signal].filter(Boolean).join(" "), centerHz: band.centerHz })),
+    });
+    expect(result.label).toBe(`${serviceLabel} 1575.420 MHz`);
+    expect(result.signalsLabel).toBe("GPS L1 · Galileo E1 · BeiDou B1C · SBAS L1");
+  });
+
+  it("keeps the fallback label for signals at distinct centre frequencies (Fugro)", () => {
+    const fugroBands = TEST_CATALOG.bands.filter((band) => band.service === "fugro");
+    expect(fugroBands).toHaveLength(6);
+    const centerHzValues = new Set(fugroBands.map((band) => band.centerHz));
+    expect(centerHzValues.size).toBe(6);
+    const result = captureWindowNaming({
+      serviceLabel: TEST_CATALOG.services.find((service) => service.id === "fugro")!.label,
+      fallbackLabel: "Fugro corrections",
+      centerHz: 1_545_742_500,
+      signals: fugroBands.map((band) => ({ label: band.label, centerHz: band.centerHz })),
+    });
+    expect(result.label).toBe("Fugro corrections");
+    expect(result.signalsLabel).toBe("ARSAT · SASAT · OCSAT · ERSAT · EASAT · IRSAT");
+  });
+
+  it("removes duplicate signal names from signalsLabel, keeping first-seen order", () => {
+    const result = captureWindowNaming({
+      serviceLabel: "Navigation / GNSS",
+      fallbackLabel: "fallback",
+      centerHz: 1_575_420_000,
+      signals: [
+        { label: "GPS L1", centerHz: 1_575_420_000 },
+        { label: "SBAS L1", centerHz: 1_575_420_000 },
+        { label: "GPS L1", centerHz: 1_575_420_000 },
+      ],
+    });
+    expect(result.signalsLabel).toBe("GPS L1 · SBAS L1");
   });
 });

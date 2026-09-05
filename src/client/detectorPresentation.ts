@@ -1,4 +1,5 @@
 import type { DetectorAnomalyBinRange, DetectorSpectrumAnalysis, SignalMetricSample, SpectrumFrame } from "../shared/types";
+import { formatFrequency } from "./format";
 
 function safeInteger(value: unknown): value is number {
   return Number.isSafeInteger(value);
@@ -39,5 +40,46 @@ export function detectorBaselineAvailable(
 ): boolean {
   const analysis = detectorAnalysisForFrame(frame);
   return Boolean(analysis?.baselineAvailable && metrics && frame && metrics.bandId === frame.bandId);
+}
+
+export interface DisturbancePlacement {
+  startHz: number;
+  endHz: number;
+  widthHz: number;
+  /** Centre of the disturbance minus the centre of the window. Signed. */
+  offsetHz: number;
+  /** Disturbance width as a fraction of the analysed span, 0 to 1. */
+  coverageRatio: number;
+}
+
+/**
+ * Placement comes only from the live frame's detector annotation: a stored
+ * incident's affectedRangeHz is the whole analysed span, not where the
+ * disturbance was, so there is nothing to place for an archived incident.
+ */
+export function disturbancePlacement(frame: SpectrumFrame | undefined): DisturbancePlacement | undefined {
+  const analysis = detectorAnalysisForFrame(frame);
+  if (!frame || !analysis || analysis.overload || !analysis.anomalyBinRanges.length || frame.bins.length < 2) return undefined;
+  const startBin = Math.min(...analysis.anomalyBinRanges.map((range) => range.startBin));
+  const endBin = Math.max(...analysis.anomalyBinRanges.map((range) => range.endBin));
+  const binWidthHz = (frame.endHz - frame.startHz) / frame.bins.length;
+  const startHz = frame.startHz + startBin * binWidthHz;
+  const endHz = frame.startHz + endBin * binWidthHz;
+  const widthHz = endHz - startHz;
+  const offsetHz = (startHz + endHz) / 2 - (frame.startHz + frame.endHz) / 2;
+  const analysedWidthHz = (analysis.analysisEndBin - analysis.analysisStartBin) * binWidthHz;
+  const coverageRatio = analysedWidthHz > 0 ? Math.min(1, Math.max(0, widthHz / analysedWidthHz)) : 0;
+  return { startHz, endHz, widthHz, offsetHz, coverageRatio };
+}
+
+export function disturbancePlacementCopy(placement: DisturbancePlacement): string {
+  const extent = `${formatFrequency(placement.startHz, 3).replace(" MHz", "")}-${formatFrequency(placement.endHz, 3)}`;
+  const width = `${formatFrequency(placement.widthHz, 3).replace(" MHz", " MHz wide")}`;
+  const offsetMagnitude = Math.abs(placement.offsetHz);
+  const offset = offsetMagnitude < 10_000
+    ? "at the centre"
+    : `${formatFrequency(offsetMagnitude, 3).replace(" MHz", ` MHz ${placement.offsetHz < 0 ? "below" : "above"} the centre`)}`;
+  const coverage = `${Math.round(placement.coverageRatio * 100)}% of the checked span`;
+  return [extent, width, offset, coverage].join(" · ");
 }
 

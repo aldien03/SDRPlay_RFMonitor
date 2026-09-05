@@ -27,6 +27,33 @@ function rangeLabel(startHz: number, endHz: number): string {
   return mhz(startHz, 3).replace(' MHz', '') + '–' + mhz(endHz, 3);
 }
 
+export interface CaptureWindowNaming {
+  /** Primary name for the physical window. */
+  label: string;
+  /** Services this window carries, when they are worth naming separately. */
+  signalsLabel?: string;
+}
+
+/**
+ * Signals that share one centre frequency cannot be told apart in a power
+ * spectrum, so the window is named by its frequency and the services it carries
+ * are listed instead of being offered as a choice.
+ */
+export function captureWindowNaming(input: {
+  serviceLabel: string;
+  fallbackLabel: string;
+  centerHz: number;
+  signals: ReadonlyArray<{ label: string; centerHz: number }>;
+}): CaptureWindowNaming {
+  if (input.signals.length < 2) return { label: input.fallbackLabel };
+  const signalsLabel = unique(input.signals.map((signal) => signal.label)).join(' · ');
+  const sameCenter = input.signals.every((signal) => signal.centerHz === input.signals[0].centerHz);
+  if (!sameCenter) return { label: input.fallbackLabel, signalsLabel };
+  // Fixed three decimals rather than the trimming mhz() helper, so a window named
+  // by its frequency matches the frequency column shown beside it in Settings.
+  return { label: `${input.serviceLabel} ${(input.centerHz / 1_000_000).toFixed(3)} MHz`, signalsLabel };
+}
+
 function relatedTargets(bandId: string, targets: MonitorTarget[]): MonitorTarget[] {
   return targets.filter((target) => target.relatedBandIds.includes(bandId));
 }
@@ -245,8 +272,17 @@ export function createMonitorFeeds(
     const focusTarget = relevantTargets[0];
     if (!focusTarget) continue;
     const centerHz = focusTarget.centerHz;
-    const label = unique(bandsAtFrequency.map((band) => [band.constellation, band.signal].filter(Boolean).join(' '))).join(' / ');
+    const fallbackLabel = unique(bandsAtFrequency.map((band) => [band.constellation, band.signal].filter(Boolean).join(' '))).join(' / ');
     const shortLabel = unique(bandsAtFrequency.map((band) => band.signal || band.label)).join(' / ');
+    const serviceLabel = catalog.services.find((service) => service.id === 'gnss')?.label ?? 'gnss';
+    // Co-frequency signals cannot be told apart on a power spectrum; name the window by
+    // frequency and carry the services separately rather than deleting them entirely.
+    const { label } = captureWindowNaming({
+      serviceLabel,
+      fallbackLabel,
+      centerHz,
+      signals: bandsAtFrequency.map((band) => ({ label: [band.constellation, band.signal].filter(Boolean).join(' '), centerHz: band.centerHz })),
+    });
     feeds.push({
       id: 'window-' + physicalTargetId,
       label,

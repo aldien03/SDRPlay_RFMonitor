@@ -1,4 +1,5 @@
 import { compileScanTargets, describeMonitorTarget } from "../shared/bands";
+import { captureWindowNaming } from "../shared/monitorGroups";
 import type {
   BandCatalog,
   BandPreset,
@@ -168,16 +169,20 @@ export function buildSignalLearningPresentation(input: {
     const physical = target.physicalTargetId
       ? input.catalog.captureTargets.find((candidate) => candidate.id === target.physicalTargetId)
       : undefined;
-    const windowLabel = physical?.label
-      ?? (target.physicalTargetId
-        ? described.label
-        : [serviceLabel, formatRange(target.startHz, target.endHz)].filter(Boolean).join(" "));
+    const bands = [...new Map(target.coverage.map(({ band }) => [band.id, band])).values()];
+    const naming = captureWindowNaming({
+      serviceLabel: serviceLabel ?? described.service,
+      fallbackLabel: physical?.label
+        ?? (target.physicalTargetId
+          ? described.label
+          : [serviceLabel, formatRange(target.startHz, target.endHz)].filter(Boolean).join(" ")),
+      centerHz: target.centerHz,
+      signals: bands.map((band) => ({ label: band.label, centerHz: band.centerHz })),
+    });
     return {
       targetId: target.id,
-      label: windowLabel,
-      ...(physical && described.label && described.label !== windowLabel
-        ? { signalsLabel: described.label }
-        : {}),
+      label: naming.label,
+      ...(naming.signalsLabel ? { signalsLabel: naming.signalsLabel } : {}),
       service: described.service,
       state: signalLearningState(baseline?.lifecycle),
       representativeHours: baseline?.representativeHours ?? 0,

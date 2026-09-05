@@ -25,7 +25,7 @@ import type { DisplayOptions } from "./BottomPanels";
 import type { SweepFrameState, TargetFrameState } from "./useMonitor";
 import { formatFrequency } from "./format";
 import { carrierViewRange, SpectrumView, WaterfallView } from "./SpectrumViews";
-import { detectorBaselineAvailable } from "./detectorPresentation";
+import { detectorBaselineAvailable, disturbancePlacement, type DisturbancePlacement } from "./detectorPresentation";
 import { SIGNAL_WALL_CAPACITY, type SignalWallLayout } from "./signalWallPreferences";
 import { preferencesForWall, surfacedVisibleFeedIds } from "./feedVisibility";
 import { operatorObservationForSurface, operatorObservationMatchesTargets } from "./operatorViewModel";
@@ -92,6 +92,7 @@ export function feedMetricReadout(input: {
   baselineAvailable: boolean;
   off: boolean;
   unavailable: boolean;
+  placement?: DisturbancePlacement;
 }): FeedMetricReadout | undefined {
   if (input.off || input.unavailable || !input.frame || !input.metrics) return undefined;
   const metrics = input.metrics;
@@ -99,6 +100,7 @@ export function feedMetricReadout(input: {
   const chips = [`Peak ${Math.round(metrics.peakLevel)}/255`];
   if (input.baselineAvailable) chips.push(`${metrics.baselineDelta >= 0 ? "+" : "−"}${Math.abs(Math.round(metrics.baselineDelta))} vs usual`);
   chips.push(`Busy ${Math.round(metrics.occupiedRatio * 100)}%`);
+  if (input.placement) chips.push(`${(input.placement.widthHz / 1_000_000).toFixed(2)} MHz wide`);
   return { chips, overload: false };
 }
 
@@ -275,7 +277,8 @@ function SignalFeedCard({
     currentAvailable: Boolean(current),
     unavailable,
   });
-  const metricReadout = feedMetricReadout({ frame, metrics, baselineAvailable: detectorBaselineAvailable(frame, metrics), off, unavailable });
+  const placement = disturbancePlacement(frame);
+  const metricReadout = feedMetricReadout({ frame, metrics, baselineAvailable: detectorBaselineAvailable(frame, metrics), off, unavailable, placement });
   const stateCopy = SIGNAL_STATE_COPY[signalState];
   const cardState = off ? "off" : signalState;
   const stateLabel = off ? "Off" : stateCopy.label;

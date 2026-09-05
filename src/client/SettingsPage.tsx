@@ -15,9 +15,10 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { estimateRevisitMs } from "../shared/bands";
+import { captureWindowNaming } from "../shared/monitorGroups";
 import { presentOperatorSummary } from "../shared/operatorSummary";
 import { applyMonitoringMission, compileEffectiveBands, continuousWatchTargetId, evaluateSettingsFeasibility, monitoringMissionForSettings, ROBUST_DETECTION_DEFAULTS, selectedMonitoringTargetIds } from "../shared/settings";
-import type { BandPreset, BaselineApprovalEligibility, BaselineDescriptor, MonitorSnapshot, MonitoringMission, OperationalSettings, PhysicalCaptureTarget, SettingsRevision } from "../shared/types";
+import type { BandCatalog, BandPreset, BaselineApprovalEligibility, BaselineDescriptor, MonitorSnapshot, MonitoringMission, OperationalSettings, PhysicalCaptureTarget, SettingsRevision } from "../shared/types";
 import { formatBytes, formatFrequency, formatRange } from "./format";
 import {
   buildSignalLearningPresentation,
@@ -287,17 +288,24 @@ export function SettingsPage(props: SettingsPageProps) {
     setAdminDialogOpen(true);
   };
 
-  // Every active frequency that already has learned data, in display order, so a
-  // single protected action can restart the whole set one target at a time.
-  const restartableBaselines = useMemo<BaselineDescriptor[]>(() => {
+  // One presentation for every surface that names a frequency window, so the
+  // learning list, the restart dialog and the batch action cannot drift apart.
+  const learningTargets = useMemo(() => {
     if (!response) return [];
     return buildSignalLearningPresentation({
       catalog: response.catalog,
       effectiveBands: response.effectiveBands,
       sampleRateHz: response.infrastructure.sampleRateHz,
       baselines: response.baselineStates,
-    }).activeTargets.flatMap((target) => target.baseline ? [target.baseline] : []);
+    }).activeTargets;
   }, [response]);
+
+  // Every active frequency that already has learned data, in display order, so a
+  // single protected action can restart the whole set one target at a time.
+  const restartableBaselines = useMemo<BaselineDescriptor[]>(
+    () => learningTargets.flatMap((target) => target.baseline ? [target.baseline] : []),
+    [learningTargets],
+  );
 
   const updateBaseline = async (action: "approve" | "restart", baseline: BaselineDescriptor) => {
     if (!response) return;
@@ -547,7 +555,7 @@ export function SettingsPage(props: SettingsPageProps) {
       {pendingBaselineRestart && response ? (
         <DialogShell backdropClassName="settings-admin-backdrop" dialogClassName="settings-admin-dialog settings-confirm-dialog" labelledBy="restart-baseline-title" describedBy="restart-baseline-description" onClose={() => setPendingBaselineRestart(undefined)}>
           <header><div><RotateCcw size={20} aria-hidden="true" /><strong id="restart-baseline-title">Start learning again?</strong></div><button className="icon-button" type="button" onClick={() => setPendingBaselineRestart(undefined)} aria-label="Cancel signal learning restart"><X size={20} aria-hidden="true" /></button></header>
-          <div className="settings-dialog-body"><p id="restart-baseline-description">Start a new learning period for {response.catalog.captureTargets.find((target) => target.id === pendingBaselineRestart.targetId)?.label ?? friendlyTargetId(pendingBaselineRestart.targetId)}. The approved normal level and recorded evidence are kept.</p><div className="settings-admin-actions"><button className="button secondary" type="button" autoFocus onClick={() => setPendingBaselineRestart(undefined)}>Cancel</button><button className="button danger" type="button" onClick={() => { const baseline = pendingBaselineRestart; setPendingBaselineRestart(undefined); void updateBaseline("restart", baseline); }}>Start learning</button></div></div>
+          <div className="settings-dialog-body"><p id="restart-baseline-description">Start a new learning period for {learningTargets.find((target) => target.targetId === pendingBaselineRestart.targetId)?.label ?? response.catalog.captureTargets.find((target) => target.id === pendingBaselineRestart.targetId)?.label ?? friendlyTargetId(pendingBaselineRestart.targetId)}. The approved normal level and recorded evidence are kept.</p><div className="settings-admin-actions"><button className="button secondary" type="button" autoFocus onClick={() => setPendingBaselineRestart(undefined)}>Cancel</button><button className="button danger" type="button" onClick={() => { const baseline = pendingBaselineRestart; setPendingBaselineRestart(undefined); void updateBaseline("restart", baseline); }}>Start learning</button></div></div>
         </DialogShell>
       ) : null}
 
@@ -671,11 +679,12 @@ function MonitoringSettings({ response, draft, current, setDraft, errors, disabl
           <FrequencyWindowPicker
             mode="single"
             targets={monitoringTargets}
+            catalog={response.catalog}
             selectedIds={continuousTarget ? [continuousTarget.id] : []}
             disabled={disabled}
             onToggle={(targetId) => setDraft(applyMonitoringMission(draft, response.catalog, "continuous-watch", targetId))}
           />
-          {continuousTarget ? <div className="mission-target-summary"><span>{currentMission === "continuous-watch" && currentContinuousTargetId === continuousTarget.id ? "Monitoring" : "Will monitor"}</span><strong>{continuousTarget.label}</strong><small>{formatFrequency(continuousTarget.nominalDisplayHz ?? continuousTarget.centerHz, 3)}</small></div> : null}
+          {continuousTarget ? <div className="mission-target-summary"><span>{currentMission === "continuous-watch" && currentContinuousTargetId === continuousTarget.id ? "Monitoring" : "Will monitor"}</span><strong>{captureWindowNaming({ serviceLabel: services.get(continuousTarget.service)?.label ?? continuousTarget.service, fallbackLabel: continuousTarget.label, centerHz: continuousTarget.centerHz, signals: continuousTarget.relatedBandIds.flatMap((bandId) => { const band = response.catalog.bands.find((candidate) => candidate.id === bandId); return band ? [{ label: band.label, centerHz: band.centerHz }] : []; }) }).label}</strong><small>{formatFrequency(continuousTarget.nominalDisplayHz ?? continuousTarget.centerHz, 3)}</small></div> : null}
           {continuousTarget?.service === "fugro" ? <FugroBeamPicker beams={fugroBeams} selectedIds={viewSettings.monitoring.fugro.selectedBeamIds} disabled={disabled} error={errors["monitoring.fugro.selectedBeamIds"]} onChange={(selectedBeamIds) => update((next) => { next.monitoring.fugro.selectedBeamIds = selectedBeamIds; })} /> : null}
         </div>
       ) : null}
@@ -687,6 +696,7 @@ function MonitoringSettings({ response, draft, current, setDraft, errors, disabl
           <FrequencyWindowPicker
             mode="multiple"
             targets={monitoringTargets}
+            catalog={response.catalog}
             selectedIds={selectedTargetIds}
             disabled={disabled}
             onToggle={(targetId) => {
@@ -748,18 +758,30 @@ const MISSION_OPTIONS: Array<{ value: Exclude<MonitoringMission, "custom">; labe
   { value: "radio-survey", label: "Radio Survey", detail: "StarTrack and 4DX" },
 ];
 
-function FrequencyWindowPicker({ mode, targets, selectedIds, disabled, onToggle }: {
+function FrequencyWindowPicker({ mode, targets, catalog, selectedIds, disabled, onToggle }: {
   mode: "single" | "multiple";
   targets: PhysicalCaptureTarget[];
+  catalog: BandCatalog;
   selectedIds: string[];
   disabled: boolean;
   onToggle: (targetId: string) => void;
 }) {
+  const bandsById = new Map(catalog.bands.map((band) => [band.id, band]));
+  const serviceLabels = new Map(catalog.services.map((service) => [service.id, service.label]));
   return <div className="frequency-window-list" role={mode === "single" ? "radiogroup" : "group"} aria-label="Frequency windows">{targets.map((target) => {
     const checked = selectedIds.includes(target.id);
+    const naming = captureWindowNaming({
+      serviceLabel: serviceLabels.get(target.service) ?? target.service,
+      fallbackLabel: target.label,
+      centerHz: target.centerHz,
+      signals: target.relatedBandIds.flatMap((bandId) => {
+        const band = bandsById.get(bandId);
+        return band ? [{ label: band.label, centerHz: band.centerHz }] : [];
+      }),
+    });
     return <label key={target.id} className={checked ? "selected" : ""}>
       <input type={mode === "single" ? "radio" : "checkbox"} name={mode === "single" ? "continuous-frequency-window" : undefined} checked={checked} disabled={disabled || (mode === "multiple" && checked && selectedIds.length <= 2)} onChange={() => onToggle(target.id)} />
-      <span><strong>{target.label}</strong><small>{target.service === "fugro" ? "Fugro corrections" : "GNSS"}{target.tier === "tier1" ? " · Priority" : ""}</small></span>
+      <span><strong>{naming.label}</strong><small>{naming.signalsLabel ?? (target.service === "fugro" ? "Fugro corrections" : "GNSS")}{target.tier === "tier1" ? " · Priority" : ""}</small></span>
       <b>{formatFrequency(target.nominalDisplayHz ?? target.centerHz, 3)}</b>
     </label>;
   })}</div>;

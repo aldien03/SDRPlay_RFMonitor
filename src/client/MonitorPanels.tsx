@@ -14,9 +14,10 @@ import {
   TriangleAlert,
 } from "lucide-react";
 import { presentOperatorSummary, type OperatorSummaryV1 } from "../shared/operatorSummary";
-import type { DetectionEvent, MonitorSnapshot, ServiceCoverageSummary } from "../shared/types";
+import type { DetectionEvent, MonitorSnapshot, ServiceCoverageSummary, SpectrumFrame } from "../shared/types";
 import { dateTime, formatDuration, formatFrequency, formatRange, timeOnly } from "./format";
 import { operatorObservationForSurface } from "./operatorViewModel";
+import { disturbancePlacement, disturbancePlacementCopy } from "./detectorPresentation";
 import { SpectrumView, WaterfallView } from "./SpectrumViews";
 
 interface DisplayOptions {
@@ -311,6 +312,7 @@ export function IncidentPanel({
   onAcknowledge,
   onExport,
   archived = false,
+  frame,
 }: {
   event?: DetectionEvent;
   operatorSummary: OperatorSummaryV1;
@@ -320,8 +322,10 @@ export function IncidentPanel({
   onAcknowledge: () => void;
   onExport: () => void;
   archived?: boolean;
+  frame?: SpectrumFrame;
 }) {
   const presentation = presentOperatorSummary(operatorSummary);
+  const placement = disturbancePlacement(frame);
   const currentIncident = archived ? undefined : operatorSummary.incident;
   const incidentPresent = archived ? Boolean(event) : Boolean(currentIncident);
   const synthetic = archived ? Boolean(event?.syntheticExercise) : operatorSummary.dataMode === "simulation" || Boolean(currentIncident?.synthetic);
@@ -363,7 +367,8 @@ export function IncidentPanel({
           {!archived && canonicalObservation.at ? <IncidentRow label="Last observation" value={`${dateTime(canonicalObservation.at, displayTimeZone)} · ${canonicalObservation.ageLabel}`} /> : null}
           {event ? <IncidentRow label="Duration" value={formatDuration(event.startedAt, event.clearedAt ?? event.lastSeenAt)} /> : null}
           {affected ? <IncidentRow label="Affected signal" value={affected} /> : null}
-          {event ? <IncidentRow label="Scan range" value={formatRange(...event.affectedRangeHz)} /> : null}
+          {event ? <IncidentRow label="Checked span" value={formatRange(...event.affectedRangeHz)} /> : null}
+          {placement ? <IncidentRow label="Disturbance" value={disturbancePlacementCopy(placement)} /> : null}
           {observation ? <IncidentRow label="Observed" value={observation} /> : null}
         </div>
       ) : <div className="incident-empty">{presentation.observation}</div>}

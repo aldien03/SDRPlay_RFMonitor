@@ -204,6 +204,18 @@ describe("feed metric readout", () => {
     const readout = feedMetricReadout({ frame, metrics: { ...metrics, baselineDelta: -5 }, baselineAvailable: true, off: false, unavailable: false });
     expect(readout?.chips[1]).toBe("−5 vs usual");
   });
+
+  const placement = { startHz: 1_575_100_000, endHz: 1_575_700_000, widthHz: 600_000, offsetHz: 400_000, coverageRatio: 0.12 };
+
+  it("appends the width chip last, leaving the earlier chips unchanged, when a placement is supplied", () => {
+    expect(feedMetricReadout({ frame, metrics, baselineAvailable: true, off: false, unavailable: false, placement }))
+      .toEqual({ chips: ["Peak 24/255", "+3 vs usual", "Busy 42%", "0.60 MHz wide"], overload: false });
+  });
+
+  it("still reports only Receiver overloaded when a placement is supplied and the receiver is saturated", () => {
+    expect(feedMetricReadout({ frame, metrics: { ...metrics, overload: true }, baselineAvailable: true, off: false, unavailable: false, placement }))
+      .toEqual({ chips: ["Receiver overloaded"], overload: true });
+  });
 });
 
 describe("feed manager scope", () => {

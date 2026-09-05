@@ -166,11 +166,20 @@ describe("settings signal learning presentation", () => {
       sampleRateHz: 10_000_000,
       baselines: [],
     });
+    // The Active frequencies row and the restart dialog both read this
+    // presentation, so pinning its naming pins every settings surface at once.
     const captureTargetsById = new Map(TEST_CATALOG.captureTargets.map((target) => [target.id, target]));
-    const matched = presentation.activeTargets.filter((target) => captureTargetsById.has(target.targetId));
+    const l1 = presentation.activeTargets.find((target) => target.targetId === "gnss-l1-e1-b1c-sbas");
+    const fugro = presentation.activeTargets.find((target) => target.targetId === "fugro-corrections-lband");
 
-    expect(matched.length).toBeGreaterThan(0);
-    for (const target of matched) expect(target.label).toBe(captureTargetsById.get(target.targetId)!.label);
+    // Four signals share 1575.42 MHz and cannot be told apart, so the window is
+    // named by its frequency and the services it carries are listed instead.
+    expect(l1?.label).not.toBe(captureTargetsById.get("gnss-l1-e1-b1c-sbas")!.label);
+    expect(l1?.label).toContain("1575.42");
+    expect(l1?.signalsLabel).toBe("GPS L1 · Galileo E1 · BeiDou B1C · SBAS L1");
+
+    // Fugro beams sit on distinct carriers, so that window keeps its catalog name.
+    expect(fugro?.label).toBe(captureTargetsById.get("fugro-corrections-lband")!.label);
   });
 
   it("marks a saved record whose frequency is no longer monitored", () => {
