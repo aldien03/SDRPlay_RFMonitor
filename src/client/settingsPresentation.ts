@@ -15,6 +15,8 @@ export type SignalLearningState = "learning" | "ready" | "approved" | "needs-lea
 export interface SignalLearningTargetView {
   targetId: string;
   label: string;
+  /** Signals covered by this physical window, when they differ from the window name. */
+  signalsLabel?: string;
   service: ServiceGroup;
   state: SignalLearningState;
   representativeHours: number;
@@ -33,6 +35,8 @@ export interface SavedSignalLearningView {
   key: string;
   label: string;
   service?: ServiceGroup;
+  /** True when this record's target is still one of the monitored windows. */
+  targetActive: boolean;
   state: SignalLearningState;
   representativeHours: number;
   observationCount: number;
@@ -161,11 +165,19 @@ export function buildSignalLearningPresentation(input: {
     const described = describeMonitorTarget(target);
     const baseline = currentBaselines.get(target.id);
     const serviceLabel = serviceLabels.get(described.service);
+    const physical = target.physicalTargetId
+      ? input.catalog.captureTargets.find((candidate) => candidate.id === target.physicalTargetId)
+      : undefined;
+    const windowLabel = physical?.label
+      ?? (target.physicalTargetId
+        ? described.label
+        : [serviceLabel, formatRange(target.startHz, target.endHz)].filter(Boolean).join(" "));
     return {
       targetId: target.id,
-      label: target.physicalTargetId
-        ? described.label
-        : [serviceLabel, formatRange(target.startHz, target.endHz)].filter(Boolean).join(" "),
+      label: windowLabel,
+      ...(physical && described.label && described.label !== windowLabel
+        ? { signalsLabel: described.label }
+        : {}),
       service: described.service,
       state: signalLearningState(baseline?.lifecycle),
       representativeHours: baseline?.representativeHours ?? 0,
@@ -194,6 +206,7 @@ export function buildSignalLearningPresentation(input: {
       return {
         key: `${baseline.targetId}:${baseline.fingerprintId}:${baseline.learningGenerationId}`,
         ...identity,
+        targetActive: activeTargetMap.has(baseline.targetId),
         state: signalLearningState(baseline.lifecycle),
         representativeHours: baseline.representativeHours,
         observationCount: baseline.observationCount,

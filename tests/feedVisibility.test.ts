@@ -10,7 +10,7 @@ const feeds = [
 ] as MonitorFeed[];
 
 function preferences(layout: SignalWallPreferences["layout"] = "2x1"): SignalWallPreferences {
-  return { schemaVersion: 4, layout, pinnedFeedIds: ["l1", "l2"], selectedFeedId: "l2" };
+  return { schemaVersion: 4, layout, pinnedFeedIds: ["l1", "l2"], seeded: true, selectedFeedId: "l2" };
 }
 
 describe("affected-feed surfacing", () => {

@@ -6,6 +6,12 @@ export interface SignalWallPreferences {
   schemaVersion: 4;
   layout: SignalWallLayout;
   pinnedFeedIds: string[];
+  /**
+   * True once the operator's own pin set has been stored. An empty wall is a
+   * real choice, so the starter pins may only seed a preference that the
+   * operator has never chosen.
+   */
+  seeded: boolean;
   selectedFeedId?: string;
   legacyGroupIds?: string[];
   legacyTargetIds?: string[];
@@ -27,6 +33,7 @@ export const DEFAULT_SIGNAL_WALL_PREFERENCES: SignalWallPreferences = {
   schemaVersion: 4,
   layout: "2x1",
   pinnedFeedIds: [],
+  seeded: false,
 };
 
 function stringArray(value: unknown, limit: number): string[] {
@@ -51,13 +58,15 @@ export function parseSignalWallPreferences(value: string | null, legacyValue: st
     if (Array.isArray(parsed.pinnedFeedIds)) {
       const pinnedFeedIds = stringArray(parsed.pinnedFeedIds, 9);
       const selectedFeedId = typeof parsed.selectedFeedId === "string" ? parsed.selectedFeedId : undefined;
-      return { schemaVersion: 4, layout, pinnedFeedIds, selectedFeedId };
+      const seeded = typeof parsed.seeded === "boolean" ? parsed.seeded : true;
+      return { schemaVersion: 4, layout, pinnedFeedIds, seeded, selectedFeedId };
     }
     if (Array.isArray(parsed.pinnedGroupIds)) {
       return {
         schemaVersion: 4,
         layout,
         pinnedFeedIds: [],
+        seeded: false,
         legacyGroupIds: stringArray(parsed.pinnedGroupIds, 9),
         legacySelectedTargetIds: stringRecord(parsed.selectedTargetIds),
       };
@@ -66,6 +75,7 @@ export function parseSignalWallPreferences(value: string | null, legacyValue: st
       schemaVersion: 4,
       layout,
       pinnedFeedIds: [],
+      seeded: false,
       legacyTargetIds: stringArray(parsed.pinnedTargetIds, 9),
     };
   } catch {
@@ -91,40 +101,49 @@ export function reconcileSignalWallPreferences(
   feeds: MonitorFeed[],
 ): SignalWallPreferences {
   if (!feeds.length) return preferences;
+  // A pin survives as long as the backend still publishes the feed. A feed the
+  // operator switched off in Monitoring stays pinned and is labelled Off on the
+  // wall; silently dropping it would make pinning look broken.
+  const known = new Set(feeds.map((feed) => feed.id));
   const available = new Set(feeds.filter((feed) => feed.enabled).map((feed) => feed.id));
-  let pinnedFeedIds = preferences.pinnedFeedIds.filter((feedId) => available.has(feedId)).slice(0, 9);
+  let pinnedFeedIds = preferences.pinnedFeedIds.filter((feedId) => known.has(feedId)).slice(0, 9);
 
-  if (!pinnedFeedIds.length && preferences.legacyGroupIds?.length) {
+  if (!pinnedFeedIds.length && !preferences.seeded && preferences.legacyGroupIds?.length) {
     pinnedFeedIds = preferences.legacyGroupIds
       .map((groupId) => feedForLegacyGroup(groupId, preferences.legacySelectedTargetIds ?? {}, feeds)?.id)
       .filter((feedId): feedId is string => Boolean(feedId && available.has(feedId)))
       .filter((feedId, index, values) => values.indexOf(feedId) === index)
       .slice(0, 9);
   }
-  if (!pinnedFeedIds.length && preferences.legacyTargetIds?.length) {
+  if (!pinnedFeedIds.length && !preferences.seeded && preferences.legacyTargetIds?.length) {
     pinnedFeedIds = preferences.legacyTargetIds
       .map((targetId) => feedForTarget(targetId, feeds)?.id)
       .filter((feedId): feedId is string => Boolean(feedId && available.has(feedId)))
       .filter((feedId, index, values) => values.indexOf(feedId) === index)
       .slice(0, 9);
   }
-  if (!pinnedFeedIds.length) {
-    const gpsL2 = feeds.find((feed) => feed.category === "navigation" && feed.bandIds.includes("gps-l2"));
-    const galileoE5a = feeds.find((feed) => feed.category === "navigation" && feed.bandIds.includes("galileo-e5a"));
+  // Starter pins only ever apply to a wall the operator has not chosen yet.
+  if (!pinnedFeedIds.length && !preferences.seeded) {
+    const enabled = feeds.filter((feed) => available.has(feed.id));
+    const gpsL2 = enabled.find((feed) => feed.category === "navigation" && feed.bandIds.includes("gps-l2"));
+    const galileoE5a = enabled.find((feed) => feed.category === "navigation" && feed.bandIds.includes("galileo-e5a"));
     const defaults = [
-      ...feeds.filter((feed) => feed.category === "navigation" && feed.priority),
-      ...feeds.filter((feed) => feed.id === "survey-startrack"),
-      ...feeds.filter((feed) => feed.id === "survey-4dx"),
+      ...enabled.filter((feed) => feed.category === "navigation" && feed.priority),
+      ...enabled.filter((feed) => feed.id === "survey-startrack"),
+      ...enabled.filter((feed) => feed.id === "survey-4dx"),
       ...(gpsL2 ? [gpsL2] : []),
       ...(galileoE5a ? [galileoE5a] : []),
-      ...feeds.filter((feed) => feed.category === "navigation" && !feed.priority),
-      ...feeds.filter((feed) => feed.category === "radio" && !["survey-startrack", "survey-4dx"].includes(feed.id)),
+      ...enabled.filter((feed) => feed.category === "navigation" && !feed.priority),
+      ...enabled.filter((feed) => feed.category === "radio" && !["survey-startrack", "survey-4dx"].includes(feed.id)),
     ];
     pinnedFeedIds = defaults.map((feed) => feed.id).filter((feedId, index, values) => values.indexOf(feedId) === index).slice(0, 5);
   }
 
+  // Stay unseeded while there was nothing to seed from, so a wall that is empty
+  // only because no service is enabled yet still gets its starter pins later.
+  const seeded = preferences.seeded || pinnedFeedIds.length > 0;
   const selectedFeedId = preferences.selectedFeedId && pinnedFeedIds.includes(preferences.selectedFeedId)
     ? preferences.selectedFeedId
     : pinnedFeedIds[1] ?? pinnedFeedIds[0];
-  return { schemaVersion: 4, layout: preferences.layout, pinnedFeedIds, selectedFeedId };
+  return { schemaVersion: 4, layout: preferences.layout, pinnedFeedIds, seeded, selectedFeedId };
 }

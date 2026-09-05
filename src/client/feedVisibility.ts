@@ -46,5 +46,5 @@ export function surfacedVisibleFeedIds(input: {
 }
 
 export function preferencesForWall(layout: SignalWallLayout, pinnedFeedIds: string[], selectedFeedId?: string): SignalWallPreferences {
-  return { schemaVersion: 4, layout, pinnedFeedIds, selectedFeedId };
+  return { schemaVersion: 4, layout, pinnedFeedIds, seeded: true, selectedFeedId };
 }

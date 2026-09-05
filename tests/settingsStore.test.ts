@@ -191,3 +191,22 @@ describe("settings persistence", () => {
     )).rejects.toThrow(/audit durability is uncertain/i);
   });
 });
+
+describe("quarantined profile retention", () => {
+  it("keeps only the newest invalid profiles so the config directory stays bounded", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "rf-monitor-quarantine-"));
+    temporaryRoots.push(root);
+    const operationalPath = path.join(root, "operational.json");
+    const auditPath = path.join(root, "config-audit.jsonl");
+    const revisionsPath = path.join(root, "revisions");
+
+    // Twelve successive starts, each finding an unusable profile on disk.
+    for (let index = 0; index < 12; index += 1) {
+      await writeFile(operationalPath, "{ not valid json");
+      await SettingsStore.create({ settings: settings(), catalog: TEST_CATALOG, operationalPath, auditPath, revisionsPath });
+    }
+
+    const quarantined = (await readdir(root)).filter((name) => name.includes(".invalid-"));
+    expect(quarantined.length).toBe(10);
+  });
+});

@@ -33,7 +33,7 @@ const emptySnapshot: MonitorSnapshot = {
       dependencyLockDigest: "0".repeat(64),
       integrity: "runtime-derived",
     },
-    protocols: { health: 2, live: 2, evidenceManifest: 2, catalogSchema: 3, operationalSchema: 3 },
+    protocols: { health: 2, live: 2, evidenceManifest: 2, catalogSchema: 4, operationalSchema: 4 },
     configuration: {
       catalogVersion: "loading",
       configurationHash: "",

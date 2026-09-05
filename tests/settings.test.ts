@@ -8,8 +8,10 @@ import {
   createDefaultOperationalSettings,
   evaluateSettingsFeasibility,
   createServiceSummaries,
+  continuousWatchTargetId,
   monitoringMissionForSettings,
-  primaryWatchTargetId,
+  ROBUST_DETECTION_DEFAULTS,
+  selectedMonitoringTargetIds,
   validateBandCatalog,
   SettingsValidationError,
   validateOperationalSettings,
@@ -34,7 +36,7 @@ function defaults(): OperationalSettings {
 }
 
 describe("operational monitoring settings", () => {
-  it("defaults new installations to the combined L1/E1/B1C/SBAS Primary Watch target", () => {
+  it("defaults new installations to the combined L1/E1/B1C/SBAS Continuous Watch target", () => {
     const settings = defaults();
     expect(settings.monitoring.startrack.enabled).toBe(false);
     expect(settings.monitoring["4dx"].enabled).toBe(false);
@@ -42,27 +44,27 @@ describe("operational monitoring settings", () => {
     expect(new Set(compileEffectiveBands(TEST_CATALOG, settings).map((band) => band.captureTargetId))).toEqual(new Set([
       "gnss-l1-e1-b1c-sbas",
     ]));
-    expect(monitoringMissionForSettings(settings, TEST_CATALOG)).toBe("primary-watch");
+    expect(monitoringMissionForSettings(settings, TEST_CATALOG)).toBe("continuous-watch");
   });
 
-  it("applies Primary Watch as one physical GNSS target", () => {
-    const settings = applyMonitoringMission(defaults(), TEST_CATALOG, "primary-watch");
-    expect(settings.schemaVersion).toBe(3);
+  it("applies Continuous Watch as one selected physical GNSS target", () => {
+    const settings = applyMonitoringMission(defaults(), TEST_CATALOG, "continuous-watch");
+    expect(settings.schemaVersion).toBe(4);
     expect(settings.scan.profile).toBe("gnss-priority");
     expect(settings.monitoring.startrack.enabled).toBe(false);
     expect(settings.monitoring["4dx"].enabled).toBe(false);
-    expect(primaryWatchTargetId(settings, TEST_CATALOG)).toBe("gnss-l1-e1-b1c-sbas");
+    expect(continuousWatchTargetId(settings, TEST_CATALOG)).toBe("gnss-l1-e1-b1c-sbas");
     expect(new Set(compileEffectiveBands(TEST_CATALOG, settings).map((band) => band.captureTargetId))).toEqual(new Set(["gnss-l1-e1-b1c-sbas"]));
-    expect(monitoringMissionForSettings(validateOperationalSettings(settings, TEST_CATALOG), TEST_CATALOG)).toBe("primary-watch");
+    expect(monitoringMissionForSettings(validateOperationalSettings(settings, TEST_CATALOG), TEST_CATALOG)).toBe("continuous-watch");
 
-    const l5 = applyMonitoringMission(settings, TEST_CATALOG, "primary-watch", "gnss-l5-e5a-b2a");
-    expect(primaryWatchTargetId(l5, TEST_CATALOG)).toBe("gnss-l5-e5a-b2a");
+    const l5 = applyMonitoringMission(settings, TEST_CATALOG, "continuous-watch", "gnss-l5-e5a-b2a");
+    expect(continuousWatchTargetId(l5, TEST_CATALOG)).toBe("gnss-l5-e5a-b2a");
     expect(l5.scan.priorityWindowId).toBe("gnss-l5-e5a-b2a");
     expect(l5.scan.maxPriorityGapMs).toBe(6_000);
     expect(validateOperationalSettings(l5, TEST_CATALOG).monitoring.gnss.enabledSignalIds.sort()).toEqual(["beidou-b2a", "galileo-e5a", "gps-l5"]);
   });
 
-  it("applies Multi-band Survey as the exact Tier-1 target set", () => {
+  it("defaults Multi-band Survey to the Tier-1 GNSS target set", () => {
     const configured = defaults();
     configured.monitoring.startrack.enabled = true;
     configured.monitoring["4dx"].enabled = true;
@@ -72,7 +74,19 @@ describe("operational monitoring settings", () => {
     expect(settings.scan.profile).toBe("fast-gnss");
     expect(settings.monitoring.startrack.enabled).toBe(false);
     expect(settings.monitoring["4dx"].enabled).toBe(false);
-    expect(targetIds).toEqual(new Set(TEST_CATALOG.captureTargets.filter((target) => target.tier === "tier1").map((target) => target.id)));
+    expect(targetIds).toEqual(new Set(TEST_CATALOG.captureTargets.filter((target) => target.service === "gnss" && target.tier === "tier1").map((target) => target.id)));
+    expect(monitoringMissionForSettings(settings, TEST_CATALOG)).toBe("multi-band-survey");
+  });
+
+  it("lets Multi-band Survey combine selected GNSS and Fugro frequency windows", () => {
+    const selectedIds = ["gnss-l1-e1-b1c-sbas", "gnss-l5-e5a-b2a", "fugro-corrections-lband"];
+    const configured = defaults();
+    configured.monitoring.fugro.selectedBeamIds = ["fugro-ersat", "fugro-easat"];
+    const settings = applyMonitoringMission(configured, TEST_CATALOG, "multi-band-survey", selectedIds);
+    expect(selectedMonitoringTargetIds(settings, TEST_CATALOG)).toEqual(selectedIds);
+    expect(settings.monitoring.fugro.enabled).toBe(true);
+    expect(settings.monitoring.fugro.selectedBeamIds).toEqual(["fugro-ersat", "fugro-easat"]);
+    expect(new Set(compileEffectiveBands(TEST_CATALOG, settings).map((band) => band.captureTargetId))).toEqual(new Set(selectedIds));
     expect(monitoringMissionForSettings(settings, TEST_CATALOG)).toBe("multi-band-survey");
   });
 
@@ -85,6 +99,36 @@ describe("operational monitoring settings", () => {
     expect(compileEffectiveBands(TEST_CATALOG, settings).every((band) => band.service !== "gnss")).toBe(true);
     expect(evaluateSettingsFeasibility({ settings, catalog: TEST_CATALOG, sampleRateHz: 10_000_000 }).optionalWorkAdmitted).toBe(true);
     expect(monitoringMissionForSettings(settings, TEST_CATALOG)).toBe("radio-survey");
+  });
+
+  it("applies Continuous Watch to Fugro as one physical target with multiple beam guides", () => {
+    const beamIds = ["fugro-ersat", "fugro-easat"];
+    const configured = defaults();
+    configured.monitoring.fugro.selectedBeamIds = beamIds;
+    const settings = applyMonitoringMission(configured, TEST_CATALOG, "continuous-watch", "fugro-corrections-lband");
+    const effective = compileEffectiveBands(TEST_CATALOG, settings);
+
+    expect(settings.scan).toMatchObject({ profile: "correction-watch", priorityWindowId: "fugro-corrections-lband" });
+    expect(settings.monitoring).toMatchObject({
+      gnss: { enabled: false },
+      startrack: { enabled: false },
+      "4dx": { enabled: false },
+      fugro: { enabled: true, selectedBeamIds: beamIds },
+    });
+    expect(effective.map((band) => band.id)).toEqual(beamIds);
+    expect(new Set(effective.map((band) => band.captureTargetId))).toEqual(new Set(["fugro-corrections-lband"]));
+    expect(new Set(effective.map((band) => band.captureCenterHz))).toEqual(new Set([1_545_742_500]));
+    expect(new Set(effective.map((band) => band.captureSpanHz))).toEqual(new Set([10_000_000]));
+    expect(new Set(effective.map((band) => band.analysisSpanHz))).toEqual(new Set([8_000_000]));
+    expect(monitoringMissionForSettings(validateOperationalSettings(settings, TEST_CATALOG), TEST_CATALOG)).toBe("continuous-watch");
+  });
+
+  it("requires one known beam whenever the Fugro window is enabled", () => {
+    const settings = applyMonitoringMission(defaults(), TEST_CATALOG, "continuous-watch", "fugro-corrections-lband");
+    settings.monitoring.fugro.selectedBeamIds = [];
+    expect(() => validateOperationalSettings(settings, TEST_CATALOG)).toThrow(/Select at least one Fugro beam/);
+    settings.monitoring.fugro.selectedBeamIds = ["fugro-unknown"];
+    expect(() => validateOperationalSettings(settings, TEST_CATALOG)).toThrow(/unknown beam/);
   });
 
   it("does not mislabel a legacy simultaneous selection as Radio Survey", () => {
@@ -159,7 +203,8 @@ describe("operational monitoring settings", () => {
       for (const field of ["captureTargetId", "captureCenterHz", "captureSpanHz", "analysisSpanHz", "revisitObjectiveMs", "captureTier", "nominalVisitMs", "maxVisitMs", "settleMs", "discardFrames", "minFreshFrames"] as const) delete band[field];
     }
     const catalog = validateBandCatalog(legacyCatalog);
-    expect(catalog.schemaVersion).toBe(3);
+    expect(catalog.schemaVersion).toBe(4);
+    expect(catalog.catalogVersion).toBe(legacyCatalog.catalogVersion);
     expect(catalog.priorityWindows[0].id).toBe("gnss-l1-core");
 
     const legacySettings = defaults() as any;
@@ -171,8 +216,46 @@ describe("operational monitoring settings", () => {
     delete legacySettings.scan.priorityWindowId;
     delete legacySettings.scan.maxPriorityGapMs;
     const settings = validateOperationalSettings(legacySettings, catalog);
-    expect(settings).toMatchObject({ schemaVersion: 3, scan: { profile: "balanced", maxPriorityGapMs: 10_000 } });
+    expect(settings).toMatchObject({
+      schemaVersion: 4,
+      scan: { profile: "balanced", maxPriorityGapMs: 10_000 },
+      monitoring: { fugro: { enabled: false, selectedBeamIds: [] } },
+    });
     expect(settings.monitoring.gnss.enabledSignalIds).not.toContain("sbas-l1");
+  });
+
+  it("migrates v3 settings to v4 without changing the active mission or stored choices", () => {
+    const current = applyMonitoringMission(defaults(), TEST_CATALOG, "multi-band-survey");
+    current.revision = 17;
+    current.retention.retentionMs = 7 * 86_400_000;
+    const legacy = structuredClone(current) as any;
+    legacy.schemaVersion = 3;
+    delete legacy.monitoring.fugro;
+    delete legacy.scan.dwellMs.fugro;
+    delete legacy.scan.priority.fugro;
+
+    const migrated = validateOperationalSettings(legacy, TEST_CATALOG);
+    expect(migrated).toMatchObject({
+      schemaVersion: 4,
+      revision: 17,
+      scan: { profile: "fast-gnss", dwellMs: { fugro: 1_000 }, priority: { fugro: 10 } },
+      monitoring: { fugro: { enabled: false, selectedBeamIds: [] } },
+      retention: { retentionMs: 7 * 86_400_000 },
+    });
+    expect(monitoringMissionForSettings(migrated, TEST_CATALOG)).toBe("multi-band-survey");
+  });
+
+  it("catalogs the published Fugro carriers with one shared capture target", () => {
+    const beams = TEST_CATALOG.bands.filter((band) => band.service === "fugro");
+    expect(beams.map((beam) => [beam.label, beam.centerHz, beam.correctionBeam?.linkId, beam.correctionBeam?.symbolRateHz, beam.correctionBeam?.bitRateBps])).toEqual([
+      ["ARSAT", 1_545_245_000, 13, 4_876, 2_400],
+      ["SASAT", 1_545_815_000, 4, 2_438, 1_200],
+      ["OCSAT", 1_545_875_000, 18, 2_438, 1_200],
+      ["ERSAT", 1_545_950_000, 20, 4_876, 2_400],
+      ["EASAT", 1_546_230_000, 6, 2_438, 1_200],
+      ["IRSAT", 1_546_240_000, 7, 2_438, 1_200],
+    ]);
+    expect(new Set(beams.map((beam) => beam.captureTargetId))).toEqual(new Set(["fugro-corrections-lband"]));
   });
 
   it("derives capture tiers from the selected profile and catalog priority window", () => {
@@ -236,5 +319,15 @@ describe("operational monitoring settings", () => {
       schedulerHealth,
       measurementAvailable: false,
     }).revisitObjective).toBe("not-verified");
+  });
+
+  it("ships detection defaults that pass validation", () => {
+    const settings = { ...defaults(), detection: { ...ROBUST_DETECTION_DEFAULTS } };
+    const validated = validateOperationalSettings(settings, TEST_CATALOG);
+    expect(validated.detection).toEqual(ROBUST_DETECTION_DEFAULTS);
+  });
+
+  it("keeps the shipped rule set id", () => {
+    expect(ROBUST_DETECTION_DEFAULTS.ruleSetId).toBe("rf-relative-mad-v1");
   });
 });

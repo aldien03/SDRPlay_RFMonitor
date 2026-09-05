@@ -31,7 +31,7 @@ async function config(exercises = true) {
     RF_MONITOR_SYNTHETIC_EXERCISES: exercises ? "true" : "false",
   });
   // These tests exercise every Tier-1 target. New installations intentionally
-  // default to one-target Primary Watch, so opt this fixture into Multi-band.
+  // default to one-target Continuous Watch, so opt this fixture into Multi-band.
   const value = withOperationalSettings(
     base,
     applyMonitoringMission(base.operationalSettings, base.bandCatalog, "multi-band-survey"),

@@ -205,8 +205,8 @@ export function createRuntimeIdentity(release: ReleaseIdentity, context: Identit
       health: 2,
       live: 2,
       evidenceManifest: 2,
-      catalogSchema: 3,
-      operationalSchema: 3,
+      catalogSchema: 4,
+      operationalSchema: 4,
     },
     configuration: { ...context },
   };

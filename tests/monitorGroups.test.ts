@@ -32,6 +32,7 @@ describe("monitor groups", () => {
     expect(groups.map((group) => group.id)).toEqual([
       "service-startrack",
       "service-4dx",
+      "service-fugro",
       "gnss-gps",
       "gnss-galileo",
       "gnss-glonass",
@@ -68,6 +69,22 @@ describe("monitor groups", () => {
       priority: true,
     });
     expect(feeds.filter((feed) => feed.bandIds.includes("gps-l2"))).toHaveLength(1);
+  });
+
+  it("builds selected Fugro beams as one shared live feed", () => {
+    const bands = TEST_CATALOG.bands.filter((band) => ["fugro-ersat", "fugro-easat", "fugro-irsat"].includes(band.id));
+    const targets = targetsFor(bands);
+    expect(targets).toHaveLength(1);
+    const feeds = createMonitorFeeds(TEST_CATALOG, bands, targets, summaries(bands));
+    expect(feeds).toHaveLength(1);
+    expect(feeds[0]).toMatchObject({
+      id: "window-fugro-corrections-lband",
+      service: "fugro",
+      kind: "capture-window",
+      targetIds: ["fugro-corrections-lband"],
+      bandIds: ["fugro-ersat", "fugro-easat", "fugro-irsat"],
+      centerHz: 1_545_742_500,
+    });
   });
 
   it("separates signal condition from scan coverage", () => {

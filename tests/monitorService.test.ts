@@ -68,6 +68,13 @@ function enableSingleRadioTarget(base: Awaited<ReturnType<typeof loadConfig>>) {
   return withOperationalSettings(base, settings);
 }
 
+// Continuous Watch on the one Fugro capture window. The mission helper also
+// seeds a beam selection, which an enabled-but-empty Fugro service would not.
+function enableFugroTarget(base: Awaited<ReturnType<typeof loadConfig>>) {
+  const settings = applyMonitoringMission(base.operationalSettings, base.bandCatalog, "continuous-watch", "fugro-corrections-lband");
+  return withOperationalSettings(base, settings);
+}
+
 describe("bounded monitor runtime", () => {
   it("publishes one server-owned operator summary without treating simulation as production", async () => {
     vi.useFakeTimers();
@@ -473,7 +480,7 @@ describe("bounded monitor runtime", () => {
     await monitor.stop();
   });
 
-  it("publishes one server-owned blocked approval state and throws its typed error", async () => {
+  it("keeps baseline review independent from historical commissioning faults", async () => {
     const monitor = new MonitorService(await temporaryConfig("baseline-approval-blocked"));
     await monitor.start();
     const baseline: BaselineDescriptor = {
@@ -488,7 +495,33 @@ describe("bounded monitor runtime", () => {
       learningStartedAt: "2026-08-20T12:00:00.000Z",
     };
     vi.spyOn(monitor, "getBaselineStates").mockReturnValue([baseline]);
-    vi.spyOn(monitor, "getCommissioningHealth").mockReturnValue({
+    const internal = monitor as unknown as {
+      config: { dataDomain: "field" | "test" };
+      activeBaselineFingerprints: Map<string, Record<string, unknown>>;
+      activeBaselineFingerprintIdByTarget: Map<string, string>;
+      evidenceHealthy: boolean;
+      targetStates: Map<string, ChannelMonitorState>;
+      receiverStates: Array<{
+        deviceReady: boolean;
+        streamReady: boolean;
+        connection: "live";
+        streamState: "running";
+        deviceName: string;
+        lastFrameAt: string;
+      }>;
+    };
+    internal.config.dataDomain = "field";
+    internal.receiverStates = [{
+      deviceReady: true,
+      streamReady: true,
+      connection: "live",
+      streamState: "running",
+      deviceName: "RSPdx",
+      lastFrameAt: new Date().toISOString(),
+    }];
+    internal.activeBaselineFingerprints.set(`${baseline.targetId}:${baseline.fingerprintId}`, {});
+    internal.activeBaselineFingerprintIdByTarget.set(baseline.targetId, baseline.fingerprintId);
+    const commissioning = vi.spyOn(monitor, "getCommissioningHealth").mockReturnValue({
       epochId: "commissioning-test",
       state: "invalidated",
       ready: false,
@@ -501,11 +534,45 @@ describe("bounded monitor runtime", () => {
       soakStartedAt: "2026-08-20T12:00:00.000Z",
       scanObjectiveReady: false,
       resourceSoakClean: false,
-      faults: ["evidence-frame-drop"],
+      faults: ["unknown-visit:insufficient-frames"],
     });
 
+    expect(monitor.getBaselineApprovalEligibility()[0]).toMatchObject({
+      eligible: true,
+      state: "eligible",
+      label: "Ready for review",
+    });
+    expect(commissioning()).toMatchObject({ ready: false, state: "invalidated" });
+    expect(monitor.getSnapshot().operatorSummary.monitoring).toMatchObject({
+      state: "checking",
+      reasonCode: "baseline-review-required",
+      actionCode: "open-signal-learning",
+    });
+
+    baseline.lifecycle = "protected";
+    internal.targetStates.set(baseline.targetId, {
+      targetId: baseline.targetId,
+      lifecycle: "clear",
+      candidateCount: 0,
+      clearCount: 0,
+      requiredCount: 3,
+      lastObservedAt: new Date().toISOString(),
+      baselineLifecycle: "protected",
+      observationDisposition: "clean",
+    });
+    const protectedSnapshot = monitor.getSnapshot();
+    expect(protectedSnapshot.operatorSummary.monitoring).toMatchObject({ state: "normal", reasonCode: "monitoring-normal" });
+    expect(protectedSnapshot.operatorSummary.productionQualification).toMatchObject({ state: "pending", ready: false });
+
+    baseline.lifecycle = "reviewable";
+    internal.evidenceHealthy = false;
     const approval = monitor.getBaselineApprovalEligibility()[0];
-    expect(approval).toMatchObject({ eligible: false, state: "blocked", label: "Restart required", detail: "Evidence recording fell behind." });
+    expect(approval).toMatchObject({
+      eligible: false,
+      state: "blocked",
+      label: "Recording issue",
+      detail: "Current evidence recording is not healthy.",
+    });
     await expect(monitor.approveBaseline({
       targetId: baseline.targetId,
       expectedFingerprintId: baseline.fingerprintId,
@@ -886,6 +953,40 @@ describe("bounded monitor runtime", () => {
       observationDisposition: "unknown",
     });
     expect(monitor.getBaselineStates().filter((baseline) => baseline.targetId === before.targetId).at(-1)).toMatchObject({ learningGenerationId: "2" });
+    await monitor.stop();
+  });
+
+  it("restarts signal learning for the Fugro L-band capture target", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-20T12:00:00.000Z"));
+    const config = enableFugroTarget(await temporaryConfig("fugro-learning-restart"));
+    const monitor = new MonitorService(config);
+    await monitor.start();
+    const internal = monitor as unknown as {
+      stopSimulation(): void;
+      handleSpectrum(receiverId: number, bins: Uint8Array, source: "simulation"): void;
+      detector: { getBaselineStates(): Array<{ targetId: string; learningGenerationId: string; observationCount: number }> };
+    };
+    internal.stopSimulation();
+    const quiet = new Uint8Array(640).fill(30);
+    internal.handleSpectrum(0, quiet, "simulation");
+    internal.handleSpectrum(0, quiet, "simulation");
+    internal.handleSpectrum(0, quiet, "simulation");
+    const before = monitor.getBaselineStates()[0];
+    expect(before).toMatchObject({ targetId: "fugro-corrections-lband", dataDomain: "test", learningGenerationId: "1" });
+
+    const restarted = await monitor.restartBaseline({
+      targetId: before.targetId,
+      expectedFingerprintId: before.fingerprintId,
+      expectedGeneration: 1,
+      restartedBy: "settings-admin",
+    });
+
+    expect(restarted).toMatchObject({ committed: true, state: "complete", auditDurable: true });
+    expect(restarted.baseline).toMatchObject({ dataDomain: "test", lifecycle: "learning", learningGenerationId: "2", observationCount: 0 });
+    expect(internal.detector.getBaselineStates()).toEqual([
+      expect.objectContaining({ targetId: "fugro-corrections-lband", learningGenerationId: "2", observationCount: 0 }),
+    ]);
     await monitor.stop();
   });
 

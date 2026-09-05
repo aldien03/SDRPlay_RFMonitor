@@ -1,5 +1,5 @@
 export const OPERATOR_SUMMARY_SCHEMA_VERSION = 1 as const;
-export const OPERATOR_COPY_VERSION = "operator-copy-v2" as const;
+export const OPERATOR_COPY_VERSION = "operator-copy-v3" as const;
 export const MAX_OPERATOR_AFFECTED_TARGETS = 16;
 
 export const OPERATOR_MONITORING_STATES = [
@@ -24,6 +24,7 @@ export const OPERATOR_REASON_CODES = [
   "monitoring-normal",
   "monitoring-checking",
   "signal-learning",
+  "baseline-review-required",
   "candidate-checking",
   "receiver-offline",
   "live-data-late",
@@ -54,6 +55,7 @@ export const OPERATOR_ACTION_CODES = [
   "open-incident",
   "resume-monitoring",
   "wait-for-check",
+  "open-signal-learning",
   "open-recording",
   "open-system-health",
   "review-qualification",
@@ -204,6 +206,7 @@ export const OPERATOR_REASON_COPY: Readonly<Record<OperatorReasonCode, string>> 
   "monitoring-normal": "No RF anomaly",
   "monitoring-checking": "Checking signal",
   "signal-learning": "Signal learning",
+  "baseline-review-required": "Review signal learning",
   "candidate-checking": "Checking repeated signal change",
   "receiver-offline": "Receiver offline",
   "live-data-late": "Data late",
@@ -232,6 +235,7 @@ export const OPERATOR_ACTION_COPY: Readonly<Record<OperatorActionCode, string>> 
   "open-incident": "Open incident",
   "resume-monitoring": "Resume monitoring",
   "wait-for-check": "Wait for the next scan",
+  "open-signal-learning": "Open Signal learning",
   "open-recording": "Open Recording",
   "open-system-health": "Open System health",
   "review-qualification": "Review qualification",

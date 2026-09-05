@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { copyFile, mkdir, open, readFile, rename, stat } from "node:fs/promises";
+import { copyFile, mkdir, open, readdir, readFile, rename, stat, unlink } from "node:fs/promises";
 import path from "node:path";
 import { changedFieldPaths, compileEffectiveBands, validateOperationalSettings } from "../shared/settings";
 import type { BandCatalog, ConfigurationAuditEntry, OperationalSettings } from "../shared/types";
@@ -20,6 +20,28 @@ async function exists(filePath: string): Promise<boolean> {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
     throw error;
+  }
+}
+
+/**
+ * Quarantined profiles are a diagnostic aid, not an archive. Keep the newest
+ * few so an unattended 24/7 install cannot fill its configuration directory.
+ */
+const QUARANTINE_RETAINED = 10;
+
+async function pruneQuarantinedProfiles(operationalPath: string): Promise<void> {
+  const directory = path.dirname(operationalPath);
+  const prefix = `${path.basename(operationalPath)}.invalid-`;
+  try {
+    const stale = (await readdir(directory))
+      .filter((name) => name.startsWith(prefix) && name.endsWith(".bak"))
+      .sort()
+      .slice(0, -QUARANTINE_RETAINED);
+    for (const name of stale) {
+      await unlink(path.join(directory, name)).catch(() => undefined);
+    }
+  } catch {
+    // Retention is best effort; it must never block service startup.
   }
 }
 
@@ -116,6 +138,7 @@ export class SettingsStore {
         await copyFile(options.operationalPath, revisionBackup);
       } else if (restored) {
         await copyFile(options.operationalPath, `${options.operationalPath}.invalid-${timestamp}.bak`);
+        await pruneQuarantinedProfiles(options.operationalPath);
       }
     }
     if (!operationalExists || restored || migratedFromV2) await writeAtomic(options.operationalPath, options.settings);

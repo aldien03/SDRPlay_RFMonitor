@@ -38,7 +38,7 @@ function identity(overrides: Partial<RuntimeIdentity["release"]> = {}, sampleRat
       integrity: "release-metadata",
       ...overrides,
     },
-    protocols: { health: 2, live: 2, evidenceManifest: 2, catalogSchema: 3, operationalSchema: 3 },
+    protocols: { health: 2, live: 2, evidenceManifest: 2, catalogSchema: 4, operationalSchema: 4 },
     configuration: {
       catalogVersion: "catalog-v3",
       configurationHash: "4".repeat(64),

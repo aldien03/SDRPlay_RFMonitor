@@ -79,6 +79,29 @@ export function signalStateForFeed(input: {
   return !input.currentAvailable && !input.unavailable ? "checking" : input.measured;
 }
 
+export interface FeedMetricReadout {
+  /** Short chips rendered left to right under the chart heading. */
+  chips: string[];
+  /** True when the receiver was saturated, so level chips are not meaningful. */
+  overload: boolean;
+}
+
+export function feedMetricReadout(input: {
+  frame: SpectrumFrame | undefined;
+  metrics: SignalMetricSample | undefined;
+  baselineAvailable: boolean;
+  off: boolean;
+  unavailable: boolean;
+}): FeedMetricReadout | undefined {
+  if (input.off || input.unavailable || !input.frame || !input.metrics) return undefined;
+  const metrics = input.metrics;
+  if (metrics.overload) return { chips: ["Receiver overloaded"], overload: true };
+  const chips = [`Peak ${Math.round(metrics.peakLevel)}/255`];
+  if (input.baselineAvailable) chips.push(`${metrics.baselineDelta >= 0 ? "+" : "−"}${Math.abs(Math.round(metrics.baselineDelta))} vs usual`);
+  chips.push(`Busy ${Math.round(metrics.occupiedRatio * 100)}%`);
+  return { chips, overload: false };
+}
+
 function feedTarget(feed: MonitorFeed, targets: MonitorTarget[]): MonitorTarget | undefined {
   return targets.find((target) => target.id === feed.focusTargetId)
     ?? targets.find((target) => feed.targetIds.includes(target.id));
@@ -202,6 +225,9 @@ function SignalFeedCard({
   const history = feed.kind === "stitched-sweep" && !isLive ? sweepData?.waterfall ?? [] : targetData?.waterfall ?? [];
   const frame = traceFrame(current, history, options.traceMode);
   const metrics = metricsForFrame(frame, feed.kind === "stitched-sweep" && !isLive ? sweepData?.metrics : targetData?.metrics);
+  // A pinned feed whose service is switched off in Monitoring stays on the wall
+  // and says so, rather than silently reporting Scanning over an empty plot.
+  const off = !feed.enabled;
   const exclusive = Boolean(snapshot.activeFocus);
   const feedObservedAt = feed.kind === "stitched-sweep" && !isLive
     ? sweep?.lastCompletedAt
@@ -222,6 +248,8 @@ function SignalFeedCard({
   const stale = !paused && !unavailable && feed.targetIds.every((targetId) => snapshot.monitorTargets.find((item) => item.id === targetId)?.coverageMode === "stale");
   const coverageLabel = exercise
     ? "Simulation"
+    : off
+    ? "Off"
     : unavailable
     ? "Offline"
     : isLive
@@ -247,37 +275,43 @@ function SignalFeedCard({
     currentAvailable: Boolean(current),
     unavailable,
   });
+  const metricReadout = feedMetricReadout({ frame, metrics, baselineAvailable: detectorBaselineAvailable(frame, metrics), off, unavailable });
   const stateCopy = SIGNAL_STATE_COPY[signalState];
+  const cardState = off ? "off" : signalState;
+  const stateLabel = off ? "Off" : stateCopy.label;
   const displayStartHz = frame ? frame.startHz : feed.startHz;
   const displayEndHz = frame ? frame.endHz : feed.endHz;
   const displayCoverage = isLive && frame ? `${formatFrequency(frame.startHz, 3).replace(" MHz", "")}-${formatFrequency(frame.endHz, 3)}` : feed.coverageLabel;
+  const frequencyGuides = useMemo(() => snapshot.bands
+    .filter((band) => feed.bandIds.includes(band.id) && band.service === "fugro" && band.correctionBeam)
+    .map((band) => ({ frequencyHz: band.centerHz, label: band.label })), [feed.bandIds, snapshot.bands]);
 
   return (
-    <article className={`mission-feed-card ${selected ? "selected" : ""} ${signalState} ${paused ? "paused" : ""} ${exercise ? "simulation" : ""}`}>
+    <article className={`mission-feed-card ${selected ? "selected" : ""} ${cardState} ${paused ? "paused" : ""} ${exercise ? "simulation" : ""}`}>
       <header className="feed-header">
         <button className="feed-identity" type="button" onClick={onSelect} aria-pressed={selected} aria-label={`Select ${feed.label}`}>
           <span className="feed-icon">{feed.category === "navigation" ? <span className="feed-icon-text">GPS</span> : <SatelliteDish size={23} />}</span>
-          <div><h2>{feed.label}</h2><p>{displayCoverage}<span aria-hidden="true"> - </span>{coverageLabel}{liveAge ? ` - ${liveAge}` : ""}<span className={`feed-state-dot ${signalState}`} aria-hidden="true" /><strong>{stateCopy.label}</strong></p></div>
+          <div><h2>{feed.label}</h2><p>{displayCoverage}<span aria-hidden="true"> - </span>{coverageLabel}{liveAge ? ` - ${liveAge}` : ""}<span className={`feed-state-dot ${cardState}`} aria-hidden="true" /><strong>{stateLabel}</strong></p></div>
         </button>
         <div className="feed-freshness">
           {exercise ? <button className="stop-exercise-button" type="button" disabled={Boolean(exercise.stopRequested && exercise.phase !== "complete")} onMouseDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); onStopExercise(); }} aria-label={exercise.phase === "complete" ? "Close simulation test" : "Stop simulation test"}>{exercise.phase === "complete" ? "Done" : exercise.stopRequested ? "Stopping…" : "Stop test"}</button> : null}
-          {!isLive ? <span>{canonicalAffected ? canonicalObservation.at ? `Checked ${lastObservedAge}` : lastObservedAge : lastObservedAt ? `Checked ${lastObservedAge}` : feed.kind === "stitched-sweep" ? `First sweep ${progress}%` : "Not checked"}</span> : null}
-          {resume ? <span>Resumes in {resume}</span> : nextCheck ? <span>Next check {nextCheck}</span> : null}
+          {off ? <span>Not monitored</span> : !isLive ? <span>{canonicalAffected ? canonicalObservation.at ? `Checked ${lastObservedAge}` : lastObservedAge : lastObservedAt ? `Checked ${lastObservedAge}` : feed.kind === "stitched-sweep" ? `First sweep ${progress}%` : "Not checked"}</span> : null}
+          {!off && resume ? <span>Resumes in {resume}</span> : nextCheck ? <span>Next check {nextCheck}</span> : null}
           {compact ? <button type="button" onClick={(event) => { event.stopPropagation(); onInspect(); }} aria-label={`Expand ${feed.label}`}><Maximize2 size={16} /></button> : null}
         </div>
       </header>
-      {!exercise && !isLive && !unavailable && target ? <button className="make-live-button" type="button" onClick={(event) => { event.stopPropagation(); onRequestFocus(); }}>Make live</button> : null}
+      {!exercise && !off && !isLive && !unavailable && target ? <button className="make-live-button" type="button" onClick={(event) => { event.stopPropagation(); onRequestFocus(); }}>Make live</button> : null}
       <div className="feed-mode-line">
         <span>{exercise ? "SIMULATION" : isLive || feed.kind === "capture-window" ? "One receiver window" : "Stitched sweep"}</span>
         <span>{exercise ? `${exercise.scenarioName} · ${exercise.phase === "waiting-for-target" ? "Starting" : exercise.phase === "alert" ? "Test alert" : exercise.phase === "recovering" ? `Recovering ${exercise.cleanChecks} of ${exercise.requiredCleanChecks}` : exercise.phase === "complete" ? exercise.verdict ?? "Test complete" : exercise.phase === "inconclusive" ? "Test inconclusive" : "Test running"}` : coverageLabel}</span>
       </div>
-      <div className="feed-chart-heading"><strong>Relative signal level</strong><div><span><i className="legend-current" />{feed.kind === "stitched-sweep" && !isLive ? "Last full sweep" : "Current"}</span>{options.baseline && (feed.kind !== "stitched-sweep" || isLive) && detectorBaselineAvailable(frame, metrics) ? <span><i className="legend-usual" />Usual level</span> : null}</div></div>
+      <div className="feed-chart-heading"><strong>Relative signal level</strong>{metricReadout ? <span className={`feed-metrics ${metricReadout.overload ? "overload" : ""}`}>{metricReadout.chips.map((chip) => <b key={chip}>{chip}</b>)}</span> : null}<div><span><i className="legend-current" />{feed.kind === "stitched-sweep" && !isLive ? "Last full sweep" : "Current"}</span>{options.baseline && (feed.kind !== "stitched-sweep" || isLive) && detectorBaselineAvailable(frame, metrics) ? <span><i className="legend-usual" />Usual level</span> : null}</div></div>
       <div className="feed-spectrum-grid">
         <div className="plain-level-axis" aria-hidden="true"><span>High</span><span>Usual</span><span>Low</span></div>
-        <div className="feed-spectrum"><SpectrumView frame={frame} metrics={metrics} showBaseline={options.baseline && (feed.kind !== "stitched-sweep" || isLive)} showMarkers={options.markers} /></div>
+        <div className="feed-spectrum"><SpectrumView frame={frame} metrics={metrics} showBaseline={options.baseline && (feed.kind !== "stitched-sweep" || isLive)} showMarkers={options.markers} frequencyGuides={frequencyGuides} />{off ? <p className="feed-off-notice">Off. Turn this window on in Settings, Monitoring.</p> : null}</div>
       </div>
       <FeedFrequencyAxis startHz={displayStartHz} endHz={displayEndHz} />
-      <div className="feed-waterfall"><WaterfallView frames={history} /></div>
+      <div className="feed-waterfall"><WaterfallView frames={history} frequencyGuides={frequencyGuides} /></div>
       <FeedFrequencyAxis startHz={displayStartHz} endHz={displayEndHz} />
       {feed.kind === "stitched-sweep" ? <div className="sweep-progress"><span>{paused ? `Paused at ${progress}%` : sweep?.status === "complete" && sweep.lastCompletedAt ? `Sweep ready · ${ageLabel(sweep.lastCompletedAt, now)}` : sweep?.lastCompletedAt ? `Scanning ${progress}% · Last sweep ${ageLabel(sweep.lastCompletedAt, now)}` : `First sweep ${progress}%`}</span><div><i style={{ width: `${progress}%` }} /></div></div> : null}
     </article>
@@ -349,15 +383,26 @@ function ShelfGroup({ label, feeds, targets, targetStates, operatorSummary, swee
   })}</div></div>;
 }
 
+/**
+ * Only monitored windows produce a feed, so the manager says how many the
+ * current Monitoring selection covers rather than leaving a short list
+ * looking like a missing frequency.
+ */
+export function feedManagerScopeCopy(windowCount: number): string {
+  return `This list shows the ${windowCount} frequency ${windowCount === 1 ? "window" : "windows"} your Monitoring selection covers. To pin another window, add it in Monitoring first.`;
+}
+
 export function FeedManagerModal({
   feeds,
   pinnedFeedIds,
   onChange,
+  onOpenMonitoring,
   onClose,
 }: {
   feeds: MonitorFeed[];
   pinnedFeedIds: string[];
   onChange: (feedIds: string[]) => void;
+  onOpenMonitoring: () => void;
   onClose: () => void;
 }) {
   const selected = new Set(pinnedFeedIds);
@@ -381,6 +426,10 @@ export function FeedManagerModal({
     <DialogShell backdropClassName="feed-manager-backdrop" dialogClassName="feed-manager" labelledBy="feed-manager-title" onClose={onClose}>
       <header><div><span>Signal wall</span><strong id="feed-manager-title">Choose signals</strong></div><button type="button" onClick={onClose} aria-label="Close"><X size={19} /></button></header>
       <div className="feed-manager-count">{pinnedFeedIds.length} of 9 pinned</div>
+      <div className="feed-manager-scope">
+        <span>{feedManagerScopeCopy(feeds.length)}</span>
+        <button type="button" onClick={onOpenMonitoring}>Open Monitoring</button>
+      </div>
       <div className="feed-manager-list">{sections.map((section) => <section key={section.label}><h3>{section.label}</h3>{section.feeds.map((feed) => {
         const order = pinnedFeedIds.indexOf(feed.id);
         const isPinned = order >= 0;

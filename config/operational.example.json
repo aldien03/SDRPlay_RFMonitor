@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 3,
+  "schemaVersion": 4,
   "revision": 1,
   "updatedAt": "2026-08-20T00:00:00.000Z",
   "siteName": "RF Monitoring Site",
@@ -19,14 +19,15 @@
         "BeiDou": { "enabled": true, "signals": { "beidou-b1i": { "enabled": false, "spanHz": 8000000 }, "beidou-b1c": { "enabled": true, "spanHz": 8000000 }, "beidou-b2a": { "enabled": true, "spanHz": 8000000 }, "beidou-b2b": { "enabled": false, "spanHz": 8000000 }, "beidou-b3i": { "enabled": false, "spanHz": 8000000 } } },
         "SBAS": { "enabled": true, "signals": { "sbas-l1": { "enabled": true, "spanHz": 8000000 } } }
       }
-    }
+    },
+    "fugro": { "enabled": false, "selectedBeamIds": [] }
   },
   "scan": {
     "profile": "fast-gnss",
     "priorityWindowId": "gnss-l1-core",
     "maxPriorityGapMs": 2000,
-    "dwellMs": { "startrack": 8000, "4dx": 8000, "gnss": 1000 },
-    "priority": { "startrack": 1, "4dx": 1, "gnss": 10 }
+    "dwellMs": { "startrack": 8000, "4dx": 8000, "gnss": 1000, "fugro": 1000 },
+    "priority": { "startrack": 1, "4dx": 1, "gnss": 10, "fugro": 10 }
   },
   "detection": {
     "ruleSetId": "rf-relative-mad-v1",

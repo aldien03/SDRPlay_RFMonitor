@@ -43,7 +43,7 @@ async function startServer(simulation: "on" | "off", exercises = false): Promise
       RF_MONITOR_STORAGE: path.join(root, "evidence"),
       RF_MONITOR_CATALOG_FILE: path.join(repositoryRoot, "config/band-catalog.example.json"),
       // Live-playback coverage in this test deliberately targets all four
-      // Tier-1 windows; production defaults remain one-target Primary Watch.
+      // Tier-1 windows; production defaults remain one-target Continuous Watch.
       RF_MONITOR_OPERATIONAL_FILE: path.join(repositoryRoot, "config/operational.example.json"),
       SDRCONNECT_URL: "ws://127.0.0.1:9/",
       RF_MONITOR_RECOVERY_REQUEST: path.join(root, "recover-sdrconnect"),

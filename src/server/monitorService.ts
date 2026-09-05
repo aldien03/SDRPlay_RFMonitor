@@ -700,8 +700,7 @@ export class MonitorService extends EventEmitter {
   }
 
   getBaselineApprovalEligibility(): BaselineApprovalEligibility[] {
-    const commissioning = this.getCommissioningHealth();
-    return this.getBaselineStates().map((baseline) => this.baselineApprovalEligibility(baseline, commissioning));
+    return this.getBaselineStates().map((baseline) => this.baselineApprovalEligibility(baseline));
   }
 
   getProtectedBaselineReadiness(): { ready: boolean; requiredTargetIds: string[]; pendingTargetIds: string[] } {
@@ -1083,7 +1082,6 @@ export class MonitorService extends EventEmitter {
 
   private baselineApprovalEligibility(
     baseline: BaselineDescriptor,
-    commissioning: CommissioningHealth,
   ): BaselineApprovalEligibility {
     const common = {
       targetId: baseline.targetId,
@@ -1092,34 +1090,28 @@ export class MonitorService extends EventEmitter {
     };
     if (baseline.lifecycle === "protected") return { ...common, eligible: false, state: "approved", label: "Approved" };
     if (baseline.lifecycle !== "reviewable") return { ...common, eligible: false, state: "learning", label: "Learning" };
-    if (commissioning.simulation || commissioning.dataDomain !== "field") {
+    if (this.config.dataDomain !== "field") {
       return { ...common, eligible: false, state: "blocked", label: "Test data", detail: "Field data is required.", action: "Use Live field data." };
     }
-    if (commissioning.state === "receiver-pending") {
+    const receiverReady = getMonitoringReadiness(this.receiverStates).ready;
+    if (!receiverReady) {
       return { ...common, eligible: false, state: "blocked", label: "Receiver offline", detail: "RF data is unavailable.", action: "Restore RF data." };
     }
-    if (commissioning.state === "invalidated") {
-      const fault = commissioning.faults[0];
-      const detail = fault === "evidence-frame-drop"
-        ? "Evidence recording fell behind."
-        : fault === "resource-critical"
-          ? "Computer resources reached a safety limit."
-          : fault === "unknown-visit:insufficient-frames"
-            ? "Not enough RF data was received."
-            : fault === "unknown-visit:tune-timeout"
-              ? "A frequency change timed out."
-              : "The commissioning check stopped.";
-      return { ...common, eligible: false, state: "blocked", label: "Restart required", detail, action: "Restart RF Monitor to begin a new 24-hour check." };
+    const writer = this.getWriterHealth();
+    if (!this.evidenceHealthy || this.storageMaintenance.pressure || writer.oldestAgeMs >= 2_000 || writer.queueItems >= 64 || writer.queueBytes >= 2 * 1024 * 1024) {
+      return { ...common, eligible: false, state: "blocked", label: "Recording issue", detail: "Current evidence recording is not healthy.", action: "Open Recording." };
     }
-    if (!commissioning.ready) {
-      const remainingMs = Math.max(0, commissioning.soakRequiredMs - commissioning.soakElapsedMs);
-      const detail = remainingMs > 0 ? "Commissioning is still running." : "Scan timing has not met its target.";
-      return { ...common, eligible: false, state: "checking", label: "Checking", detail, action: "Wait.", remainingMs };
+    if (this.resourceHealthState !== "normal" || this.hostMemoryPressureActive || this.applicationRecoveryActive || this.receiverRecoveryActive) {
+      return { ...common, eligible: false, state: "blocked", label: "System issue", detail: "Wait for current system recovery to finish.", action: "Open System health." };
+    }
+    const targetState = this.targetStates.get(baseline.targetId);
+    if (targetState && (targetState.candidateCount > 0 || targetState.lifecycle === "active" || targetState.lifecycle === "recovering")) {
+      return { ...common, eligible: false, state: "checking", label: "Checking", detail: "Wait for the current signal check to clear.", action: "Wait." };
     }
     if (!this.activeBaselineFingerprints.has(`${baseline.targetId}:${baseline.fingerprintId}`)) {
       return { ...common, eligible: false, state: "checking", label: "Checking", detail: "Waiting for current RF data.", action: "Wait." };
     }
-    return { ...common, eligible: true, state: "eligible", label: "Ready" };
+    return { ...common, eligible: true, state: "eligible", label: "Ready for review", detail: "Confirm this period is suitable as the local reference." };
   }
 
   async restartBaseline(input: {
@@ -1524,17 +1516,32 @@ export class MonitorService extends EventEmitter {
     ));
     const candidateActive = input.targetStates.some((state) => state.candidateCount > 0 && state.lifecycle === "detecting");
     const baselineDescriptors = this.getBaselineStates();
-    const signalLearningActive = input.monitorTargets.some((target) => {
+    const activeBaselineLifecycle = (targetId: string): BaselineDescriptor["lifecycle"] | undefined => {
+      const fingerprintId = this.activeBaselineFingerprintIdByTarget.get(targetId);
+      if (!fingerprintId) return undefined;
+      return baselineDescriptors
+        .filter((baseline) => baseline.targetId === targetId && baseline.fingerprintId === fingerprintId)
+        .sort((left, right) => Number(right.learningGenerationId) - Number(left.learningGenerationId))[0]?.lifecycle;
+    };
+    const activeMonitorTargets = input.monitorTargets.filter((target) => target.coverageMode !== "paused" && target.coverageMode !== "unavailable");
+    const signalLearningActive = activeMonitorTargets.some((target) => {
+      const lifecycle = activeBaselineLifecycle(target.id);
+      return lifecycle === undefined || lifecycle === "learning" || lifecycle === "provisional" || lifecycle === "stale";
+    });
+    const baselineReviewRequired = !signalLearningActive && activeMonitorTargets.some((target) => {
+      return activeBaselineLifecycle(target.id) === "reviewable";
+    });
+    /*
+     * A reviewable local reference has finished learning. The detector remains
+     * fail-closed until it is explicitly protected, but operator copy must not
+     * describe this human-review state as continued collection.
+     */
+    const unprotectedReferenceActive = activeMonitorTargets.some((target) => {
       if (target.coverageMode === "paused" || target.coverageMode === "unavailable") return false;
-      const fingerprintId = this.activeBaselineFingerprintIdByTarget.get(target.id);
-      if (!fingerprintId) return true;
-      const active = baselineDescriptors
-        .filter((baseline) => baseline.targetId === target.id && baseline.fingerprintId === fingerprintId)
-        .sort((left, right) => Number(right.learningGenerationId) - Number(left.learningGenerationId))[0];
-      return active?.lifecycle !== "protected";
+      return activeBaselineLifecycle(target.id) !== "protected";
     });
     const detectingActive = signalLearningActive
-      || input.targetStates.some((state) => state.lifecycle === "detecting");
+      || (!baselineReviewRequired && input.targetStates.some((state) => state.lifecycle === "detecting"));
     const recovering = input.targetStates.some((state) => state.lifecycle === "recovering")
       || this.activeEvent?.lifecycle === "recovering";
     const alertActive = input.targetStates.some((state) => state.lifecycle === "active")
@@ -1631,6 +1638,7 @@ export class MonitorService extends EventEmitter {
         candidateActive,
         detectingActive,
         checking: this.operatorStatus(input.monitoringReady, input.monitorTargets) === "Checking",
+        ...(baselineReviewRequired && unprotectedReferenceActive ? { reasonCode: "baseline-review-required", actionCode: "open-signal-learning" } : {}),
       },
       ...(event ? {
         incident: {
@@ -1770,7 +1778,7 @@ export class MonitorService extends EventEmitter {
   private recordSweepFrame(frame: SpectrumFrame): void {
     if (this.paused || this.activeFocus) return;
     const band = this.config.bands.find((candidate) => candidate.id === frame.bandId);
-    if (!band || band.service === "gnss" || !frame.targetId) return;
+    if (!band || (band.service !== "startrack" && band.service !== "4dx") || !frame.targetId) return;
     const feedId = "survey-" + band.service;
     const expectedTargetIds = this.getMonitorTargets().filter((target) => target.service === band.service).map((target) => target.id);
     if (!expectedTargetIds.includes(frame.targetId)) return;

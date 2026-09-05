@@ -59,7 +59,7 @@ function healthFixture(): HealthSnapshotV2 {
         dependencyLockDigest: "c".repeat(64),
         integrity: "release-metadata",
       },
-      protocols: { health: 2, live: 2, evidenceManifest: 2, catalogSchema: 3, operationalSchema: 3 },
+      protocols: { health: 2, live: 2, evidenceManifest: 2, catalogSchema: 4, operationalSchema: 4 },
       configuration: { catalogVersion: "catalog-v3", configurationHash: "d".repeat(64), configurationRevision: 1, detectorRuleSetId: "rf-relative-mad-v1", expectedSampleRateHz: 10_000_000 },
     },
     currentHealth: { state: "normal", ready: true, monitoringReady: true, evidenceReady: true, issueCount: 0, evaluatedAt: "2026-08-22T12:00:00.000Z" },

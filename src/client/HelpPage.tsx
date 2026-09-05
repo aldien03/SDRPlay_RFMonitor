@@ -1,6 +1,7 @@
 import { AlertTriangle, ArrowLeft, ClockAlert, Database, HeartPulse, Radio, RotateCcw, TestTube2 } from "lucide-react";
 import { presentOperatorSummary } from "../shared/operatorSummary";
 import type { MonitorSnapshot } from "../shared/types";
+import { SurfaceAlertBanner } from "./SurfaceAlertBanner";
 
 interface HelpPageProps {
   snapshot: MonitorSnapshot;
@@ -25,6 +26,7 @@ export function HelpPage({ snapshot, onClose, onOpenHealth, onOpenRecording, onO
         <div><Radio size={22} aria-hidden="true" /><strong>RF Monitor help</strong></div>
         <button type="button" onClick={onClose}><ArrowLeft size={18} aria-hidden="true" /> Dashboard</button>
       </header>
+      <SurfaceAlertBanner summary={snapshot.operatorSummary} onOpenDashboard={onClose} />
       <main className="help-content">
         <header className="help-intro">
           <span>Current status · <strong data-rf-help-mode>{operator.mode}</strong></span>
@@ -70,7 +72,7 @@ export function HelpPage({ snapshot, onClose, onOpenHealth, onOpenRecording, onO
           <ol>
             <li>Open System health and check the named signal.</li>
             <li>Wait for its next scheduled visit.</li>
-            <li>If it stays late, use Primary Watch for the signal needed now.</li>
+            <li>If it stays late, use Continuous Watch for the frequency needed now.</li>
           </ol>
           <p>A late survey means that signal was not observed on time. It is not an RF anomaly.</p>
           <button type="button" onClick={onOpenHealth}>Open System health</button>
@@ -96,6 +98,12 @@ export function HelpPage({ snapshot, onClose, onOpenHealth, onOpenRecording, onO
             <li><strong>Learning complete:</strong> 24 representative hours.</li>
           </ul>
           <p>Restart learning after an approved RF setup change or a confirmed contaminated learning period.</p>
+          <ol>
+            <li>Open Settings, then Advanced, then Signal learning.</li>
+            <li>Select Unlock to edit and enter the settings password.</li>
+            <li>Select Restart learning on one frequency, or Restart signal learning for every active frequency.</li>
+          </ol>
+          <p>Restarting starts a new learning period. Recordings, incidents and saved learning records are kept.</p>
         </section>
 
         <section id="test" className="help-task">

@@ -1,4 +1,4 @@
-import { BellRing, Copy, Download, Eye, FolderArchive, Pause, Play, RefreshCw, RotateCcw, Volume2, X } from "lucide-react";
+import { Copy, Download, Eye, FolderArchive, Pause, Play, RefreshCw, RotateCcw, X } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { DetectionEvent, EvidenceArchiveEventPage, EvidenceArchivePage, EvidenceArchiveSession, EvidenceLifecycle, EvidenceReplayBatch, EvidenceReplayFrame, MonitorSnapshot, MonitorStatus, SignalMetricSample, SpectrumFrame } from "../shared/types";
 import { dateTime, formatBytes, formatDuration, formatRange, timeOnly } from "./format";
@@ -409,7 +409,7 @@ export function EvidenceArchive({
 }
 
 export function OptionsPanel({ options, onChange }: { options: DisplayOptions; onChange: (next: DisplayOptions) => void }) {
-  const toggle = (key: "waterfall" | "baseline" | "markers" | "audioAlerts" | "popupAlerts") => onChange({ ...options, [key]: !options[key] });
+  const toggle = (key: "waterfall" | "baseline" | "markers") => onChange({ ...options, [key]: !options[key] });
   return (
     <section className="panel options-panel" aria-labelledby="view-title">
       <h2 id="view-title" className="panel-title">Engineer view</h2>
@@ -418,9 +418,6 @@ export function OptionsPanel({ options, onChange }: { options: DisplayOptions; o
       <CheckOption label="Show waterfall" checked={options.waterfall} onChange={() => toggle("waterfall")} />
       <CheckOption label="Show baseline" checked={options.baseline} onChange={() => toggle("baseline")} />
       <CheckOption label="Show markers" checked={options.markers} onChange={() => toggle("markers")} />
-      <h3>Alerts</h3>
-      <CheckOption label="Audio alerts" icon={<Volume2 size={15} />} checked={options.audioAlerts} onChange={() => toggle("audioAlerts")} />
-      <CheckOption label="Popup alerts" icon={<BellRing size={15} />} checked={options.popupAlerts} onChange={() => toggle("popupAlerts")} />
     </section>
   );
 }

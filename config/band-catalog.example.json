@@ -1,10 +1,11 @@
 {
-  "schemaVersion": 3,
-  "catalogVersion": "2026.09-fast-gnss",
+  "schemaVersion": 4,
+  "catalogVersion": "2026.10-fugro-corrections",
   "services": [
     { "id": "startrack", "label": "StarTrack radio", "description": "Source tracking radio link" },
     { "id": "4dx", "label": "4DX radio", "description": "91-channel radio telemetry link" },
-    { "id": "gnss", "label": "Navigation / GNSS", "description": "GPS, GLONASS, Galileo, BeiDou, and SBAS" }
+    { "id": "gnss", "label": "Navigation / GNSS", "description": "GPS, GLONASS, Galileo, BeiDou, and SBAS" },
+    { "id": "fugro", "label": "Fugro corrections", "description": "L-band positioning correction beams" }
   ],
   "priorityWindows": [
     {
@@ -26,12 +27,14 @@
     { "id": "gnss-glonass-g2", "label": "GLONASS G2", "service": "gnss", "relatedBandIds": ["glonass-g2"], "centerHz": 1245781000, "nominalDisplayHz": 1246000000, "captureSpanHz": 10000000, "analysisSpanHz": 8000000, "tier": "tier2", "defaultEnabled": false, "revisitObjectiveMs": 30000, "weight": 1, "nominalVisitMs": 1000, "maxVisitMs": 1500, "tuneAckTimeoutMs": 500, "settleMs": 250, "discardFrames": 2, "minFreshFrames": 3 },
     { "id": "gnss-glonass-g3", "label": "GLONASS G3", "service": "gnss", "relatedBandIds": ["glonass-g3"], "centerHz": 1202025000, "captureSpanHz": 10000000, "analysisSpanHz": 8000000, "tier": "tier2", "defaultEnabled": false, "revisitObjectiveMs": 30000, "weight": 1, "nominalVisitMs": 1000, "maxVisitMs": 1500, "tuneAckTimeoutMs": 500, "settleMs": 250, "discardFrames": 2, "minFreshFrames": 3 },
     { "id": "gnss-galileo-e6", "label": "Galileo E6", "service": "gnss", "relatedBandIds": ["galileo-e6"], "centerHz": 1278750000, "captureSpanHz": 10000000, "analysisSpanHz": 8000000, "tier": "tier2", "defaultEnabled": false, "revisitObjectiveMs": 30000, "weight": 1, "nominalVisitMs": 1000, "maxVisitMs": 1500, "tuneAckTimeoutMs": 500, "settleMs": 250, "discardFrames": 2, "minFreshFrames": 3 },
-    { "id": "gnss-beidou-b3i", "label": "BeiDou B3I", "service": "gnss", "relatedBandIds": ["beidou-b3i"], "centerHz": 1268520000, "captureSpanHz": 10000000, "analysisSpanHz": 8000000, "tier": "tier2", "defaultEnabled": false, "revisitObjectiveMs": 30000, "weight": 1, "nominalVisitMs": 1000, "maxVisitMs": 1500, "tuneAckTimeoutMs": 500, "settleMs": 250, "discardFrames": 2, "minFreshFrames": 3 }
+    { "id": "gnss-beidou-b3i", "label": "BeiDou B3I", "service": "gnss", "relatedBandIds": ["beidou-b3i"], "centerHz": 1268520000, "captureSpanHz": 10000000, "analysisSpanHz": 8000000, "tier": "tier2", "defaultEnabled": false, "revisitObjectiveMs": 30000, "weight": 1, "nominalVisitMs": 1000, "maxVisitMs": 1500, "tuneAckTimeoutMs": 500, "settleMs": 250, "discardFrames": 2, "minFreshFrames": 3 },
+    { "id": "fugro-corrections-lband", "label": "Fugro L-band corrections", "service": "fugro", "relatedBandIds": ["fugro-arsat", "fugro-sasat", "fugro-ocsat", "fugro-ersat", "fugro-easat", "fugro-irsat"], "centerHz": 1545742500, "captureSpanHz": 10000000, "analysisSpanHz": 8000000, "tier": "tier1", "defaultEnabled": false, "revisitObjectiveMs": 2000, "weight": 10, "nominalVisitMs": 1000, "maxVisitMs": 1500, "tuneAckTimeoutMs": 500, "settleMs": 250, "discardFrames": 2, "minFreshFrames": 3 }
   ],
   "sources": [
     { "title": "StarTrack 2 Spec Sheet", "reference": "410-470 MHz at 25 kHz spacing" },
     { "title": "4DX Radio Frequency Band Restriction Procedure", "reference": "Channels 1-91, 902.400-927.600 MHz at 280 kHz spacing" },
-    { "title": "GNSS official signal references", "reference": "GPS, GLONASS, Galileo, and BeiDou common civil signals" }
+    { "title": "GNSS official signal references", "reference": "GPS, GLONASS, Galileo, and BeiDou common civil signals" },
+    { "title": "Fugro beam frequencies and coverage", "reference": "https://fsp.support/beams/ (reviewed 2026-08-29)" }
   ],
   "bands": [
     {
@@ -59,6 +62,36 @@
       "priority": 2,
       "dwellMs": 8000,
       "editable": true
+    },
+    {
+      "id": "fugro-arsat", "label": "ARSAT", "service": "fugro", "signal": "L-band correction", "captureTargetId": "fugro-corrections-lband", "defaultEnabled": false,
+      "startHz": 1545235000, "endHz": 1545255000, "centerHz": 1545245000, "priority": 1, "dwellMs": 1000, "editable": true,
+      "correctionBeam": { "orbitalLongitudeDeg": -98, "linkId": 13, "symbolRateHz": 4876, "bitRateBps": 2400 }
+    },
+    {
+      "id": "fugro-sasat", "label": "SASAT", "service": "fugro", "signal": "L-band correction", "captureTargetId": "fugro-corrections-lband", "defaultEnabled": false,
+      "startHz": 1545805000, "endHz": 1545825000, "centerHz": 1545815000, "priority": 1, "dwellMs": 1000, "editable": true,
+      "correctionBeam": { "orbitalLongitudeDeg": -54, "linkId": 4, "symbolRateHz": 2438, "bitRateBps": 1200 }
+    },
+    {
+      "id": "fugro-ocsat", "label": "OCSAT", "service": "fugro", "signal": "L-band correction", "captureTargetId": "fugro-corrections-lband", "defaultEnabled": false,
+      "startHz": 1545865000, "endHz": 1545885000, "centerHz": 1545875000, "priority": 1, "dwellMs": 1000, "editable": true,
+      "correctionBeam": { "orbitalLongitudeDeg": 143.5, "linkId": 18, "symbolRateHz": 2438, "bitRateBps": 1200 }
+    },
+    {
+      "id": "fugro-ersat", "label": "ERSAT", "service": "fugro", "signal": "L-band correction", "captureTargetId": "fugro-corrections-lband", "defaultEnabled": false,
+      "startHz": 1545940000, "endHz": 1545960000, "centerHz": 1545950000, "priority": 1, "dwellMs": 1000, "editable": true,
+      "correctionBeam": { "orbitalLongitudeDeg": 25, "linkId": 20, "symbolRateHz": 4876, "bitRateBps": 2400 }
+    },
+    {
+      "id": "fugro-easat", "label": "EASAT", "service": "fugro", "signal": "L-band correction", "captureTargetId": "fugro-corrections-lband", "defaultEnabled": false,
+      "startHz": 1546220000, "endHz": 1546240000, "centerHz": 1546230000, "priority": 1, "dwellMs": 1000, "editable": true,
+      "correctionBeam": { "orbitalLongitudeDeg": 25, "linkId": 6, "symbolRateHz": 2438, "bitRateBps": 1200 }
+    },
+    {
+      "id": "fugro-irsat", "label": "IRSAT", "service": "fugro", "signal": "L-band correction", "captureTargetId": "fugro-corrections-lband", "defaultEnabled": false,
+      "startHz": 1546230000, "endHz": 1546250000, "centerHz": 1546240000, "priority": 1, "dwellMs": 1000, "editable": true,
+      "correctionBeam": { "orbitalLongitudeDeg": 83.5, "linkId": 7, "symbolRateHz": 2438, "bitRateBps": 1200 }
     },
     {
       "id": "gps-l1",

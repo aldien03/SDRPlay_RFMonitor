@@ -4,7 +4,7 @@ import { Header } from "./client/Header";
 import { EvidenceArchive, OptionsPanel, type DisplayOptions } from "./client/BottomPanels";
 import { IncidentPanel } from "./client/MonitorPanels";
 import { NoteModal } from "./client/Modals";
-import { SettingsPage, type SettingsTab } from "./client/SettingsPage";
+import { SettingsPage, type SettingsSection, type SettingsTab } from "./client/SettingsPage";
 import { EngineerWorkspace } from "./client/EngineerWorkspace";
 import { SystemHealth, SystemHealthIndicator } from "./client/SystemHealth";
 import { useDiagnostics } from "./client/useDiagnostics";
@@ -86,6 +86,14 @@ function loadOptions(): DisplayOptions {
   }
 }
 
+function storePreference(key: string, value: unknown): void {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // A browser with storage disabled or full still monitors normally.
+  }
+}
+
 function loadSignalWallPreferences(): SignalWallPreferences {
   try {
     const legacy = localStorage.getItem(LEGACY_SIGNAL_WALL_STORAGE_KEY) ?? localStorage.getItem(OLDEST_SIGNAL_WALL_STORAGE_KEY);
@@ -104,6 +112,7 @@ export function App() {
   const [focusFeed, setFocusFeed] = useState<MonitorFeed>();
   const [noteOpen, setNoteOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>();
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>();
   const [helpOpen, setHelpOpen] = useState(() => location.pathname === "/help");
   const [toast, setToast] = useState<string>();
   const [selectedEventId, setSelectedEventId] = useState<string>();
@@ -136,7 +145,9 @@ export function App() {
   }, []);
 
   useEffect(() => {
-    localStorage.setItem("rf-monitor-display-v1", JSON.stringify(options));
+    // Preference storage is a convenience. A full or blocked store must never
+    // abort this effect, or the live stream subscription below never runs.
+    storePreference("rf-monitor-display-v1", options);
     setEngineerStream(options.engineer);
   }, [options, setEngineerStream]);
 
@@ -148,7 +159,7 @@ export function App() {
   }, [snapshot.monitorFeeds]);
 
   useEffect(() => {
-    localStorage.setItem(SIGNAL_WALL_STORAGE_KEY, JSON.stringify(wallPreferences));
+    storePreference(SIGNAL_WALL_STORAGE_KEY, wallPreferences);
     const displayedFeeds = surfacedVisibleFeedIds({
       preferences: wallPreferences,
       feeds: snapshot.monitorFeeds,
@@ -229,11 +240,12 @@ export function App() {
     setOptions((current) => current.engineer ? { ...current, engineer: false } : current);
   };
 
-  const openSettings = (tab: SettingsTab = "monitoring") => {
+  const openSettings = (tab: SettingsTab = "monitoring", section?: SettingsSection) => {
     if (location.pathname === "/help") history.replaceState(null, "", `/${retainedQaSearch()}`);
     setHelpOpen(false);
     setDetailsView(undefined);
     setOptions((current) => current.engineer ? { ...current, engineer: false } : current);
+    setSettingsSection(section);
     setSettingsTab(tab);
   };
 
@@ -321,6 +333,9 @@ export function App() {
       case "open-recording":
         openSettings("recording");
         return;
+      case "open-signal-learning":
+        openSettings("advanced", "signal-learning");
+        return;
       case "review-qualification":
         openSettings("health");
         return;
@@ -348,8 +363,9 @@ export function App() {
       <>
         <SettingsPage
           initialTab={settingsTab}
+          initialSection={settingsSection}
           snapshot={snapshot}
-          onClose={() => setSettingsTab(undefined)}
+          onClose={() => { setSettingsTab(undefined); setSettingsSection(undefined); }}
           onToast={showTemporaryToast}
           getSettings={monitor.getSettings}
           unlockSettings={monitor.unlockSettings}
@@ -404,11 +420,14 @@ export function App() {
         snapshot={snapshot}
         layout={wallPreferences.layout}
         engineer={options.engineer}
+        audioAlerts={options.audioAlerts}
+        popupAlerts={options.popupAlerts}
         onLayout={(layout) => setWallPreferences((current) => ({ ...current, layout }))}
         onEngineer={toggleEngineer}
         onPause={pause}
         onSettings={() => openSettings("monitoring")}
         onHelp={openHelp}
+        onAlertOption={(key) => void changeOptions({ ...options, [key]: !options[key] })}
       />
       {error ? <div className="mission-connection-error" role="status" aria-live="polite"><span>{error}</span>{reloadRequired ? <button type="button" onClick={() => location.reload()}>Reload</button> : null}</div> : null}
       <main className="mission-dashboard">
@@ -460,7 +479,7 @@ export function App() {
       ) : null}
 
       {noteOpen && selectedEvent ? <NoteModal onClose={() => setNoteOpen(false)} onSave={async (text) => { await addNote(selectedEvent.id, text); setNoteOpen(false); showTemporaryToast("Note added."); }} /> : null}
-      {feedManagerOpen ? <FeedManagerModal feeds={snapshot.monitorFeeds} pinnedFeedIds={wallPreferences.pinnedFeedIds} onChange={(pinnedFeedIds) => setWallPreferences((current) => ({ ...current, pinnedFeedIds, selectedFeedId: pinnedFeedIds.includes(current.selectedFeedId ?? "") ? current.selectedFeedId : pinnedFeedIds[0] }))} onClose={() => setFeedManagerOpen(false)} /> : null}
+      {feedManagerOpen ? <FeedManagerModal feeds={snapshot.monitorFeeds} pinnedFeedIds={wallPreferences.pinnedFeedIds} onOpenMonitoring={() => { setFeedManagerOpen(false); openSettings("monitoring"); }} onChange={(pinnedFeedIds) => setWallPreferences((current) => ({ ...current, pinnedFeedIds, selectedFeedId: pinnedFeedIds.includes(current.selectedFeedId ?? "") ? current.selectedFeedId : pinnedFeedIds[0] }))} onClose={() => setFeedManagerOpen(false)} /> : null}
       {focusFeed ? <FocusConfirmation feed={focusFeed} currentFeed={activeFeed} snapshot={snapshot} onCancel={() => setFocusFeed(undefined)} onConfirm={() => void startLiveFeed()} /> : null}
       {toast ? <div className="toast" role="status">{toast}</div> : null}
     </div>

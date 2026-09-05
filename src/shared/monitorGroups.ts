@@ -99,6 +99,36 @@ function radioGroup(
   };
 }
 
+function correctionGroup(catalog: BandCatalog, activeBands: BandPreset[], targets: MonitorTarget[], summaries: ServiceCoverageSummary[]): MonitorGroup {
+  const catalogBands = catalog.bands.filter((band) => band.service === 'fugro');
+  const activeIds = new Set(activeBands.filter((band) => band.service === 'fugro').map((band) => band.id));
+  const memberBands = activeIds.size ? catalogBands.filter((band) => activeIds.has(band.id)) : catalogBands;
+  const members = memberBands.map((band): MonitorGroupMember => ({
+    id: 'beam-' + band.id,
+    label: band.label,
+    coverageLabel: mhz(band.centerHz, 3),
+    bandIds: [band.id],
+    targetIds: relatedTargets(band.id, targets).map((target) => target.id),
+    centerHz: band.centerHz,
+    startHz: band.startHz,
+    endHz: band.endHz,
+    priority: true,
+  }));
+  const definition = catalog.services.find((service) => service.id === 'fugro');
+  const summary = summaries.find((candidate) => candidate.service === 'fugro');
+  return {
+    id: 'service-fugro',
+    label: definition?.label ?? 'Fugro corrections',
+    description: definition?.description ?? 'L-band correction beams',
+    service: 'fugro',
+    kind: 'radio',
+    enabled: Boolean(summary?.enabled && activeIds.size),
+    coverageLabel: summary?.enabled ? summary.coverageLabel : 'Off',
+    targetIds: unique(members.flatMap((member) => member.targetIds)),
+    members,
+  };
+}
+
 export function createMonitorGroups(
   catalog: BandCatalog,
   activeBands: BandPreset[],
@@ -127,6 +157,7 @@ export function createMonitorGroups(
   return [
     radioGroup('startrack', catalog, activeBands, targets, summaries),
     radioGroup('4dx', catalog, activeBands, targets, summaries),
+    correctionGroup(catalog, activeBands, targets, summaries),
     ...gnssGroups,
   ];
 }
@@ -167,6 +198,35 @@ export function createMonitorFeeds(
       focusBandId: focusTarget?.relatedBandIds[0],
       focusCenterHz: focusTarget?.centerHz,
     });
+  }
+
+  const fugroBands = activeBands.filter((band) => band.service === 'fugro');
+  if (fugroBands.length) {
+    const targetIds = new Set(fugroBands.map((band) => band.captureTargetId).filter(Boolean));
+    const relevantTargets = targets.filter((target) => target.service === 'fugro' && (targetIds.has(target.id) || target.relatedBandIds.some((id) => fugroBands.some((band) => band.id === id))));
+    const focusTarget = relevantTargets[0];
+    if (focusTarget) {
+      feeds.push({
+        id: 'window-fugro-corrections-lband',
+        label: 'Fugro corrections',
+        shortLabel: fugroBands.map((band) => band.label).join(' / '),
+        description: 'Selected L-band correction beams',
+        service: 'fugro',
+        category: 'radio',
+        kind: 'capture-window',
+        enabled: true,
+        coverageLabel: `${fugroBands.length} selected ${fugroBands.length === 1 ? 'beam' : 'beams'}`,
+        targetIds: [focusTarget.id],
+        bandIds: fugroBands.map((band) => band.id),
+        startHz: focusTarget.startHz,
+        endHz: focusTarget.endHz,
+        centerHz: focusTarget.centerHz,
+        priority: true,
+        focusTargetId: focusTarget.id,
+        focusBandId: fugroBands[0].id,
+        focusCenterHz: focusTarget.centerHz,
+      });
+    }
   }
 
   const gnssBands = activeBands.filter((band) => band.service === 'gnss');

@@ -1,6 +1,7 @@
 import type { OperatorSummaryV1 } from "./operatorSummary";
 
-export type ServiceGroup = "startrack" | "4dx" | "gnss";
+export type LegacyServiceGroup = "startrack" | "4dx" | "gnss";
+export type ServiceGroup = LegacyServiceGroup | "fugro";
 /**
  * Storage and learning trust boundary. Field data is produced only while
  * simulation is explicitly disabled; every simulated/replayed path is test.
@@ -27,8 +28,8 @@ export interface RecoveryOperationHealth {
   attemptsInWindow?: number;
   maxAttempts?: number;
 }
-export type ScanProfile = "balanced" | "gnss-priority" | "fast-gnss";
-export type MonitoringMission = "primary-watch" | "multi-band-survey" | "radio-survey" | "custom";
+export type ScanProfile = "balanced" | "gnss-priority" | "fast-gnss" | "correction-watch";
+export type MonitoringMission = "continuous-watch" | "multi-band-survey" | "radio-survey" | "custom";
 export type TuneState = "idle" | "commanded" | "confirming" | "settling" | "confirmed" | "timed-out";
 export type ChannelLifecycle = "clear" | "detecting" | "active" | "recovering";
 export type IncidentLifecycle = "active" | "recovering" | "cleared" | "ended-unknown";
@@ -99,8 +100,8 @@ export interface RuntimeIdentity {
     health: 2;
     live: 2;
     evidenceManifest: 2;
-    catalogSchema: 3;
-    operationalSchema: 3;
+    catalogSchema: 4;
+    operationalSchema: 4;
   };
   configuration: {
     catalogVersion: string;
@@ -163,6 +164,13 @@ export interface BandPreset {
   channelCount?: number;
   constellation?: GnssConstellation;
   signal?: string;
+  /** Fugro correction-beam metadata; the receiver observes RF only and does not decode this service. */
+  correctionBeam?: {
+    orbitalLongitudeDeg: number;
+    linkId: number;
+    symbolRateHz: number;
+    bitRateBps: number;
+  };
   captureTargetId?: string;
   defaultEnabled?: boolean;
   nominalDisplayHz?: number;
@@ -190,7 +198,7 @@ export interface ServiceDefinition {
 }
 
 export interface BandCatalog {
-  schemaVersion: 3;
+  schemaVersion: 4;
   catalogVersion: string;
   services: ServiceDefinition[];
   bands: BandPreset[];
@@ -225,7 +233,7 @@ export interface PhysicalCaptureTarget {
 export interface PriorityWindow {
   id: string;
   label: string;
-  service: "gnss";
+  service: "gnss" | "fugro";
   centerHz: number;
   spanHz: number;
   relatedBandIds: string[];
@@ -259,10 +267,11 @@ export interface MonitoringProfile {
   startrack: { enabled: boolean; channels: RadioChannelSelection };
   "4dx": { enabled: boolean; channels: RadioChannelSelection };
   gnss: GnssSelection;
+  fugro: { enabled: boolean; selectedBeamIds: string[] };
 }
 
 export interface OperationalSettings {
-  schemaVersion: 3;
+  schemaVersion: 4;
   revision: number;
   updatedAt: string;
   siteName: string;

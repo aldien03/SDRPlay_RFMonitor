@@ -1,6 +1,7 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
+import { DisplayErrorBoundary } from "./client/DisplayErrorBoundary";
 import type { AccessibilityHarnessResult } from "./client/accessibilityHarness";
 import { startV3BrowserHarness } from "./client/v3BrowserHarness";
 import "./styles.css";
@@ -10,7 +11,9 @@ if (qaMode === "v3") startV3BrowserHarness();
 
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <App />
+    <DisplayErrorBoundary>
+      <App />
+    </DisplayErrorBoundary>
   </React.StrictMode>,
 );
 

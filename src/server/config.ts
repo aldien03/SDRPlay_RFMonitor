@@ -245,7 +245,9 @@ function applyLegacyBandSelection(settings: OperationalSettings, enabledIds: Set
     .filter((band) => settings.monitoring.gnss.enabledSignalIds.includes(band.id) && band.constellation)
     .map((band) => band.constellation!))];
   settings.monitoring.gnss.enabled = gnssEnabled;
-  if (![settings.monitoring.startrack.enabled, settings.monitoring["4dx"].enabled, settings.monitoring.gnss.enabled].some(Boolean)) {
+  settings.monitoring.fugro.selectedBeamIds = catalog.bands.filter((band) => band.service === "fugro" && enabledIds.has(band.id)).map((band) => band.id);
+  settings.monitoring.fugro.enabled = settings.monitoring.fugro.selectedBeamIds.length > 0;
+  if (![settings.monitoring.startrack.enabled, settings.monitoring["4dx"].enabled, settings.monitoring.gnss.enabled, settings.monitoring.fugro.enabled].some(Boolean)) {
     settings.monitoring.startrack.enabled = true;
   }
 }

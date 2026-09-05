@@ -16,8 +16,8 @@ import {
 import { useEffect, useMemo, useState } from "react";
 import { estimateRevisitMs } from "../shared/bands";
 import { presentOperatorSummary } from "../shared/operatorSummary";
-import { applyMonitoringMission, compileEffectiveBands, evaluateSettingsFeasibility, monitoringMissionForSettings, primaryWatchTargetId } from "../shared/settings";
-import type { BandPreset, BaselineApprovalEligibility, BaselineDescriptor, MonitorSnapshot, MonitoringMission, OperationalSettings, SettingsRevision } from "../shared/types";
+import { applyMonitoringMission, compileEffectiveBands, continuousWatchTargetId, evaluateSettingsFeasibility, monitoringMissionForSettings, ROBUST_DETECTION_DEFAULTS, selectedMonitoringTargetIds } from "../shared/settings";
+import type { BandPreset, BaselineApprovalEligibility, BaselineDescriptor, MonitorSnapshot, MonitoringMission, OperationalSettings, PhysicalCaptureTarget, SettingsRevision } from "../shared/types";
 import { formatBytes, formatFrequency, formatRange } from "./format";
 import {
   buildSignalLearningPresentation,
@@ -36,13 +36,16 @@ import {
   type SoftwareRestartResponse,
 } from "./useMonitor";
 import { DialogShell } from "./DialogShell";
+import { SurfaceAlertBanner } from "./SurfaceAlertBanner";
 
 export type SettingsTab = "monitoring" | "health" | "recording" | "site" | "advanced";
+export type SettingsSection = "signal-learning";
 
 type ServiceDisplayState = "Monitoring" | "Paused" | "Will monitor" | "Off";
 
 interface SettingsPageProps {
   initialTab?: SettingsTab;
+  initialSection?: SettingsSection;
   snapshot: MonitorSnapshot;
   onClose: () => void;
   onToast: (message: string) => void;
@@ -60,10 +63,11 @@ interface SettingsPageProps {
   renderSystemHealth?: (controls: { openTab: (tab: SettingsTab) => void }) => React.ReactNode;
 }
 
-export type MaintenanceAction = "clear-test-data" | "delete-recordings" | "restart-software";
+export type MaintenanceAction = "clear-test-data" | "restart-learning" | "delete-recordings" | "restart-software";
 
 export const MAINTENANCE_CONFIRMATION: Record<MaintenanceAction, string> = {
   "clear-test-data": "CLEAR TEST DATA",
+  "restart-learning": "RESTART LEARNING",
   "delete-recordings": "DELETE RECORDINGS",
   "restart-software": "RESTART SOFTWARE",
 };
@@ -74,6 +78,12 @@ export function maintenancePresentation(action: MaintenanceAction, dataDomain: M
     changes: "Deletes test recordings, test incidents and test signal learning.",
     retained: "Field data and settings are kept.",
     button: "Clear test data",
+  };
+  if (action === "restart-learning") return {
+    title: "Restart signal learning?",
+    changes: `Starts a new learning period for every active ${dataDomain === "field" ? "Field" : "Test"} frequency that has learned data.`,
+    retained: "Recordings, incidents, saved learning records and settings are kept.",
+    button: "Restart learning",
   };
   if (action === "delete-recordings") return {
     title: "Delete recordings?",
@@ -110,6 +120,10 @@ function channelCount(band: BandPreset): number {
 
 function formatChannelSpacing(spacingHz: number): string {
   return spacingHz >= 1_000_000 ? `${spacingHz / 1_000_000} MHz` : `${spacingHz / 1_000} kHz`;
+}
+
+function orbitalLongitude(value: number): string {
+  return `${Math.abs(value).toFixed(Number.isInteger(value) ? 0 : 1)}°${value < 0 ? "W" : "E"}`;
 }
 
 function cloneSettings(settings: OperationalSettings): OperationalSettings {
@@ -273,6 +287,18 @@ export function SettingsPage(props: SettingsPageProps) {
     setAdminDialogOpen(true);
   };
 
+  // Every active frequency that already has learned data, in display order, so a
+  // single protected action can restart the whole set one target at a time.
+  const restartableBaselines = useMemo<BaselineDescriptor[]>(() => {
+    if (!response) return [];
+    return buildSignalLearningPresentation({
+      catalog: response.catalog,
+      effectiveBands: response.effectiveBands,
+      sampleRateHz: response.infrastructure.sampleRateHz,
+      baselines: response.baselineStates,
+    }).activeTargets.flatMap((target) => target.baseline ? [target.baseline] : []);
+  }, [response]);
+
   const updateBaseline = async (action: "approve" | "restart", baseline: BaselineDescriptor) => {
     if (!response) return;
     setError(undefined);
@@ -316,6 +342,30 @@ export function SettingsPage(props: SettingsPageProps) {
         setResponse(next);
         if (!dirty) setDraft(cloneSettings(next.settings));
         props.onToast(result.result.previousDataPresent ? "Test data cleared." : "No test data to clear.");
+      } else if (pendingMaintenance === "restart-learning") {
+        if (!restartableBaselines.length) throw new Error("No learned data to restart yet.");
+        // The server allows one journalled restart at a time, so walk the
+        // targets in order and report exactly how far the batch got.
+        let current = response;
+        let restarted = 0;
+        for (const baseline of restartableBaselines) {
+          try {
+            const result = await props.restartBaseline(baseline, current.settings.revision);
+            if (baselineRestartRequiresRecovery(result)) {
+              setResponse(await props.getSettings());
+              setTab("health");
+              throw new Error(`Restarted ${restarted} of ${restartableBaselines.length}. Learning generation changed; recovery is required. Check System health.`);
+            }
+          } catch (reason) {
+            const detail = reason instanceof Error ? reason.message : String(reason);
+            throw new Error(`Restarted ${restarted} of ${restartableBaselines.length}. ${detail}`);
+          }
+          restarted += 1;
+          current = await props.getSettings();
+        }
+        setResponse(current);
+        if (!dirty) setDraft(cloneSettings(current.settings));
+        props.onToast(`Signal learning restarted for ${restarted} ${restarted === 1 ? "frequency" : "frequencies"}.`);
       } else if (pendingMaintenance === "delete-recordings") {
         const result = await props.deleteRecordings(response.settings.revision, props.snapshot.dataDomain);
         if (result.result.state !== "complete" || !result.result.auditDurable) {
@@ -407,6 +457,7 @@ export function SettingsPage(props: SettingsPageProps) {
           <button className="icon-button" type="button" onClick={requestClose} aria-label="Close settings"><X size={23} aria-hidden="true" /></button>
         </div>
       </header>
+      <SurfaceAlertBanner summary={props.snapshot.operatorSummary} onOpenDashboard={props.onClose} />
 
       <div className="settings-layout">
         <nav className="settings-nav" aria-label="Settings sections">
@@ -428,7 +479,7 @@ export function SettingsPage(props: SettingsPageProps) {
                 {tab === "health" ? (props.renderSystemHealth?.({ openTab: setTab }) ?? <SystemHealthPlaceholder />) : null}
                 {tab === "recording" ? <EvidenceSettings draft={draft} setDraft={setDraft} response={response} errors={fieldErrors} disabled={!unlocked} dataDomain={props.snapshot.dataDomain} onMaintenance={openMaintenance} /> : null}
                 {tab === "site" ? <SiteSettings draft={draft} setDraft={setDraft} response={response} errors={fieldErrors} disabled={!unlocked} /> : null}
-                {tab === "advanced" ? <AdvancedSettings response={response} draft={draft} setDraft={setDraft} errors={fieldErrors} unlocked={unlocked} onRestartSoftware={() => openMaintenance("restart-software")} onBaselineAction={async (action, baseline) => { if (action === "restart") setPendingBaselineRestart(baseline); else await updateBaseline(action, baseline); }} /> : null}
+                {tab === "advanced" ? <AdvancedSettings response={response} draft={draft} setDraft={setDraft} errors={fieldErrors} unlocked={unlocked} onMaintenance={openMaintenance} onBaselineAction={async (action, baseline) => { if (action === "restart") setPendingBaselineRestart(baseline); else await updateBaseline(action, baseline); }} onOpenTab={setTab} initialSection={props.initialSection} /> : null}
               </div>
             </>
           )}
@@ -534,25 +585,37 @@ function MonitoringSettings({ response, draft, current, setDraft, errors, disabl
   disabled: boolean;
 }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({ startrack: true, "4dx": false });
+  const [previewMission, setPreviewMission] = useState<Exclude<MonitoringMission, "custom">>();
   const startrack = serviceBand(response, "startrack");
   const fourDx = serviceBand(response, "4dx");
   const fourDxChannelCount = channelCount(fourDx);
   const services = new Map(response.catalog.services.map((service) => [service.id, service]));
-  const mission = monitoringMissionForSettings(draft, response.catalog);
+  const configuredMission = monitoringMissionForSettings(draft, response.catalog);
+  const viewSettings = useMemo(() => {
+    if (!disabled || !previewMission || previewMission === configuredMission) return draft;
+    try {
+      return applyMonitoringMission(draft, response.catalog, previewMission);
+    } catch {
+      return draft;
+    }
+  }, [configuredMission, disabled, draft, previewMission, response.catalog]);
+  const mission = disabled && previewMission ? previewMission : configuredMission;
   const currentMission = monitoringMissionForSettings(current, response.catalog);
-  const primaryTarget = response.catalog.captureTargets.find((target) => target.id === primaryWatchTargetId(draft, response.catalog));
-  const currentPrimaryTargetId = primaryWatchTargetId(current, response.catalog);
-  const tierOneTargets = response.catalog.captureTargets.filter((target) => target.service === "gnss" && target.tier === "tier1");
+  const monitoringTargets = response.catalog.captureTargets.filter((target) => target.service === "gnss" || target.service === "fugro");
+  const continuousTarget = monitoringTargets.find((target) => target.id === continuousWatchTargetId(viewSettings, response.catalog));
+  const currentContinuousTargetId = continuousWatchTargetId(current, response.catalog);
+  const selectedTargetIds = selectedMonitoringTargetIds(viewSettings, response.catalog);
+  const fugroBeams = response.catalog.bands.filter((band) => band.service === "fugro" && band.correctionBeam);
   const draftState = useMemo(() => {
     try {
-      const bands = compileEffectiveBands(response.catalog, draft);
+      const bands = compileEffectiveBands(response.catalog, viewSettings);
       const evaluated = evaluateSettingsFeasibility({
-        settings: draft,
+        settings: viewSettings,
         catalog: response.catalog,
         sampleRateHz: response.infrastructure.sampleRateHz,
         measurementAvailable: !response.commissioning.simulation,
       });
-      const feasibility = JSON.stringify(draft) === JSON.stringify(current)
+      const feasibility = JSON.stringify(viewSettings) === JSON.stringify(current)
         ? { ...evaluated, ...response.feasibility }
         : evaluated;
       return {
@@ -563,18 +626,24 @@ function MonitoringSettings({ response, draft, current, setDraft, errors, disabl
     } catch {
       return undefined;
     }
-  }, [current, draft, response.catalog, response.commissioning.simulation, response.feasibility, response.infrastructure.sampleRateHz]);
+  }, [current, response.catalog, response.commissioning.simulation, response.feasibility, response.infrastructure.sampleRateHz, viewSettings]);
   const update = (mutate: (next: OperationalSettings) => void) => {
     const next = cloneSettings(draft);
     mutate(next);
     setDraft(next);
   };
   const chooseMission = (nextMission: Exclude<MonitoringMission, "custom">) => {
+    if (disabled) {
+      setPreviewMission(nextMission);
+      if (nextMission === "radio-survey") setExpanded({ startrack: true, "4dx": false });
+      return;
+    }
+    setPreviewMission(undefined);
     setDraft(applyMonitoringMission(draft, response.catalog, nextMission));
     if (nextMission === "radio-survey") setExpanded({ startrack: true, "4dx": false });
   };
   const serviceState = (service: "startrack" | "4dx"): ServiceDisplayState => {
-    const enabled = service === "startrack" ? draft.monitoring.startrack.enabled : draft.monitoring["4dx"].enabled;
+    const enabled = service === "startrack" ? viewSettings.monitoring.startrack.enabled : viewSettings.monitoring["4dx"].enabled;
     if (!enabled) return "Off";
     if (!draftState?.feasibility.optionalWorkAdmitted) return "Paused";
     const currentEnabled = service === "startrack" ? current.monitoring.startrack.enabled : current.monitoring["4dx"].enabled;
@@ -588,25 +657,45 @@ function MonitoringSettings({ response, draft, current, setDraft, errors, disabl
   return (
     <section className="settings-section" aria-labelledby="monitoring-settings-title">
       <div className="settings-title-row">
-        <div><h1 id="monitoring-settings-title">Monitoring</h1><p>Choose one task.</p></div>
+        <div><h1 id="monitoring-settings-title">Monitoring</h1><p>{disabled ? "Review tasks. Unlock to change." : "Choose one task."}</p></div>
         <div className="coverage-estimate"><span>Estimated schedule</span><strong>{draftState ? formatRevisit(draftState.estimatedRevisitMs) : "Check selection"}</strong><small>Measured: {measuredRevisit}</small></div>
       </div>
       {errors.monitoring ? <FieldError text={errors.monitoring} /> : null}
 
-      <MissionChoiceGroup value={mission} disabled={disabled} onChange={chooseMission} />
+      <MissionChoiceGroup value={mission} disabled={false} onChange={chooseMission} />
       {mission === "custom" ? <div className="mission-custom-state"><strong>Current setup</strong><span>Choose a task to replace it.</span></div> : null}
 
-      {mission === "primary-watch" ? (
+      {mission === "continuous-watch" ? (
         <div className="mission-panel">
-          <label className="form-field" htmlFor="primary-watch-target"><span>GNSS band</span><select id="primary-watch-target" disabled={disabled} value={primaryTarget?.id ?? ""} onChange={(event) => setDraft(applyMonitoringMission(draft, response.catalog, "primary-watch", event.target.value))}>{response.catalog.captureTargets.filter((target) => target.service === "gnss").map((target) => <option key={target.id} value={target.id}>{target.label}</option>)}</select></label>
-          {primaryTarget ? <div className="mission-target-summary"><span>{currentMission === "primary-watch" && currentPrimaryTargetId === primaryTarget.id ? "Monitoring" : "Will monitor"}</span><strong>{primaryTarget.label}</strong><small>{formatFrequency(primaryTarget.nominalDisplayHz ?? primaryTarget.centerHz, 3)}</small></div> : null}
+          <div className="mission-panel-heading"><strong>Frequency window</strong><span>Watched continuously</span></div>
+          <FrequencyWindowPicker
+            mode="single"
+            targets={monitoringTargets}
+            selectedIds={continuousTarget ? [continuousTarget.id] : []}
+            disabled={disabled}
+            onToggle={(targetId) => setDraft(applyMonitoringMission(draft, response.catalog, "continuous-watch", targetId))}
+          />
+          {continuousTarget ? <div className="mission-target-summary"><span>{currentMission === "continuous-watch" && currentContinuousTargetId === continuousTarget.id ? "Monitoring" : "Will monitor"}</span><strong>{continuousTarget.label}</strong><small>{formatFrequency(continuousTarget.nominalDisplayHz ?? continuousTarget.centerHz, 3)}</small></div> : null}
+          {continuousTarget?.service === "fugro" ? <FugroBeamPicker beams={fugroBeams} selectedIds={viewSettings.monitoring.fugro.selectedBeamIds} disabled={disabled} error={errors["monitoring.fugro.selectedBeamIds"]} onChange={(selectedBeamIds) => update((next) => { next.monitoring.fugro.selectedBeamIds = selectedBeamIds; })} /> : null}
         </div>
       ) : null}
 
       {mission === "multi-band-survey" ? (
         <div className="mission-panel">
-          <div className="mission-panel-heading"><strong>GNSS bands</strong><span>{draftState?.feasibility.scheduleCapacity === "full" ? "No timing reserve" : `${tierOneTargets.length} rotating`}</span></div>
-          <div className="mission-target-list">{tierOneTargets.map((target) => <div key={target.id}><span><strong>{target.label}</strong><small>{formatFrequency(target.nominalDisplayHz ?? target.centerHz, 3)}</small></span><b className={`service-state ${currentMission === "multi-band-survey" ? "monitoring" : "will-monitor"}`}>{currentMission === "multi-band-survey" ? "Monitoring" : "Will monitor"}</b></div>)}</div>
+          <div className="mission-panel-heading"><strong>Frequency windows</strong><span>{selectedTargetIds.length} checked in turn</span></div>
+          <p className="correction-watch-note">One receiver checks the selected windows in turn.</p>
+          <FrequencyWindowPicker
+            mode="multiple"
+            targets={monitoringTargets}
+            selectedIds={selectedTargetIds}
+            disabled={disabled}
+            onToggle={(targetId) => {
+              const checked = selectedTargetIds.includes(targetId);
+              const nextIds = checked ? selectedTargetIds.filter((id) => id !== targetId) : [...selectedTargetIds, targetId];
+              if (nextIds.length >= 2) setDraft(applyMonitoringMission(draft, response.catalog, "multi-band-survey", nextIds));
+            }}
+          />
+          {viewSettings.monitoring.fugro.enabled ? <FugroBeamPicker beams={fugroBeams} selectedIds={viewSettings.monitoring.fugro.selectedBeamIds} disabled={disabled} error={errors["monitoring.fugro.selectedBeamIds"]} onChange={(selectedBeamIds) => update((next) => { next.monitoring.fugro.selectedBeamIds = selectedBeamIds; })} /> : null}
         </div>
       ) : null}
 
@@ -616,35 +705,35 @@ function MonitoringSettings({ response, draft, current, setDraft, errors, disabl
           <ServiceEditor
             label={services.get("startrack")!.label}
             description={services.get("startrack")?.description ?? ""}
-            enabled={draft.monitoring.startrack.enabled}
+            enabled={viewSettings.monitoring.startrack.enabled}
             state={serviceState("startrack")}
             disabled={disabled}
-            toggleDisabled={draft.monitoring.startrack.enabled && !draft.monitoring["4dx"].enabled}
+            toggleDisabled={viewSettings.monitoring.startrack.enabled && !viewSettings.monitoring["4dx"].enabled}
             expanded={expanded.startrack}
             icon={<RadioTower size={22} />}
-            summary={draft.monitoring.startrack.channels.mode === "all" ? formatRange(startrack.startHz, startrack.endHz) : `${draft.monitoring.startrack.channels.frequenciesHz.length} selected frequencies`}
+            summary={viewSettings.monitoring.startrack.channels.mode === "all" ? formatRange(startrack.startHz, startrack.endHz) : `${viewSettings.monitoring.startrack.channels.frequenciesHz.length} selected frequencies`}
             onToggle={() => update((next) => { next.monitoring.startrack.enabled = !next.monitoring.startrack.enabled; })}
             onExpand={() => setExpanded((currentExpanded) => ({ ...currentExpanded, startrack: !currentExpanded.startrack }))}
           >
-            <SegmentedControl ariaLabel={`${services.get("startrack")!.label} frequency selection`} disabled={disabled} value={draft.monitoring.startrack.channels.mode} options={[{ value: "all", label: "All frequencies" }, { value: "frequencies", label: "Selected frequencies" }]} onChange={(value) => update((next) => { next.monitoring.startrack.channels.mode = value as "all" | "frequencies"; })} />
-            {draft.monitoring.startrack.channels.mode === "frequencies" ? <StarTrackFrequencies disabled={disabled} band={startrack} values={draft.monitoring.startrack.channels.frequenciesHz} error={errors["monitoring.startrack.frequenciesHz"]} onChange={(values) => update((next) => { next.monitoring.startrack.channels.frequenciesHz = values; })} /> : <div className="selection-summary"><ShieldCheck size={17} /> {formatRange(startrack.startHz, startrack.endHz)} · {formatChannelSpacing(startrack.channelSpacingHz!)} steps</div>}
+            <SegmentedControl ariaLabel={`${services.get("startrack")!.label} frequency selection`} disabled={disabled} value={viewSettings.monitoring.startrack.channels.mode} options={[{ value: "all", label: "All frequencies" }, { value: "frequencies", label: "Selected frequencies" }]} onChange={(value) => update((next) => { next.monitoring.startrack.channels.mode = value as "all" | "frequencies"; })} />
+            {viewSettings.monitoring.startrack.channels.mode === "frequencies" ? <StarTrackFrequencies disabled={disabled} band={startrack} values={viewSettings.monitoring.startrack.channels.frequenciesHz} error={errors["monitoring.startrack.frequenciesHz"]} onChange={(values) => update((next) => { next.monitoring.startrack.channels.frequenciesHz = values; })} /> : <div className="selection-summary"><ShieldCheck size={17} /> {formatRange(startrack.startHz, startrack.endHz)} · {formatChannelSpacing(startrack.channelSpacingHz!)} steps</div>}
           </ServiceEditor>
 
           <ServiceEditor
             label={services.get("4dx")!.label}
             description={services.get("4dx")?.description ?? ""}
-            enabled={draft.monitoring["4dx"].enabled}
+            enabled={viewSettings.monitoring["4dx"].enabled}
             state={serviceState("4dx")}
             disabled={disabled}
-            toggleDisabled={draft.monitoring["4dx"].enabled && !draft.monitoring.startrack.enabled}
+            toggleDisabled={viewSettings.monitoring["4dx"].enabled && !viewSettings.monitoring.startrack.enabled}
             expanded={expanded["4dx"]}
             icon={<RadioTower size={22} />}
-            summary={draft.monitoring["4dx"].channels.mode === "all" ? `All ${fourDxChannelCount} channels` : `Channels ${draft.monitoring["4dx"].channels.startChannel}-${draft.monitoring["4dx"].channels.endChannel}`}
+            summary={viewSettings.monitoring["4dx"].channels.mode === "all" ? `All ${fourDxChannelCount} channels` : `Channels ${viewSettings.monitoring["4dx"].channels.startChannel}-${viewSettings.monitoring["4dx"].channels.endChannel}`}
             onToggle={() => update((next) => { next.monitoring["4dx"].enabled = !next.monitoring["4dx"].enabled; })}
             onExpand={() => setExpanded((currentExpanded) => ({ ...currentExpanded, "4dx": !currentExpanded["4dx"] }))}
           >
-            <SegmentedControl ariaLabel={`${services.get("4dx")!.label} channel selection`} disabled={disabled} value={draft.monitoring["4dx"].channels.mode} options={[{ value: "all", label: `All ${fourDxChannelCount} channels` }, { value: "range", label: "Selected channels" }]} onChange={(value) => update((next) => { next.monitoring["4dx"].channels.mode = value as "all" | "range"; })} />
-            {draft.monitoring["4dx"].channels.mode === "range" ? <div className="inline-fields channel-range-fields"><NumberField disabled={disabled} label="Start channel" min={1} max={fourDxChannelCount} value={draft.monitoring["4dx"].channels.startChannel ?? 1} onChange={(value) => update((next) => { next.monitoring["4dx"].channels.startChannel = value; })} /><NumberField disabled={disabled} label="End channel" min={1} max={fourDxChannelCount} value={draft.monitoring["4dx"].channels.endChannel ?? fourDxChannelCount} onChange={(value) => update((next) => { next.monitoring["4dx"].channels.endChannel = value; })} /><div className="calculated-field"><span>Frequency range</span><strong>{fourDxRange(fourDx, draft.monitoring["4dx"].channels.startChannel ?? 1, draft.monitoring["4dx"].channels.endChannel ?? fourDxChannelCount)}</strong></div></div> : <div className="selection-summary"><ShieldCheck size={17} /> Channels 1-{fourDxChannelCount} · {formatFrequency(fourDx.startHz, 3)} to {formatFrequency(fourDx.endHz, 3)}</div>}
+            <SegmentedControl ariaLabel={`${services.get("4dx")!.label} channel selection`} disabled={disabled} value={viewSettings.monitoring["4dx"].channels.mode} options={[{ value: "all", label: `All ${fourDxChannelCount} channels` }, { value: "range", label: "Selected channels" }]} onChange={(value) => update((next) => { next.monitoring["4dx"].channels.mode = value as "all" | "range"; })} />
+            {viewSettings.monitoring["4dx"].channels.mode === "range" ? <div className="inline-fields channel-range-fields"><NumberField disabled={disabled} label="Start channel" min={1} max={fourDxChannelCount} value={viewSettings.monitoring["4dx"].channels.startChannel ?? 1} onChange={(value) => update((next) => { next.monitoring["4dx"].channels.startChannel = value; })} /><NumberField disabled={disabled} label="End channel" min={1} max={fourDxChannelCount} value={viewSettings.monitoring["4dx"].channels.endChannel ?? fourDxChannelCount} onChange={(value) => update((next) => { next.monitoring["4dx"].channels.endChannel = value; })} /><div className="calculated-field"><span>Frequency range</span><strong>{fourDxRange(fourDx, viewSettings.monitoring["4dx"].channels.startChannel ?? 1, viewSettings.monitoring["4dx"].channels.endChannel ?? fourDxChannelCount)}</strong></div></div> : <div className="selection-summary"><ShieldCheck size={17} /> Channels 1-{fourDxChannelCount} · {formatFrequency(fourDx.startHz, 3)} to {formatFrequency(fourDx.endHz, 3)}</div>}
             {errors["monitoring.4dx.range"] ? <FieldError text={errors["monitoring.4dx.range"]} /> : null}
           </ServiceEditor>
         </div>
@@ -654,10 +743,44 @@ function MonitoringSettings({ response, draft, current, setDraft, errors, disabl
 }
 
 const MISSION_OPTIONS: Array<{ value: Exclude<MonitoringMission, "custom">; label: string; detail: string }> = [
-  { value: "primary-watch", label: "Primary Watch", detail: "One GNSS band" },
-  { value: "multi-band-survey", label: "Multi-band Survey", detail: "Four GNSS bands · Best effort" },
+  { value: "continuous-watch", label: "Continuous Watch", detail: "One frequency window" },
+  { value: "multi-band-survey", label: "Multi-band Survey", detail: "Choose frequency windows" },
   { value: "radio-survey", label: "Radio Survey", detail: "StarTrack and 4DX" },
 ];
+
+function FrequencyWindowPicker({ mode, targets, selectedIds, disabled, onToggle }: {
+  mode: "single" | "multiple";
+  targets: PhysicalCaptureTarget[];
+  selectedIds: string[];
+  disabled: boolean;
+  onToggle: (targetId: string) => void;
+}) {
+  return <div className="frequency-window-list" role={mode === "single" ? "radiogroup" : "group"} aria-label="Frequency windows">{targets.map((target) => {
+    const checked = selectedIds.includes(target.id);
+    return <label key={target.id} className={checked ? "selected" : ""}>
+      <input type={mode === "single" ? "radio" : "checkbox"} name={mode === "single" ? "continuous-frequency-window" : undefined} checked={checked} disabled={disabled || (mode === "multiple" && checked && selectedIds.length <= 2)} onChange={() => onToggle(target.id)} />
+      <span><strong>{target.label}</strong><small>{target.service === "fugro" ? "Fugro corrections" : "GNSS"}{target.tier === "tier1" ? " · Priority" : ""}</small></span>
+      <b>{formatFrequency(target.nominalDisplayHz ?? target.centerHz, 3)}</b>
+    </label>;
+  })}</div>;
+}
+
+function FugroBeamPicker({ beams, selectedIds, disabled, error, onChange }: { beams: BandPreset[]; selectedIds: string[]; disabled: boolean; error?: string; onChange: (ids: string[]) => void }) {
+  return <div className="fugro-beam-picker">
+    <div className="mission-panel-heading"><strong>Fugro satellites</strong><a href="https://fsp.support/beams/" target="_blank" rel="noreferrer">View coverage map</a></div>
+    <p className="correction-watch-note">Choose the expected beams. They share one frequency window.</p>
+    <div className="correction-beam-list" role="group" aria-label="Expected Fugro correction beams">{beams.map((beam) => {
+      const metadata = beam.correctionBeam!;
+      const checked = selectedIds.includes(beam.id);
+      return <label key={beam.id} className={checked ? "selected" : ""}>
+        <input type="checkbox" checked={checked} disabled={disabled || (checked && selectedIds.length === 1)} onChange={() => onChange(checked ? selectedIds.filter((id) => id !== beam.id) : [...selectedIds, beam.id])} />
+        <span><strong>{beam.label}</strong><small>{orbitalLongitude(metadata.orbitalLongitudeDeg)} · Link {metadata.linkId}</small></span>
+        <span><b>{formatFrequency(beam.centerHz, 3)}</b><small>{metadata.symbolRateHz.toLocaleString()} symbols/s · {metadata.bitRateBps.toLocaleString()} bps</small></span>
+      </label>;
+    })}</div>
+    {error ? <FieldError text={error} /> : null}
+  </div>;
+}
 
 function MissionChoiceGroup({ value, disabled, onChange }: { value: MonitoringMission; disabled: boolean; onChange: (value: Exclude<MonitoringMission, "custom">) => void }) {
   const move = (event: React.KeyboardEvent<HTMLButtonElement>, index: number) => {
@@ -784,17 +907,19 @@ function EvidenceSettings({ draft, setDraft, response, errors, disabled, dataDom
   );
 }
 
-function AdvancedSettings({ response, draft, setDraft, errors, unlocked, onBaselineAction, onRestartSoftware }: {
+function AdvancedSettings({ response, draft, setDraft, errors, unlocked, onBaselineAction, onMaintenance, onOpenTab, initialSection }: {
   response: SettingsRevision;
   draft: OperationalSettings;
   setDraft: (value: OperationalSettings) => void;
   errors: Record<string, string>;
   unlocked: boolean;
   onBaselineAction: (action: "approve" | "restart", baseline: BaselineDescriptor) => Promise<void>;
-  onRestartSoftware: () => void;
+  onMaintenance: (action: MaintenanceAction) => void;
+  onOpenTab: (tab: SettingsTab) => void;
+  initialSection?: SettingsSection;
 }) {
   const updateDetection = (key: keyof OperationalSettings["detection"], value: number) => setDraft({ ...draft, detection: { ...draft.detection, [key]: value } });
-  const updateScan = (kind: "dwellMs" | "priority", service: "startrack" | "4dx" | "gnss", value: number) => setDraft({ ...draft, scan: { ...draft.scan, [kind]: { ...draft.scan[kind], [service]: value } } });
+  const updateScan = (kind: "dwellMs" | "priority", service: "startrack" | "4dx" | "gnss" | "fugro", value: number) => setDraft({ ...draft, scan: { ...draft.scan, [kind]: { ...draft.scan[kind], [service]: value } } });
   const learning = useMemo(() => buildSignalLearningPresentation({
     catalog: response.catalog,
     effectiveBands: response.effectiveBands,
@@ -804,11 +929,20 @@ function AdvancedSettings({ response, draft, setDraft, errors, unlocked, onBasel
   const approvalByBaseline = useMemo(() => new Map(
     (response.baselineApprovals ?? []).map((approval) => [baselineApprovalKey(approval), approval]),
   ), [response.baselineApprovals]);
+  const restartableCount = learning.activeTargets.filter((target) => target.baseline).length;
   const blockedApproval = useMemo(() => learning.activeTargets.flatMap((target) => {
     if (target.baseline?.lifecycle !== "reviewable") return [];
     const approval = approvalByBaseline.get(baselineApprovalKey(target.baseline));
     return approval && !approval.eligible ? [approval] : [];
   })[0], [approvalByBaseline, learning.activeTargets]);
+  const detectionIsDefault = useMemo(
+    () => JSON.stringify(draft.detection) === JSON.stringify(ROBUST_DETECTION_DEFAULTS),
+    [draft.detection],
+  );
+  useEffect(() => {
+    if (initialSection !== "signal-learning") return;
+    document.getElementById("signal-learning")?.scrollIntoView({ block: "start" });
+  }, [initialSection]);
   return (
     <section className="settings-section" aria-labelledby="advanced-settings-title">
       <h1 id="advanced-settings-title">Advanced</h1>
@@ -843,11 +977,15 @@ function AdvancedSettings({ response, draft, setDraft, errors, unlocked, onBasel
               <NumberField disabled={!unlocked} label="Voting window" suffix="visits" min={1} max={20} value={draft.detection.interferenceWindow} onChange={(value) => updateDetection("interferenceWindow", value)} />
               <NumberField disabled={!unlocked} label="Clear after" suffix="clean visits" min={1} max={100} value={draft.detection.clearObservations} onChange={(value) => updateDetection("clearObservations", value)} />
             </div>
+            <div className="protected-action-row">
+              <span><strong>Reset detection rules</strong><small>Returns every value on this screen to the supplied defaults. Nothing is saved until you select Apply changes.</small></span>
+              <button className="button secondary compact" type="button" disabled={!unlocked || detectionIsDefault} onClick={() => setDraft({ ...draft, detection: { ...ROBUST_DETECTION_DEFAULTS } })}>Reset to defaults</button>
+            </div>
             {Object.entries(errors).filter(([key]) => key.startsWith("detection.")).map(([key, text]) => <FieldError key={key} text={text} />)}
           </div>
         </details>
 
-        <details className="advanced-settings-group">
+        <details className="advanced-settings-group" id="signal-learning" open={initialSection === "signal-learning"}>
           <summary><span><strong>Signal learning</strong></span><ChevronDown size={18} aria-hidden="true" /></summary>
           <div className="advanced-settings-body">
             <div className="baseline-requirement"><span>Minimum learning</span><strong>{SIGNAL_LEARNING_REQUIRED_HOURS} hours</strong></div>
@@ -861,41 +999,50 @@ function AdvancedSettings({ response, draft, setDraft, errors, unlocked, onBasel
             </div>
             {blockedApproval ? <div className="baseline-approval-status" id="baseline-approval-status" role="status"><strong>{blockedApproval.label}</strong>{approvalDetail(blockedApproval) ? <span>{approvalDetail(blockedApproval)}</span> : null}{blockedApproval.action && blockedApproval.action !== "Wait." ? <span>{blockedApproval.action}</span> : null}</div> : null}
 
-            <details className="advanced-settings-group">
-              <summary><span><strong>Learning details</strong></span><ChevronDown size={18} aria-hidden="true" /></summary>
-              <div className="advanced-settings-body">
-                <h3 className="settings-subheading">Active frequencies</h3>
-                <div className="baseline-list">
-                  {learning.activeTargets.map((target) => {
-                    const approval = target.baseline ? approvalByBaseline.get(baselineApprovalKey(target.baseline)) : undefined;
-                    return (
-                      <div className="baseline-row" key={target.targetId}>
-                        <span><strong>{target.label}</strong><small>{signalLearningProgressLabel(target.representativeHours)}</small></span>
-                        <span className={`evidence-pill ${signalLearningPillClass(target.state)}`}>{signalLearningStateLabel(target.state)}</span>
-                        {unlocked && target.baseline?.lifecycle === "reviewable" ? <button className="button secondary compact" type="button" disabled={!approval?.eligible} aria-describedby={!approval?.eligible && blockedApproval ? "baseline-approval-status" : undefined} onClick={() => void onBaselineAction("approve", target.baseline!)}>Approve</button> : null}
-                        {unlocked && target.baseline ? <button className="button secondary compact" type="button" onClick={() => void onBaselineAction("restart", target.baseline!)}>Restart learning</button> : null}
-                      </div>
-                    );
-                  })}
-                </div>
+            <h3 className="settings-subheading">Active frequencies</h3>
+            <div className="baseline-list">
+              {learning.activeTargets.length ? learning.activeTargets.map((target) => {
+                const approval = target.baseline ? approvalByBaseline.get(baselineApprovalKey(target.baseline)) : undefined;
+                return (
+                  <div className="baseline-row" key={target.targetId}>
+                    <span><strong>{target.label}</strong><small>{target.signalsLabel ? `${target.signalsLabel} · ` : ""}{signalLearningProgressLabel(target.representativeHours)}</small></span>
+                    <span className={`evidence-pill ${signalLearningPillClass(target.state)}`}>{signalLearningStateLabel(target.state)}</span>
+                    {unlocked && target.baseline?.lifecycle === "reviewable" ? <button className="button secondary compact" type="button" disabled={!approval?.eligible} aria-describedby={!approval?.eligible && blockedApproval ? "baseline-approval-status" : undefined} onClick={() => void onBaselineAction("approve", target.baseline!)}>Approve</button> : null}
+                    {/* The control stays visible with its blocking reason so a
+                        missing baseline never looks like a missing feature. */}
+                    {unlocked ? <button className="button secondary compact" type="button" disabled={!target.baseline} title={target.baseline ? undefined : "No learned data to restart yet."} onClick={() => { if (target.baseline) void onBaselineAction("restart", target.baseline); }}>Restart learning</button> : null}
+                  </div>
+                );
+              }) : <div className="selection-summary">No active frequencies.</div>}
+            </div>
 
-                {learning.saved.length ? (
-                  <details className="advanced-settings-group">
-                    <summary><span><strong>Saved learning</strong><small>{countLabel(learning.saved.length, "saved record")}</small></span><ChevronDown size={18} aria-hidden="true" /></summary>
-                    <div className="advanced-settings-body">
-                      <div className="baseline-list">
-                        {learning.saved.map((saved) => (
-                          <div className="baseline-row" key={saved.key}>
-                            <span><strong>{saved.label}</strong><small>{saved.observationCount} observations · {signalLearningProgressLabel(saved.representativeHours)}</small></span>
-                            <span className={`evidence-pill ${signalLearningPillClass(saved.state)}`}>{signalLearningStateLabel(saved.state)}</span>
-                          </div>
-                        ))}
+            <div className="protected-action-row">
+              <span><strong>Restart signal learning</strong><small>Starts a new learning period for every active frequency with learned data. Recordings, incidents and saved learning records are kept.</small></span>
+              <button className="button danger compact" type="button" disabled={!unlocked || !restartableCount} title={restartableCount ? undefined : "No learned data to restart yet."} onClick={() => onMaintenance("restart-learning")}>Restart learning</button>
+            </div>
+            {!unlocked ? <p className="protected-action-hint">Unlock to use this action.</p> : null}
+
+            {learning.saved.length ? (
+              <details className="advanced-settings-group">
+                <summary><span><strong>Saved learning</strong><small>{countLabel(learning.saved.length, "saved record")}</small></span><ChevronDown size={18} aria-hidden="true" /></summary>
+                <div className="advanced-settings-body">
+                  <p className="protected-action-hint">Saved records are kept for reference. Learning can only be restarted for frequencies that are being monitored now.</p>
+                  <div className="baseline-list">
+                    {learning.saved.map((saved) => (
+                      <div className="baseline-row" key={saved.key}>
+                        <span>
+                          <strong>{saved.label}</strong>
+                          <small>{saved.observationCount} observations · {signalLearningProgressLabel(saved.representativeHours)}</small>
+                          {saved.targetActive ? null : <small>Not monitored now. Turn this frequency on in Monitoring to restart its learning.</small>}
+                        </span>
+                        <span className={`evidence-pill ${signalLearningPillClass(saved.state)}`}>{signalLearningStateLabel(saved.state)}</span>
+                        {saved.targetActive ? null : <button className="button secondary compact" type="button" onClick={() => onOpenTab("monitoring")}>Open Monitoring</button>}
                       </div>
-                    </div>
-                  </details>
-                ) : null}
-              </div>
-            </details>
+                    ))}
+                  </div>
+                </div>
+              </details>
+            ) : null}
           </div>
         </details>
 
@@ -912,7 +1059,7 @@ function AdvancedSettings({ response, draft, setDraft, errors, unlocked, onBasel
           <div className="advanced-settings-body">
             <div className="protected-action-row">
               <span><strong>Restart RF Monitor</strong><small>Restarts this application. Recordings, signal learning and settings are kept.</small></span>
-              <button className="button secondary compact" type="button" disabled={!unlocked} onClick={onRestartSoftware}>Restart software</button>
+              <button className="button secondary compact" type="button" disabled={!unlocked} onClick={() => onMaintenance("restart-software")}>Restart software</button>
             </div>
             {!unlocked ? <p className="protected-action-hint">Unlock to use this action.</p> : null}
           </div>

@@ -7,6 +7,11 @@ interface SpectrumViewProps {
   metrics?: SignalMetricSample;
   showBaseline: boolean;
   showMarkers: boolean;
+  frequencyGuides?: ReadonlyArray<{ frequencyHz: number; label: string }>;
+}
+
+function guideX(frequencyHz: number, startHz: number, endHz: number, width: number): number {
+  return ((frequencyHz - startHz) / Math.max(1, endHz - startHz)) * width;
 }
 
 function fitCanvas(canvas: HTMLCanvasElement): CanvasRenderingContext2D | undefined {
@@ -42,6 +47,7 @@ export const SpectrumView = memo(function SpectrumView({
   metrics,
   showBaseline,
   showMarkers,
+  frequencyGuides = [],
 }: SpectrumViewProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const frameDetectorAnalysis = detectorAnalysisForFrame(frame);
@@ -134,6 +140,49 @@ export const SpectrumView = memo(function SpectrumView({
       context.textAlign = "left";
     }
 
+    const visibleGuides = frequencyGuides.filter((guide) => guide.frequencyHz >= frame.startHz && guide.frequencyHz <= frame.endHz);
+    if (visibleGuides.length) {
+      context.strokeStyle = "rgba(206, 121, 0, 0.78)";
+      context.fillStyle = "#865300";
+      context.lineWidth = 1;
+      context.font = "700 8px Arial, sans-serif";
+      context.textAlign = "center";
+      const laneRight = [-Infinity, -Infinity, -Infinity];
+      for (const guide of [...visibleGuides].sort((left, right) => left.frequencyHz - right.frequencyHz)) {
+        const x = guideX(guide.frequencyHz, frame.startHz, frame.endHz, plotWidth);
+        context.setLineDash([2, 3]);
+        context.beginPath();
+        context.moveTo(x + 0.5, plotTop);
+        context.lineTo(x + 0.5, plotBottom);
+        context.stroke();
+        context.setLineDash([]);
+        const labelWidth = context.measureText(guide.label).width + 6;
+        const naturalX = Math.max(labelWidth / 2, Math.min(width - labelWidth / 2, x));
+        const candidates = laneRight.map((right, lane) => {
+          const shiftedX = Math.max(naturalX, right + 3 + labelWidth / 2);
+          return { lane, labelX: shiftedX, shift: shiftedX - naturalX, fits: shiftedX + labelWidth / 2 <= width };
+        });
+        const selected = candidates.filter((candidate) => candidate.fits).sort((left, right) => left.shift - right.shift || left.lane - right.lane)[0]
+          ?? candidates.sort((left, right) => left.shift - right.shift || left.lane - right.lane)[0];
+        const lane = selected.lane;
+        const labelX = Math.max(labelWidth / 2, Math.min(width - labelWidth / 2, selected.labelX));
+        laneRight[lane] = labelX + labelWidth / 2;
+        if (Math.abs(labelX - x) > 1) {
+          const y = plotTop + lane * 10 + 4.5;
+          context.strokeStyle = "rgba(206, 121, 0, 0.78)";
+          context.beginPath();
+          context.moveTo(x, y);
+          context.lineTo(labelX, y);
+          context.stroke();
+        }
+        context.fillStyle = "rgba(255, 248, 230, 0.94)";
+        context.fillRect(labelX - labelWidth / 2, plotTop + lane * 10, labelWidth, 9);
+        context.fillStyle = "#865300";
+        context.fillText(guide.label, labelX, plotTop + 8 + lane * 10);
+      }
+      context.textAlign = "left";
+    }
+
     for (const range of anomalyRanges) {
       context.beginPath();
       for (let index = range.startBin; index < range.endBin; index += 1) {
@@ -190,7 +239,7 @@ export const SpectrumView = memo(function SpectrumView({
     <canvas
       ref={canvasRef}
       className="spectrum-canvas"
-      aria-label={frame ? `${frame.syntheticExercise ? "Synthetic exercise " : ""}spectrum for ${frame.bandId}; relative scale 0 to 255; peak ${metrics?.peakLevel ?? 0}; higher values mean stronger received activity; shaded outer bins are guard roll-off and are not analyzed${frameDetectorAnalysis?.overload ? "; receiver overloaded; no RF anomaly bins attributed" : frameDetectorAnalysis?.anomalyBinRanges.length ? `; detector marked ${frameDetectorAnalysis.anomalyBinRanges.length} anomaly ${frameDetectorAnalysis.anomalyBinRanges.length === 1 ? "range" : "ranges"}` : "; no detector anomaly ranges"}` : "Spectrum waiting for data"}
+      aria-label={frame ? `${frame.syntheticExercise ? "Synthetic exercise " : ""}spectrum for ${frame.bandId}; relative scale 0 to 255; peak ${metrics?.peakLevel ?? 0}; higher values mean stronger received activity; shaded outer bins are guard roll-off and are not analyzed${frameDetectorAnalysis?.overload ? "; receiver overloaded; no RF anomaly bins attributed" : frameDetectorAnalysis?.anomalyBinRanges.length ? `; detector marked ${frameDetectorAnalysis.anomalyBinRanges.length} anomaly ${frameDetectorAnalysis.anomalyBinRanges.length === 1 ? "range" : "ranges"}` : "; no detector anomaly ranges"}${frequencyGuides.length ? `; ${frequencyGuides.length} expected correction carrier guides` : ""}` : "Spectrum waiting for data"}
     />
   );
 });
@@ -203,7 +252,7 @@ function waterfallColor(value: number): string {
   return `rgb(${Math.round(230 + level * 25)}, ${Math.round(210 - level * 190)}, 0)`;
 }
 
-export const WaterfallView = memo(function WaterfallView({ frames }: { frames: SpectrumFrame[] }) {
+export const WaterfallView = memo(function WaterfallView({ frames, frequencyGuides = [] }: { frames: SpectrumFrame[]; frequencyGuides?: ReadonlyArray<{ frequencyHz: number; label: string }> }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const draw = () => {
     const canvas = canvasRef.current;
@@ -258,6 +307,18 @@ export const WaterfallView = memo(function WaterfallView({ frames }: { frames: S
         }
         context.setLineDash([]);
       }
+      context.strokeStyle = "rgba(255, 210, 91, 0.74)";
+      context.lineWidth = 1;
+      context.setLineDash([2, 3]);
+      for (const guide of frequencyGuides) {
+        if (guide.frequencyHz < guideFrame.startHz || guide.frequencyHz > guideFrame.endHz) continue;
+        const x = guideX(guide.frequencyHz, guideFrame.startHz, guideFrame.endHz, width);
+        context.beginPath();
+        context.moveTo(x + 0.5, 0);
+        context.lineTo(x + 0.5, height);
+        context.stroke();
+      }
+      context.setLineDash([]);
     }
     context.strokeStyle = "rgba(255, 255, 255, 0.22)";
     context.lineWidth = 1;
@@ -273,5 +334,5 @@ export const WaterfallView = memo(function WaterfallView({ frames }: { frames: S
   useRedraw(canvasRef, draw);
 
   const anomalyRows = frames.filter((frame) => detectorAnomalyRanges(frame).length > 0).length;
-  return <canvas ref={canvasRef} className="waterfall-canvas" aria-label={`${frames.some((frame) => frame.syntheticExercise) ? "Synthetic exercise " : ""}waterfall with ${frames.length} recent spectrum frames; newest row on top; ${anomalyRows} detector-marked anomaly ${anomalyRows === 1 ? "row" : "rows"}; shaded outer columns are guard roll-off and are not analyzed`} />;
+  return <canvas ref={canvasRef} className="waterfall-canvas" aria-label={`${frames.some((frame) => frame.syntheticExercise) ? "Synthetic exercise " : ""}waterfall with ${frames.length} recent spectrum frames; newest row on top; ${anomalyRows} detector-marked anomaly ${anomalyRows === 1 ? "row" : "rows"}; shaded outer columns are guard roll-off and are not analyzed${frequencyGuides.length ? `; ${frequencyGuides.length} expected correction carrier guides` : ""}`} />;
 });

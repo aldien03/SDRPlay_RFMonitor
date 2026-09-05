@@ -1,7 +1,7 @@
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { metricsForFrame, PinnedShelf, signalStateForFeed } from "../src/client/SignalWall";
+import { feedManagerScopeCopy, feedMetricReadout, metricsForFrame, PinnedShelf, signalStateForFeed } from "../src/client/SignalWall";
 import { resolveOperatorSummary } from "../src/shared/operatorSummary";
 import type { MonitorFeed, SignalMetricSample, SpectrumFrame, SweepCycle } from "../src/shared/types";
 
@@ -153,5 +153,68 @@ describe("Signal Wall canonical incident state", () => {
       currentAvailable: false,
       unavailable: false,
     })).toBe("checking");
+  });
+});
+
+
+describe("feed metric readout", () => {
+  const frame: SpectrumFrame = {
+    id: "frame-1",
+    timestamp: "2026-08-23T04:00:00.000Z",
+    receiver: 0,
+    bandId: "gps-l1",
+    startHz: 1_570_000_000,
+    endHz: 1_580_000_000,
+    bins: new Uint8Array([20, 22, 24]),
+    source: "sdrconnect",
+    calibrated: false,
+  };
+  const metrics: SignalMetricSample = {
+    timestamp: frame.timestamp,
+    bandId: frame.bandId,
+    meanLevel: 22,
+    peakLevel: 24.4,
+    baselineLevel: 19,
+    baselineDelta: 3.2,
+    occupiedRatio: 0.42,
+    overload: false,
+  };
+
+  it("shows no numbers when the feed is off or unavailable", () => {
+    expect(feedMetricReadout({ frame, metrics, baselineAvailable: true, off: true, unavailable: false })).toBeUndefined();
+    expect(feedMetricReadout({ frame, metrics, baselineAvailable: true, off: false, unavailable: true })).toBeUndefined();
+  });
+
+  it("reports only Receiver overloaded when the receiver is saturated", () => {
+    expect(feedMetricReadout({ frame, metrics: { ...metrics, overload: true }, baselineAvailable: true, off: false, unavailable: false }))
+      .toEqual({ chips: ["Receiver overloaded"], overload: true });
+  });
+
+  it("omits the vs usual chip when no baseline is available", () => {
+    expect(feedMetricReadout({ frame, metrics, baselineAvailable: false, off: false, unavailable: false }))
+      .toEqual({ chips: ["Peak 24/255", "Busy 42%"], overload: false });
+  });
+
+  it("shows a plus prefix for a positive baseline delta", () => {
+    expect(feedMetricReadout({ frame, metrics, baselineAvailable: true, off: false, unavailable: false }))
+      .toEqual({ chips: ["Peak 24/255", "+3 vs usual", "Busy 42%"], overload: false });
+  });
+
+  it("uses the U+2212 minus sign, not a hyphen, for a negative baseline delta", () => {
+    const readout = feedMetricReadout({ frame, metrics: { ...metrics, baselineDelta: -5 }, baselineAvailable: true, off: false, unavailable: false });
+    expect(readout?.chips[1]).toBe("−5 vs usual");
+  });
+});
+
+describe("feed manager scope", () => {
+  it("explains that pinnable windows come from the Monitoring selection", () => {
+    expect(feedManagerScopeCopy(1)).toBe(
+      "This list shows the 1 frequency window your Monitoring selection covers. To pin another window, add it in Monitoring first.",
+    );
+  });
+
+  it("counts the covered windows so a short list is never unexplained", () => {
+    expect(feedManagerScopeCopy(2)).toContain("2 frequency windows");
+    expect(feedManagerScopeCopy(0)).toContain("0 frequency windows");
   });
 });

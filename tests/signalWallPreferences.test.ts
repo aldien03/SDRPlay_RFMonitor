@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { MonitorFeed } from "../src/shared/types";
 import {
+  DEFAULT_SIGNAL_WALL_PREFERENCES,
   parseSignalWallPreferences,
   reconcileSignalWallPreferences,
   SIGNAL_WALL_CAPACITY,
@@ -40,6 +41,7 @@ describe("Signal Wall browser preferences", () => {
       schemaVersion: 4,
       layout: "2x1",
       pinnedFeedIds: ["a"],
+      seeded: true,
       selectedFeedId: undefined,
     });
   });
@@ -52,7 +54,7 @@ describe("Signal Wall browser preferences", () => {
   });
 
   it("retains stored pins while the backend feed catalog is loading", () => {
-    const preferences = { schemaVersion: 4 as const, layout: "2x1" as const, pinnedFeedIds: [feeds[0].id], selectedFeedId: feeds[0].id };
+    const preferences = { schemaVersion: 4 as const, layout: "2x1" as const, pinnedFeedIds: [feeds[0].id], seeded: true, selectedFeedId: feeds[0].id };
     expect(reconcileSignalWallPreferences(preferences, [])).toBe(preferences);
   });
 
@@ -74,10 +76,53 @@ describe("Signal Wall browser preferences", () => {
 
   it("chooses the priority GNSS window then the two radio surveys on first use", () => {
     const defaults = reconcileSignalWallPreferences(
-      { schemaVersion: 4, layout: "2x1", pinnedFeedIds: ["missing"] },
+      { schemaVersion: 4, layout: "2x1", pinnedFeedIds: ["missing"], seeded: false },
       feeds,
     );
     expect(defaults.pinnedFeedIds.slice(0, 3)).toEqual(["window-target-1", "survey-startrack", "survey-4dx"]);
     expect(defaults.selectedFeedId).toBe("survey-startrack");
+    expect(defaults.seeded).toBe(true);
+  });
+
+  it("keeps a pin for a feed the operator switched off in Monitoring", () => {
+    const offFeeds = feeds.map((feed, index) => index === 5 ? { ...feed, enabled: false, coverageLabel: "Off" } : feed);
+    const chosen = reconcileSignalWallPreferences(
+      { schemaVersion: 4, layout: "2x1", pinnedFeedIds: [offFeeds[0].id, offFeeds[5].id], seeded: true, selectedFeedId: offFeeds[5].id },
+      offFeeds,
+    );
+    expect(chosen.pinnedFeedIds).toEqual([offFeeds[0].id, offFeeds[5].id]);
+    expect(chosen.selectedFeedId).toBe(offFeeds[5].id);
+  });
+
+  it("drops only pins whose feed left the backend catalog", () => {
+    const chosen = reconcileSignalWallPreferences(
+      { schemaVersion: 4, layout: "2x1", pinnedFeedIds: [feeds[0].id, "retired-feed"], seeded: true },
+      feeds,
+    );
+    expect(chosen.pinnedFeedIds).toEqual([feeds[0].id]);
+  });
+
+  it("respects an emptied wall instead of restoring the starter pins", () => {
+    const cleared = reconcileSignalWallPreferences(
+      { schemaVersion: 4, layout: "2x1", pinnedFeedIds: [], seeded: true },
+      feeds,
+    );
+    expect(cleared.pinnedFeedIds).toEqual([]);
+    expect(cleared.selectedFeedId).toBeUndefined();
+    expect(reconcileSignalWallPreferences(cleared, feeds).pinnedFeedIds).toEqual([]);
+  });
+
+  it("still seeds starter pins once a service is enabled after a fully off catalog", () => {
+    const allOff = feeds.map((feed) => ({ ...feed, enabled: false }));
+    const waiting = reconcileSignalWallPreferences(DEFAULT_SIGNAL_WALL_PREFERENCES, allOff);
+    expect(waiting.pinnedFeedIds).toEqual([]);
+    expect(waiting.seeded).toBe(false);
+    expect(reconcileSignalWallPreferences(waiting, feeds).pinnedFeedIds.length).toBeGreaterThan(0);
+  });
+
+  it("never seeds starter pins over a feed the operator switched off", () => {
+    const offFeeds = feeds.map((feed, index) => index === 0 ? { ...feed, enabled: false } : feed);
+    const seeded = reconcileSignalWallPreferences(DEFAULT_SIGNAL_WALL_PREFERENCES, offFeeds);
+    expect(seeded.pinnedFeedIds).not.toContain(offFeeds[0].id);
   });
 });

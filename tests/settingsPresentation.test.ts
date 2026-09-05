@@ -119,4 +119,87 @@ describe("settings signal learning presentation", () => {
     expect(presentation.activeTargets.find((target) => target.targetId === targetId)?.baseline?.fingerprintId).toBe("current");
     expect(presentation.saved.map((item) => item.baseline.fingerprintId)).toContain("previous");
   });
+
+  it("lists the Fugro capture window as one active frequency", () => {
+    const configured = applyMonitoringMission(settings(), TEST_CATALOG, "continuous-watch", "fugro-corrections-lband");
+    const presentation = buildSignalLearningPresentation({
+      catalog: TEST_CATALOG,
+      effectiveBands: compileEffectiveBands(TEST_CATALOG, configured),
+      sampleRateHz: 10_000_000,
+      baselines: [],
+    });
+
+    expect(presentation.activeTargets).toHaveLength(1);
+    expect(presentation.activeTargets[0]).toMatchObject({ targetId: "fugro-corrections-lband", service: "fugro" });
+  });
+
+  it("keeps one stable window name when the Fugro beam selection changes", () => {
+    const configuredOne = applyMonitoringMission(settings(), TEST_CATALOG, "continuous-watch", "fugro-corrections-lband");
+    const configuredTwo = structuredClone(configuredOne);
+    configuredTwo.monitoring.fugro.selectedBeamIds = ["fugro-ersat", "fugro-easat"];
+    const presentationOne = buildSignalLearningPresentation({
+      catalog: TEST_CATALOG,
+      effectiveBands: compileEffectiveBands(TEST_CATALOG, configuredOne),
+      sampleRateHz: 10_000_000,
+      baselines: [],
+    });
+    const presentationTwo = buildSignalLearningPresentation({
+      catalog: TEST_CATALOG,
+      effectiveBands: compileEffectiveBands(TEST_CATALOG, configuredTwo),
+      sampleRateHz: 10_000_000,
+      baselines: [],
+    });
+    const catalogLabel = TEST_CATALOG.captureTargets.find((target) => target.id === "fugro-corrections-lband")!.label;
+    const targetOne = presentationOne.activeTargets.find((target) => target.targetId === "fugro-corrections-lband");
+    const targetTwo = presentationTwo.activeTargets.find((target) => target.targetId === "fugro-corrections-lband");
+
+    expect(targetOne?.label).toBe(catalogLabel);
+    expect(targetTwo?.label).toBe(catalogLabel);
+    expect(targetOne?.signalsLabel).not.toBe(targetTwo?.signalsLabel);
+  });
+
+  it("names an active frequency the same way the restart dialog does", () => {
+    const configured = applyMonitoringMission(settings(), TEST_CATALOG, "multi-band-survey", ["fugro-corrections-lband", "gnss-l1-e1-b1c-sbas"]);
+    const presentation = buildSignalLearningPresentation({
+      catalog: TEST_CATALOG,
+      effectiveBands: compileEffectiveBands(TEST_CATALOG, configured),
+      sampleRateHz: 10_000_000,
+      baselines: [],
+    });
+    const captureTargetsById = new Map(TEST_CATALOG.captureTargets.map((target) => [target.id, target]));
+    const matched = presentation.activeTargets.filter((target) => captureTargetsById.has(target.targetId));
+
+    expect(matched.length).toBeGreaterThan(0);
+    for (const target of matched) expect(target.label).toBe(captureTargetsById.get(target.targetId)!.label);
+  });
+
+  it("marks a saved record whose frequency is no longer monitored", () => {
+    const configured = applyMonitoringMission(settings(), TEST_CATALOG, "radio-survey");
+    const effectiveBands = compileEffectiveBands(TEST_CATALOG, configured);
+    const probe = buildSignalLearningPresentation({ catalog: TEST_CATALOG, effectiveBands, sampleRateHz: 10_000_000, baselines: [] });
+    const monitoredTargetId = probe.activeTargets[0].targetId;
+    const fugroBaseline = baseline("fugro-corrections-lband", "protected", 24);
+    const previousMonitored = baseline(monitoredTargetId, "protected", 24, {
+      fingerprintId: "previous",
+      learningStartedAt: "2026-08-22T11:00:00.000Z",
+    });
+    const currentMonitored = baseline(monitoredTargetId, "provisional", 3, {
+      fingerprintId: "current",
+      learningGenerationId: "2",
+      learningStartedAt: "2026-08-23T10:00:00.000Z",
+    });
+    const presentation = buildSignalLearningPresentation({
+      catalog: TEST_CATALOG,
+      effectiveBands,
+      sampleRateHz: 10_000_000,
+      baselines: [fugroBaseline, previousMonitored, currentMonitored],
+    });
+    const fugroCatalogLabel = TEST_CATALOG.captureTargets.find((target) => target.id === "fugro-corrections-lband")!.label;
+
+    expect(presentation.saved.find((item) => item.baseline.targetId === "fugro-corrections-lband")).toMatchObject({
+      targetActive: false,
+      label: fugroCatalogLabel,
+    });
+    expect(presentation.saved.find((item) => item.baseline.fingerprintId === "previous")).toMatchObject({ targetActive: true });
+  });
 });

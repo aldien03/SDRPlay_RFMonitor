@@ -47,6 +47,7 @@ export function evaluateSettingsFeasibility(input: {
       })
       : [],
   );
+  if (settings.monitoring.fugro?.enabled) for (const beamId of settings.monitoring.fugro.selectedBeamIds) enabledSignalIds.add(beamId);
   const enabledTargets = catalog.captureTargets.filter((target) => target.relatedBandIds.some((bandId) => enabledSignalIds.has(bandId)));
   const tier1Targets = enabledTargets.filter((target) => captureTargetTierForProfile(target, settings, catalog) === "tier1");
   const tier1Utilization = tier1Targets.reduce((total, target) => total + target.nominalVisitMs / target.revisitObjectiveMs, 0);
@@ -97,7 +98,7 @@ export function evaluateSettingsFeasibility(input: {
 
 export const GNSS_CONSTELLATIONS: GnssConstellation[] = ["GPS", "GLONASS", "Galileo", "BeiDou", "SBAS"];
 const REQUIRED_GNSS_SYSTEMS: GnssConstellation[] = ["GPS", "GLONASS", "Galileo", "BeiDou"];
-export const SERVICE_GROUPS: ServiceGroup[] = ["startrack", "4dx", "gnss"];
+export const SERVICE_GROUPS: ServiceGroup[] = ["startrack", "4dx", "gnss", "fugro"];
 
 function selectedGnssTargetIds(settings: OperationalSettings, catalog: BandCatalog): string[] {
   if (!settings.monitoring.gnss.enabled) return [];
@@ -110,26 +111,40 @@ function selectedGnssTargetIds(settings: OperationalSettings, catalog: BandCatal
     .map((target) => target.id);
 }
 
-function sameIds(left: readonly string[], right: readonly string[]): boolean {
-  if (left.length !== right.length) return false;
-  const expected = new Set(right);
-  return left.every((id) => expected.has(id));
+export function selectedFugroBeamIds(settings: OperationalSettings, catalog: BandCatalog): string[] {
+  if (!settings.monitoring.fugro?.enabled) return [];
+  const known = new Set(catalog.bands.filter((band) => band.service === "fugro").map((band) => band.id));
+  return settings.monitoring.fugro.selectedBeamIds.filter((id) => known.has(id));
+}
+
+export function selectedMonitoringTargetIds(settings: OperationalSettings, catalog: BandCatalog): string[] {
+  const ids = selectedGnssTargetIds(settings, catalog);
+  if (settings.monitoring.fugro?.enabled && selectedFugroBeamIds(settings, catalog).length) {
+    const fugroTarget = catalog.captureTargets.find((target) => target.service === "fugro");
+    if (fugroTarget) ids.push(fugroTarget.id);
+  }
+  return ids;
 }
 
 /** Returns a task label only when the active selection matches that task. */
 export function monitoringMissionForSettings(settings: OperationalSettings, catalog: BandCatalog): MonitoringMission {
   const radiosEnabled = settings.monitoring.startrack.enabled || settings.monitoring["4dx"].enabled;
-  const selectedTargets = selectedGnssTargetIds(settings, catalog);
-  if (settings.scan.profile === "gnss-priority" && !radiosEnabled && selectedTargets.length === 1) return "primary-watch";
-  const tierOneTargets = catalog.captureTargets.filter((target) => target.service === "gnss" && target.tier === "tier1").map((target) => target.id);
-  if (settings.scan.profile === "fast-gnss" && !radiosEnabled && sameIds(selectedTargets, tierOneTargets)) return "multi-band-survey";
-  if (settings.scan.profile === "balanced" && !settings.monitoring.gnss.enabled && radiosEnabled) return "radio-survey";
+  const selectedTargets = selectedMonitoringTargetIds(settings, catalog);
+  if (!radiosEnabled && selectedTargets.length === 1 && ["gnss-priority", "correction-watch"].includes(settings.scan.profile)) return "continuous-watch";
+  if (!radiosEnabled && settings.scan.profile === "fast-gnss" && selectedTargets.length >= 2) return "multi-band-survey";
+  if (settings.scan.profile === "balanced" && !settings.monitoring.gnss.enabled && !settings.monitoring.fugro?.enabled && radiosEnabled) return "radio-survey";
   return "custom";
 }
 
-export function primaryWatchTargetId(settings: OperationalSettings, catalog: BandCatalog): string | undefined {
-  const ids = selectedGnssTargetIds(settings, catalog);
+export function continuousWatchTargetId(settings: OperationalSettings, catalog: BandCatalog): string | undefined {
+  const ids = selectedMonitoringTargetIds(settings, catalog);
   return ids.length === 1 ? ids[0] : undefined;
+}
+
+function ensureFugroBeamSelection(settings: OperationalSettings, catalog: BandCatalog): void {
+  const availableBeamIds = catalog.bands.filter((band) => band.service === "fugro").map((band) => band.id);
+  const selected = settings.monitoring.fugro.selectedBeamIds.filter((id) => availableBeamIds.includes(id));
+  settings.monitoring.fugro.selectedBeamIds = selected.length ? selected : availableBeamIds.slice(0, 1);
 }
 
 function setGnssSignals(settings: OperationalSettings, catalog: BandCatalog, signalIds: readonly string[]): void {
@@ -155,48 +170,63 @@ function setGnssSignals(settings: OperationalSettings, catalog: BandCatalog, sig
   }
 }
 
-/** Applies one explicit single-tuner mission without changing the v3 storage schema. */
+/** Applies one explicit single-tuner mission using the current operational schema. */
 export function applyMonitoringMission(
   settings: OperationalSettings,
   catalog: BandCatalog,
   mission: Exclude<MonitoringMission, "custom">,
-  requestedTargetId?: string,
+  requestedTargetId?: string | readonly string[],
 ): OperationalSettings {
   const next = structuredClone(settings);
-  if (mission === "primary-watch") {
-    const target = catalog.captureTargets.find((candidate) => candidate.service === "gnss" && candidate.id === requestedTargetId)
+  if (mission === "continuous-watch") {
+    const requestedId = typeof requestedTargetId === "string" ? requestedTargetId : undefined;
+    const target = catalog.captureTargets.find((candidate) => ["gnss", "fugro"].includes(candidate.service) && candidate.id === requestedId)
+      ?? catalog.captureTargets.find((candidate) => candidate.id === continuousWatchTargetId(next, catalog))
       ?? catalog.captureTargets.find((candidate) => candidate.id === "gnss-l1-e1-b1c-sbas")
       ?? catalog.captureTargets.find((candidate) => candidate.service === "gnss" && candidate.tier === "tier1")
-      ?? catalog.captureTargets.find((candidate) => candidate.service === "gnss");
-    if (!target) throw new SettingsValidationError({ monitoring: "No GNSS band is available" });
+      ?? catalog.captureTargets.find((candidate) => ["gnss", "fugro"].includes(candidate.service));
+    if (!target) throw new SettingsValidationError({ monitoring: "No monitoring frequency is available" });
     const priorityWindow = catalog.priorityWindows.find((window) => window.relatedBandIds.some((bandId) => target.relatedBandIds.includes(bandId)));
-    next.scan.profile = "gnss-priority";
+    next.scan.profile = target.service === "fugro" ? "correction-watch" : "gnss-priority";
     next.scan.priorityWindowId = priorityWindow?.id ?? target.id;
     next.scan.maxPriorityGapMs = Math.max(2_000, target.revisitObjectiveMs);
     next.monitoring.startrack.enabled = false;
     next.monitoring["4dx"].enabled = false;
-    setGnssSignals(next, catalog, target.relatedBandIds);
+    next.monitoring.fugro.enabled = target.service === "fugro";
+    if (target.service === "fugro") {
+      setGnssSignals(next, catalog, []);
+      ensureFugroBeamSelection(next, catalog);
+    } else {
+      setGnssSignals(next, catalog, target.relatedBandIds);
+    }
     return next;
   }
   if (mission === "multi-band-survey") {
-    const tierOneSignals = catalog.captureTargets
-      .filter((target) => target.service === "gnss" && target.tier === "tier1")
-      .flatMap((target) => target.relatedBandIds);
-    if (!tierOneSignals.length) throw new SettingsValidationError({ monitoring: "No GNSS survey bands are available" });
+    const availableTargets = catalog.captureTargets.filter((target) => ["gnss", "fugro"].includes(target.service));
+    const requestedIds = Array.isArray(requestedTargetId)
+      ? requestedTargetId.filter((id) => availableTargets.some((target) => target.id === id))
+      : [];
+    const defaultIds = availableTargets.filter((target) => target.service === "gnss" && target.tier === "tier1").map((target) => target.id);
+    const selectedIds = requestedIds.length >= 2 ? requestedIds : defaultIds;
+    if (selectedIds.length < 2) throw new SettingsValidationError({ monitoring: "Select at least two frequency windows" });
+    const selectedTargets = availableTargets.filter((target) => selectedIds.includes(target.id));
     next.scan.profile = "fast-gnss";
     next.monitoring.startrack.enabled = false;
     next.monitoring["4dx"].enabled = false;
-    setGnssSignals(next, catalog, tierOneSignals);
+    next.monitoring.fugro.enabled = selectedTargets.some((target) => target.service === "fugro");
+    if (next.monitoring.fugro.enabled) ensureFugroBeamSelection(next, catalog);
+    setGnssSignals(next, catalog, selectedTargets.filter((target) => target.service === "gnss").flatMap((target) => target.relatedBandIds));
     return next;
   }
   next.scan.profile = "balanced";
   next.monitoring.gnss.enabled = false;
+  next.monitoring.fugro.enabled = false;
   next.monitoring.startrack.enabled = true;
   next.monitoring["4dx"].enabled = true;
   return next;
 }
 
-const ROBUST_DETECTION_DEFAULTS: OperationalSettings["detection"] = {
+export const ROBUST_DETECTION_DEFAULTS: OperationalSettings["detection"] = {
   ruleSetId: "rf-relative-mad-v1",
   scaleFloorBins: 1,
   widebandObservationSigma: 6,
@@ -256,7 +286,7 @@ export function createDefaultOperationalSettings(catalog: BandCatalog, seed: Ope
   ])) as OperationalSettings["monitoring"]["gnss"]["constellations"];
   const enabledSystemIds = GNSS_CONSTELLATIONS.filter((constellation) => constellations[constellation].enabled);
   const defaults: OperationalSettings = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     revision: 1,
     updatedAt: seed.updatedAt ?? new Date().toISOString(),
     siteName: seed.siteName,
@@ -266,13 +296,14 @@ export function createDefaultOperationalSettings(catalog: BandCatalog, seed: Ope
       startrack: { enabled: false, channels: { mode: "all", frequenciesHz: [] } },
       "4dx": { enabled: false, channels: { mode: "all", frequenciesHz: [], startChannel: 1, endChannel: fourDx.channelCount } },
       gnss: { enabled: true, enabledSystemIds, enabledSignalIds, constellations },
+      fugro: { enabled: false, selectedBeamIds: [] },
     },
     scan: {
       profile: "fast-gnss",
       priorityWindowId: catalog.priorityWindows[0]?.id ?? "gnss-l1-core",
       maxPriorityGapMs: 2_000,
-      dwellMs: { startrack: 8_000, "4dx": 8_000, gnss: 1_000 },
-      priority: { startrack: 1, "4dx": 1, gnss: 10 },
+      dwellMs: { startrack: 8_000, "4dx": 8_000, gnss: 1_000, fugro: 1_000 },
+      priority: { startrack: 1, "4dx": 1, gnss: 10, fugro: 10 },
     },
     detection: { ...seed.detection },
     retention: { ...seed.retention },
@@ -282,7 +313,7 @@ export function createDefaultOperationalSettings(catalog: BandCatalog, seed: Ope
     ?? catalog.captureTargets.find((target) => target.service === "gnss" && target.tier === "tier1")
     ?? catalog.captureTargets.find((target) => target.service === "gnss");
   return primaryTarget
-    ? applyMonitoringMission(defaults, catalog, "primary-watch", primaryTarget.id)
+    ? applyMonitoringMission(defaults, catalog, "continuous-watch", primaryTarget.id)
     : defaults;
 }
 
@@ -328,8 +359,64 @@ function createLegacyCaptureTargets(bands: BandPreset[]): PhysicalCaptureTarget[
   });
 }
 
+const DEFAULT_FUGRO_BEAMS: ReadonlyArray<Pick<BandPreset, "id" | "label" | "centerHz" | "correctionBeam">> = [
+  { id: "fugro-arsat", label: "ARSAT", centerHz: 1_545_245_000, correctionBeam: { orbitalLongitudeDeg: -98, linkId: 13, symbolRateHz: 4_876, bitRateBps: 2_400 } },
+  { id: "fugro-sasat", label: "SASAT", centerHz: 1_545_815_000, correctionBeam: { orbitalLongitudeDeg: -54, linkId: 4, symbolRateHz: 2_438, bitRateBps: 1_200 } },
+  { id: "fugro-ocsat", label: "OCSAT", centerHz: 1_545_875_000, correctionBeam: { orbitalLongitudeDeg: 143.5, linkId: 18, symbolRateHz: 2_438, bitRateBps: 1_200 } },
+  { id: "fugro-ersat", label: "ERSAT", centerHz: 1_545_950_000, correctionBeam: { orbitalLongitudeDeg: 25, linkId: 20, symbolRateHz: 4_876, bitRateBps: 2_400 } },
+  { id: "fugro-easat", label: "EASAT", centerHz: 1_546_230_000, correctionBeam: { orbitalLongitudeDeg: 25, linkId: 6, symbolRateHz: 2_438, bitRateBps: 1_200 } },
+  { id: "fugro-irsat", label: "IRSAT", centerHz: 1_546_240_000, correctionBeam: { orbitalLongitudeDeg: 83.5, linkId: 7, symbolRateHz: 2_438, bitRateBps: 1_200 } },
+];
+
+function addDefaultFugroCatalog(catalog: { schemaVersion: number; services: BandCatalog["services"]; bands: BandCatalog["bands"]; captureTargets?: PhysicalCaptureTarget[]; sources: BandCatalog["sources"] }): void {
+  if (!catalog.services.some((service) => service.id === "fugro")) {
+    catalog.services.push({ id: "fugro", label: "Fugro corrections", description: "L-band positioning correction beams" });
+  }
+  const existingIds = new Set(catalog.bands.map((band) => band.id));
+  for (const beam of DEFAULT_FUGRO_BEAMS) {
+    if (existingIds.has(beam.id)) continue;
+    catalog.bands.push({
+      ...beam,
+      service: "fugro",
+      signal: "L-band correction",
+      captureTargetId: "fugro-corrections-lband",
+      defaultEnabled: false,
+      startHz: beam.centerHz - 10_000,
+      endHz: beam.centerHz + 10_000,
+      priority: 1,
+      dwellMs: 1_000,
+      editable: true,
+    });
+  }
+  catalog.captureTargets ??= [];
+  if (!catalog.captureTargets.some((target) => target.id === "fugro-corrections-lband")) {
+    catalog.captureTargets.push({
+      id: "fugro-corrections-lband",
+      label: "Fugro L-band corrections",
+      service: "fugro",
+      relatedBandIds: DEFAULT_FUGRO_BEAMS.map((beam) => beam.id),
+      centerHz: 1_545_742_500,
+      captureSpanHz: 10_000_000,
+      analysisSpanHz: 8_000_000,
+      tier: "tier1",
+      defaultEnabled: false,
+      revisitObjectiveMs: 2_000,
+      weight: 10,
+      nominalVisitMs: 1_000,
+      maxVisitMs: 1_500,
+      tuneAckTimeoutMs: 500,
+      settleMs: 250,
+      discardFrames: 2,
+      minFreshFrames: 3,
+    });
+  }
+  if (!catalog.sources.some((source) => source.reference.includes("fsp.support/beams"))) {
+    catalog.sources.push({ title: "Fugro beam frequencies and coverage", reference: "https://fsp.support/beams/ (reviewed 2026-08-29)" });
+  }
+}
+
 export function validateBandCatalog(input: BandCatalog): BandCatalog {
-  const catalog = structuredClone(input) as Omit<BandCatalog, "schemaVersion" | "captureTargets"> & { schemaVersion: 1 | 2 | 3; priorityWindows?: BandCatalog["priorityWindows"]; captureTargets?: PhysicalCaptureTarget[] };
+  const catalog = structuredClone(input) as Omit<BandCatalog, "schemaVersion" | "captureTargets"> & { schemaVersion: 1 | 2 | 3 | 4; priorityWindows?: BandCatalog["priorityWindows"]; captureTargets?: PhysicalCaptureTarget[] };
   const sourceSchemaVersion = catalog.schemaVersion;
   if (catalog.schemaVersion === 1) {
     catalog.schemaVersion = 2;
@@ -359,8 +446,12 @@ export function validateBandCatalog(input: BandCatalog): BandCatalog {
     const targetByBand = new Map(catalog.captureTargets.flatMap((target) => target.relatedBandIds.map((bandId) => [bandId, target.id] as const)));
     for (const band of catalog.bands) if (band.service === "gnss" && !band.captureTargetId) band.captureTargetId = targetByBand.get(band.id);
   }
-  if (catalog?.schemaVersion !== 3 || typeof catalog.catalogVersion !== "string" || !catalog.catalogVersion.trim()) {
-    throw new Error("Frequency catalog must have schemaVersion 1 and a catalogVersion");
+  if (catalog.schemaVersion === 3) {
+    addDefaultFugroCatalog(catalog);
+    catalog.schemaVersion = 4;
+  }
+  if (catalog?.schemaVersion !== 4 || typeof catalog.catalogVersion !== "string" || !catalog.catalogVersion.trim()) {
+    throw new Error("Frequency catalog must have schemaVersion 1 through 4 and a catalogVersion");
   }
   if (!Array.isArray(catalog.services) || !Array.isArray(catalog.bands)) throw new Error("Frequency catalog is incomplete");
   const services = new Set(catalog.services.map((service) => service.id));
@@ -381,10 +472,16 @@ export function validateBandCatalog(input: BandCatalog): BandCatalog {
     if (band.channelSpacingHz !== undefined && (!Number.isInteger(band.channelSpacingHz) || band.channelSpacingHz <= 0 || !Number.isInteger(band.channelCount) || band.channelCount! <= 0)) {
       throw new Error(`Frequency catalog band ${band.id} has an invalid channel plan`);
     }
+    if (band.service === "fugro") {
+      const beam = band.correctionBeam;
+      if (!beam || !finite(beam.orbitalLongitudeDeg) || !Number.isInteger(beam.linkId) || beam.linkId <= 0 || !Number.isInteger(beam.symbolRateHz) || beam.symbolRateHz <= 0 || !Number.isInteger(beam.bitRateBps) || beam.bitRateBps <= 0) {
+        throw new Error(`Frequency catalog Fugro beam ${band.id} has invalid metadata`);
+      }
+    }
   }
   if (!Array.isArray(catalog.priorityWindows) || !catalog.priorityWindows.length) throw new Error("Frequency catalog must define at least one priority window");
   for (const window of catalog.priorityWindows) {
-    if (!window.id?.trim() || window.service !== "gnss" || !finite(window.centerHz) || !finite(window.spanHz) || window.spanHz <= 0 || !Array.isArray(window.relatedBandIds) || !window.relatedBandIds.length) throw new Error("Frequency catalog contains an invalid priority window");
+    if (!window.id?.trim() || !["gnss", "fugro"].includes(window.service) || !finite(window.centerHz) || !finite(window.spanHz) || window.spanHz <= 0 || !Array.isArray(window.relatedBandIds) || !window.relatedBandIds.length) throw new Error("Frequency catalog contains an invalid priority window");
     if (window.relatedBandIds.some((id) => !ids.has(id))) throw new Error(`Priority window ${window.id} references an unknown band`);
   }
   if (!Array.isArray(catalog.captureTargets) || !catalog.captureTargets.length || catalog.captureTargets.length > 64) throw new Error("Frequency catalog must define 1 to 64 physical capture targets");
@@ -392,7 +489,7 @@ export function validateBandCatalog(input: BandCatalog): BandCatalog {
   for (const target of catalog.captureTargets) {
     if (!target.id?.trim() || captureIds.has(target.id)) throw new Error(`Physical capture target id is missing or duplicated: ${target.id ?? "unknown"}`);
     captureIds.add(target.id);
-    if (!target.label?.trim() || target.service !== "gnss" || !finite(target.centerHz) || !finite(target.captureSpanHz) || !finite(target.analysisSpanHz) || target.captureSpanHz <= 0 || target.captureSpanHz > 10_000_000 || target.analysisSpanHz <= 0 || target.analysisSpanHz > target.captureSpanHz) throw new Error(`Physical capture target ${target.id} has invalid frequency bounds`);
+    if (!target.label?.trim() || !["gnss", "fugro"].includes(target.service) || !finite(target.centerHz) || !finite(target.captureSpanHz) || !finite(target.analysisSpanHz) || target.captureSpanHz <= 0 || target.captureSpanHz > 10_000_000 || target.analysisSpanHz <= 0 || target.analysisSpanHz > target.captureSpanHz) throw new Error(`Physical capture target ${target.id} has invalid frequency bounds`);
     if (!Array.isArray(target.relatedBandIds) || !target.relatedBandIds.length || target.relatedBandIds.some((id) => !ids.has(id))) throw new Error(`Physical capture target ${target.id} references an unknown signal`);
     if (![target.revisitObjectiveMs, target.nominalVisitMs, target.maxVisitMs, target.tuneAckTimeoutMs, target.settleMs, target.discardFrames, target.minFreshFrames].every((value) => Number.isInteger(value) && value > 0) || target.maxVisitMs < target.nominalVisitMs) throw new Error(`Physical capture target ${target.id} has invalid visit timing`);
     for (const bandId of target.relatedBandIds) {
@@ -415,7 +512,7 @@ export function validateBandCatalog(input: BandCatalog): BandCatalog {
       });
     }
   }
-  for (const band of catalog.bands.filter((candidate) => candidate.service === "gnss")) if (!band.captureTargetId || !captureIds.has(band.captureTargetId)) throw new Error(`GNSS signal ${band.id} must reference a physical capture target`);
+  for (const band of catalog.bands.filter((candidate) => candidate.service === "gnss" || candidate.service === "fugro")) if (!band.captureTargetId || !captureIds.has(band.captureTargetId)) throw new Error(`Signal ${band.id} must reference a physical capture target`);
   serviceBand(catalog as BandCatalog, "startrack");
   serviceBand(catalog as BandCatalog, "4dx");
   for (const constellation of REQUIRED_GNSS_SYSTEMS) {
@@ -429,7 +526,7 @@ export function validateBandCatalog(input: BandCatalog): BandCatalog {
 export function validateOperationalSettings(input: OperationalSettings, catalog: BandCatalog): OperationalSettings {
   const fields: Record<string, string> = {};
   if (!input || typeof input !== "object") throw new SettingsValidationError({ settings: "Operational settings are required" });
-  const settings = structuredClone(input) as Omit<OperationalSettings, "schemaVersion"> & { schemaVersion: 1 | 2 | 3; scan: OperationalSettings["scan"] & { profile?: OperationalSettings["scan"]["profile"]; priorityWindowId?: string; maxPriorityGapMs?: number } };
+  const settings = structuredClone(input) as Omit<OperationalSettings, "schemaVersion"> & { schemaVersion: 1 | 2 | 3 | 4; scan: OperationalSettings["scan"] & { profile?: OperationalSettings["scan"]["profile"]; priorityWindowId?: string; maxPriorityGapMs?: number } };
   if (settings?.schemaVersion === 1) {
     settings.schemaVersion = 2;
     settings.scan.profile = "balanced";
@@ -445,7 +542,13 @@ export function validateOperationalSettings(input: OperationalSettings, catalog:
     // as robust MAD scales; v3 starts from an explicitly versioned rule set.
     settings.detection = { ...ROBUST_DETECTION_DEFAULTS };
   }
-  if (settings?.schemaVersion !== 3) fields.schemaVersion = "Unsupported operational-settings schema";
+  if (settings?.schemaVersion === 3) {
+    settings.schemaVersion = 4;
+    settings.monitoring.fugro = { enabled: false, selectedBeamIds: [] };
+    settings.scan.dwellMs.fugro = 1_000;
+    settings.scan.priority.fugro = 10;
+  }
+  if (settings?.schemaVersion !== 4) fields.schemaVersion = "Unsupported operational-settings schema";
   if (!Number.isInteger(settings?.revision) || settings.revision < 1) fields.revision = "Revision must be a positive integer";
   if (typeof settings?.siteName !== "string" || !settings.siteName.trim() || settings.siteName.length > 80) fields.siteName = "Site name must contain 1 to 80 characters";
   settings.siteName = settings.siteName?.trim();
@@ -515,13 +618,22 @@ export function validateOperationalSettings(input: OperationalSettings, catalog:
   }
   if (settings.monitoring.gnss?.enabled && !enabledSignals) fields["monitoring.gnss"] = "Enable at least one GNSS signal";
 
-  if (![settings.monitoring.startrack?.enabled, settings.monitoring["4dx"]?.enabled, settings.monitoring.gnss?.enabled].some(Boolean)) {
+  const knownFugroBeamIds = new Set(catalog.bands.filter((band) => band.service === "fugro").map((band) => band.id));
+  if (!settings.monitoring.fugro || !Array.isArray(settings.monitoring.fugro.selectedBeamIds)) {
+    fields["monitoring.fugro"] = "Fugro beam selection is missing";
+  } else {
+    settings.monitoring.fugro.selectedBeamIds = [...new Set(settings.monitoring.fugro.selectedBeamIds)];
+    if (settings.monitoring.fugro.selectedBeamIds.some((id) => !knownFugroBeamIds.has(id))) fields["monitoring.fugro.selectedBeamIds"] = "Fugro selection contains an unknown beam";
+    if (settings.monitoring.fugro.enabled && !settings.monitoring.fugro.selectedBeamIds.length) fields["monitoring.fugro.selectedBeamIds"] = "Select at least one Fugro beam";
+  }
+
+  if (![settings.monitoring.startrack?.enabled, settings.monitoring["4dx"]?.enabled, settings.monitoring.gnss?.enabled, settings.monitoring.fugro?.enabled].some(Boolean)) {
     fields.monitoring = "Enable at least one service; use Pause when monitoring should stop";
   }
-  if (!["balanced", "gnss-priority", "fast-gnss"].includes(settings.scan.profile)) fields["scan.profile"] = "Choose Primary Watch, Multi-band Survey, or Radio Survey";
+  if (!["balanced", "gnss-priority", "fast-gnss", "correction-watch"].includes(settings.scan.profile)) fields["scan.profile"] = "Choose a monitoring task";
   if (!catalog.priorityWindows.some((window) => window.id === settings.scan.priorityWindowId)
-    && !catalog.captureTargets.some((target) => target.service === "gnss" && target.id === settings.scan.priorityWindowId)) {
-    fields["scan.priorityWindowId"] = "Select a catalog-defined GNSS band";
+    && !catalog.captureTargets.some((target) => (target.service === "gnss" || target.service === "fugro") && target.id === settings.scan.priorityWindowId)) {
+    fields["scan.priorityWindowId"] = "Select a catalog-defined primary frequency";
   }
   if (!Number.isInteger(settings.scan.maxPriorityGapMs) || settings.scan.maxPriorityGapMs < 2_000 || settings.scan.maxPriorityGapMs > 300_000) fields["scan.maxPriorityGapMs"] = "Priority-window gap must be between 2 and 300 seconds";
   for (const service of SERVICE_GROUPS) {
@@ -610,6 +722,32 @@ export function compileEffectiveBands(catalog: BandCatalog, settings: Operationa
       });
     }
   }
+  if (settings.monitoring.fugro?.enabled) {
+    const selected = new Set(settings.monitoring.fugro.selectedBeamIds);
+    for (const band of catalog.bands.filter((candidate) => candidate.service === "fugro" && selected.has(candidate.id))) {
+      const target = catalog.captureTargets.find((candidate) => candidate.id === band.captureTargetId);
+      if (!target) continue;
+      bands.push({
+        ...band,
+        startHz: Math.round(target.centerHz - target.captureSpanHz / 2),
+        endHz: Math.round(target.centerHz + target.captureSpanHz / 2),
+        dwellMs: target.nominalVisitMs,
+        priority: settings.scan.priority.fugro,
+        captureCenterHz: target.centerHz,
+        captureSpanHz: target.captureSpanHz,
+        analysisSpanHz: target.analysisSpanHz,
+        revisitObjectiveMs: target.revisitObjectiveMs,
+        captureTier: target.tier,
+        nominalVisitMs: target.nominalVisitMs,
+        maxVisitMs: target.maxVisitMs,
+        tuneAckTimeoutMs: target.tuneAckTimeoutMs,
+        settleMs: target.settleMs,
+        discardFrames: target.discardFrames,
+        minFreshFrames: target.minFreshFrames,
+        nominalDisplayHz: target.nominalDisplayHz ?? target.centerHz,
+      });
+    }
+  }
   if (!bands.length) throw new SettingsValidationError({ monitoring: "Enable at least one monitoring target" });
   return bands;
 }
@@ -633,6 +771,9 @@ export function createServiceSummaries(catalog: BandCatalog, settings: Operation
     if (definition.id === "gnss" && settings.monitoring.gnss.enabled) {
       const enabled = GNSS_CONSTELLATIONS.filter((constellation) => bands.some((band) => band.constellation === constellation));
       coverageLabel = enabled.join(", ");
+    }
+    if (definition.id === "fugro" && settings.monitoring.fugro?.enabled) {
+      coverageLabel = `${settings.monitoring.fugro.selectedBeamIds.length} selected ${settings.monitoring.fugro.selectedBeamIds.length === 1 ? "beam" : "beams"}`;
     }
     return {
       service: definition.id,

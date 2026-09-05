@@ -1,4 +1,4 @@
-import { ChevronDown, CircleHelp, Grid2X2, Pause, Play, Radio, Settings, SlidersHorizontal } from "lucide-react";
+import { BellOff, BellRing, ChevronDown, CircleHelp, Grid2X2, Pause, Play, Radio, Settings, SlidersHorizontal, Volume2, VolumeX } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { presentOperatorSummary } from "../shared/operatorSummary";
 import type { MonitorSnapshot } from "../shared/types";
@@ -18,20 +18,26 @@ export function Header({
   snapshot,
   layout,
   engineer,
+  audioAlerts,
+  popupAlerts,
   onLayout,
   onEngineer,
   onPause,
   onSettings,
   onHelp,
+  onAlertOption,
 }: {
   snapshot: MonitorSnapshot;
   layout: SignalWallLayout;
   engineer: boolean;
+  audioAlerts: boolean;
+  popupAlerts: boolean;
   onLayout: (layout: SignalWallLayout) => void;
   onEngineer: () => void;
   onPause: (paused: boolean) => Promise<void>;
   onSettings: () => void;
   onHelp: () => void;
+  onAlertOption: (key: "audioAlerts" | "popupAlerts") => void;
 }) {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -75,6 +81,8 @@ export function Header({
       <label className="mission-layout"><Grid2X2 size={18} aria-hidden="true" /><span>View</span><select value={layout} onChange={(event) => onLayout(event.target.value as SignalWallLayout)} aria-label="Signal wall layout">{layouts.map((item) => <option key={item} value={item}>{item.replace("x", "\u00d7")}</option>)}</select><ChevronDown size={14} aria-hidden="true" /></label>
       <nav className="mission-actions" aria-label="Dashboard actions">
         <button type="button" onClick={() => void onPause(!snapshot.paused)} disabled={!snapshot.monitoringReady} aria-label={snapshot.paused ? "Resume monitoring" : "Pause monitoring"}>{snapshot.paused ? <Play size={19} aria-hidden="true" /> : <Pause size={19} aria-hidden="true" />}<span>{snapshot.paused ? "Resume" : "Pause"}</span></button>
+        <button type="button" className={audioAlerts ? "selected" : ""} onClick={() => onAlertOption("audioAlerts")} aria-pressed={audioAlerts} aria-label={audioAlerts ? "Turn off alert sound" : "Turn on alert sound"}>{audioAlerts ? <Volume2 size={19} aria-hidden="true" /> : <VolumeX size={19} aria-hidden="true" />}<span>Sound</span></button>
+        <button type="button" className={popupAlerts ? "selected" : ""} onClick={() => onAlertOption("popupAlerts")} aria-pressed={popupAlerts} aria-label={popupAlerts ? "Turn off alert popups" : "Turn on alert popups"}>{popupAlerts ? <BellRing size={19} aria-hidden="true" /> : <BellOff size={19} aria-hidden="true" />}<span>Popup</span></button>
         <button type="button" className={engineer ? "selected" : ""} onClick={onEngineer} aria-label={engineer ? "Close engineer tools" : "Open engineer tools"} aria-pressed={engineer} aria-expanded={engineer}><SlidersHorizontal size={19} aria-hidden="true" /><span>Engineer</span></button>
         <button type="button" onClick={onHelp} aria-label="Open help"><CircleHelp size={20} aria-hidden="true" /><span>Help</span></button>
         <button type="button" onClick={onSettings} aria-label="Open settings"><Settings size={20} aria-hidden="true" /><span>Settings</span></button>
