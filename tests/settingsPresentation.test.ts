@@ -1,14 +1,26 @@
 import { describe, expect, it } from "vitest";
 import {
   buildSignalLearningPresentation,
+  restartBlockedReason,
   signalLearningProgressLabel,
   signalLearningState,
   signalLearningStateLabel,
 } from "../src/client/settingsPresentation";
 import { DEFAULT_THRESHOLDS } from "../src/shared/detection";
 import { applyMonitoringMission, compileEffectiveBands, createDefaultOperationalSettings } from "../src/shared/settings";
-import type { BaselineDescriptor, OperationalSettings } from "../src/shared/types";
+import type { BaselineDescriptor, ChannelLifecycle, ChannelMonitorState, OperationalSettings } from "../src/shared/types";
 import { TEST_CATALOG } from "./catalogFixture";
+
+function channelState(lifecycle: ChannelLifecycle, candidateCount: number, overrides: Partial<ChannelMonitorState> = {}): ChannelMonitorState {
+  return {
+    targetId: "rf-target",
+    lifecycle,
+    candidateCount,
+    clearCount: 0,
+    requiredCount: 1,
+    ...overrides,
+  };
+}
 
 function settings(): OperationalSettings {
   return createDefaultOperationalSettings(TEST_CATALOG, {
@@ -210,5 +222,46 @@ describe("settings signal learning presentation", () => {
       label: fugroCatalogLabel,
     });
     expect(presentation.saved.find((item) => item.baseline.fingerprintId === "previous")).toMatchObject({ targetActive: true });
+  });
+});
+
+describe("restartBlockedReason", () => {
+  it("accepts a missing state", () => {
+    expect(restartBlockedReason(undefined)).toBeUndefined();
+  });
+
+  it("accepts a clear frequency with no candidates", () => {
+    expect(restartBlockedReason(channelState("clear", 0))).toBeUndefined();
+  });
+
+  it("names the alert and the recovering cause for their own lifecycles", () => {
+    expect(restartBlockedReason(channelState("active", 0))).toBe("An alert is active on this frequency.");
+    expect(restartBlockedReason(channelState("recovering", 0))).toBe("This frequency is recovering.");
+  });
+
+  it("blocks on a running signal check even when the lifecycle itself would not block", () => {
+    expect(restartBlockedReason(channelState("clear", 2))).toBe("A signal check is still running on this frequency.");
+    expect(restartBlockedReason(channelState("detecting", 2))).toBe("A signal check is still running on this frequency.");
+  });
+
+  it("prefers the alert cause over a pending candidate count, the most specific cause", () => {
+    expect(restartBlockedReason(channelState("active", 2))).toBe("An alert is active on this frequency.");
+  });
+
+  // Pins restartBlockedReason to the server's restartBaseline guard
+  // (monitorService.ts: ["active","recovering"].includes(lifecycle) ||
+  // candidateCount > 0). If these two implementations ever disagree, the
+  // client would enable a Restart button the server rejects — the exact
+  // defect this SPEC removes.
+  it("stays equivalent to the server's restartBaseline guard across every lifecycle and candidate count", () => {
+    const lifecycles: ChannelLifecycle[] = ["clear", "detecting", "active", "recovering"];
+    const candidateCounts = [0, 2];
+    for (const lifecycle of lifecycles) {
+      for (const candidateCount of candidateCounts) {
+        const state = channelState(lifecycle, candidateCount);
+        const serverBlocks = ["active", "recovering"].includes(lifecycle) || candidateCount > 0;
+        expect(restartBlockedReason(state) !== undefined).toBe(serverBlocks);
+      }
+    }
   });
 });

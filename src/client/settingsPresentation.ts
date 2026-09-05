@@ -5,9 +5,22 @@ import type {
   BandPreset,
   BaselineDescriptor,
   BaselineLifecycle,
+  ChannelMonitorState,
   ServiceGroup,
 } from "../shared/types";
 import { formatRange } from "./format";
+
+/**
+ * Mirrors the server's restart guard so the UI can say no before the operator
+ * clicks. Returns undefined when a restart would be accepted.
+ */
+export function restartBlockedReason(state: ChannelMonitorState | undefined): string | undefined {
+  if (!state) return undefined;
+  if (state.lifecycle === "active") return "An alert is active on this frequency.";
+  if (state.lifecycle === "recovering") return "This frequency is recovering.";
+  if (state.candidateCount > 0) return "A signal check is still running on this frequency.";
+  return undefined;
+}
 
 export const SIGNAL_LEARNING_REQUIRED_HOURS = 24;
 

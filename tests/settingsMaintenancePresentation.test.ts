@@ -18,7 +18,7 @@ describe("protected Settings actions", () => {
 
   it.each<[MaintenanceAction, RegExp, RegExp]>([
     ["clear-test-data", /test recordings.*test incidents.*test signal learning/i, /Field data and settings are kept/i],
-    ["restart-learning", /new learning period for every active Field frequency/i, /Recordings, incidents, saved learning records and settings are kept/i],
+    ["restart-learning", /new learning period for every active Field frequency.*Frequencies with a check still running are skipped/i, /Recordings, incidents, saved learning records and settings are kept/i],
     ["delete-recordings", /finalized Field recordings/i, /Active, finalizing and in-use recordings, exports, signal learning and settings are kept/i],
     ["restart-software", /Monitoring and this dashboard will disconnect briefly/i, /Recordings, signal learning and settings are kept/i],
   ])("states what %s changes and retains", (action, changes, retained) => {
