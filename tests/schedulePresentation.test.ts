@@ -65,8 +65,8 @@ describe("schedulePresentation", () => {
     expect(windowSchedule({ target: noObjective, settings: configured, catalog: TEST_CATALOG }).utilization).toBe(0);
   });
 
-  it("marks the shipped Multi-band Survey default as exactly full", () => {
-    const configured = applyMonitoringMission(settings(), TEST_CATALOG, "multi-band-survey");
+  it("marks the shipped GNSS default as exactly full", () => {
+    const configured = applyMonitoringMission(settings(), TEST_CATALOG, "gnss-survey");
     const feasibility = evaluateSettingsFeasibility({ settings: configured, catalog: TEST_CATALOG, sampleRateHz: 10_000_000 });
     const capacity = scheduleCapacityCopy(feasibility);
 
@@ -83,12 +83,16 @@ describe("schedulePresentation", () => {
     expect(summedUtilization).toBeCloseTo(1, 3);
   });
 
-  it("overloads the schedule when the Fugro window is added", () => {
+  it("reports over capacity when the Fugro window is added at catalog objectives", () => {
+    // The GNSS + Fugro preset relaxes objectives so this selection fits. Clearing
+    // the relaxation reproduces the raw selection an operator can still build by
+    // hand, and that one must still be reported as over capacity.
     const defaultIds = TEST_CATALOG.captureTargets
       .filter((candidate) => candidate.service === "gnss" && candidate.tier === "tier1")
       .map((candidate) => candidate.id);
-    const configured = applyMonitoringMission(settings(), TEST_CATALOG, "multi-band-survey", [...defaultIds, "fugro-corrections-lband"]);
-    const feasibility = evaluateSettingsFeasibility({ settings: configured, catalog: TEST_CATALOG, sampleRateHz: 10_000_000 });
+    const configured = applyMonitoringMission(settings(), TEST_CATALOG, "gnss-fugro-survey", [...defaultIds, "fugro-corrections-lband"]);
+    const withoutRelaxation = { ...configured, scan: { ...configured.scan, revisitObjectiveOverridesMs: {} } };
+    const feasibility = evaluateSettingsFeasibility({ settings: withoutRelaxation, catalog: TEST_CATALOG, sampleRateHz: 10_000_000 });
     const capacity = scheduleCapacityCopy(feasibility);
 
     expect(feasibility.scheduleCapacity).toBe("overloaded");
@@ -97,7 +101,7 @@ describe("schedulePresentation", () => {
   });
 
   it("reports Schedule fits and a percentage below 100 for an under-committed selection", () => {
-    const configured = applyMonitoringMission(settings(), TEST_CATALOG, "multi-band-survey");
+    const configured = applyMonitoringMission(settings(), TEST_CATALOG, "gnss-survey");
     const keepSignals = new Set(target("gnss-l1-e1-b1c-sbas").relatedBandIds);
     configured.monitoring.gnss.enabledSignalIds = configured.monitoring.gnss.enabledSignalIds.filter((bandId) => keepSignals.has(bandId));
     const feasibility = evaluateSettingsFeasibility({ settings: configured, catalog: TEST_CATALOG, sampleRateHz: 10_000_000 });
@@ -106,5 +110,26 @@ describe("schedulePresentation", () => {
     expect(feasibility.scheduleCapacity).toBe("available");
     expect(capacity.headline).toBe("Schedule fits");
     expect(capacity.detail).toMatch(/Using \d{1,2}% of the receiver's time/);
+  });
+
+  it("reports Schedule fits for the gnss-fugro-survey preset's relaxed selection", () => {
+    const configured = applyMonitoringMission(settings(), TEST_CATALOG, "gnss-fugro-survey");
+    const feasibility = evaluateSettingsFeasibility({ settings: configured, catalog: TEST_CATALOG, sampleRateHz: 10_000_000 });
+    const capacity = scheduleCapacityCopy(feasibility);
+
+    expect(feasibility.scheduleCapacity).toBe("available");
+    expect(capacity.headline).toBe("Schedule fits");
+    expect(capacity.detail).toMatch(/Using \d{1,2}% of the receiver's time/);
+  });
+
+  it("reports the gnss-fugro-survey preset's relaxed cadence for each of its five windows", () => {
+    const configured = applyMonitoringMission(settings(), TEST_CATALOG, "gnss-fugro-survey");
+    const cadence = (id: string) => windowScheduleCopy(windowSchedule({ target: target(id), settings: configured, catalog: TEST_CATALOG }));
+
+    expect(cadence("gnss-l1-e1-b1c-sbas")).toBe("Checked every 2 s");
+    expect(cadence("fugro-corrections-lband")).toBe("Checked every 4 s");
+    expect(cadence("gnss-gps-l2c")).toBe("Checked every 18 s");
+    expect(cadence("gnss-l5-e5a-b2a")).toBe("Checked every 18 s");
+    expect(cadence("gnss-glonass-g1")).toBe("Checked every 18 s");
   });
 });

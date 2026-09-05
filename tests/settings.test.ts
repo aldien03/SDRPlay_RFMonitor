@@ -49,7 +49,7 @@ describe("operational monitoring settings", () => {
 
   it("applies Continuous Watch as one selected physical GNSS target", () => {
     const settings = applyMonitoringMission(defaults(), TEST_CATALOG, "continuous-watch");
-    expect(settings.schemaVersion).toBe(4);
+    expect(settings.schemaVersion).toBe(5);
     expect(settings.scan.profile).toBe("gnss-priority");
     expect(settings.monitoring.startrack.enabled).toBe(false);
     expect(settings.monitoring["4dx"].enabled).toBe(false);
@@ -64,30 +64,30 @@ describe("operational monitoring settings", () => {
     expect(validateOperationalSettings(l5, TEST_CATALOG).monitoring.gnss.enabledSignalIds.sort()).toEqual(["beidou-b2a", "galileo-e5a", "gps-l5"]);
   });
 
-  it("defaults Multi-band Survey to the Tier-1 GNSS target set", () => {
+  it("defaults GNSS to the Tier-1 GNSS target set", () => {
     const configured = defaults();
     configured.monitoring.startrack.enabled = true;
     configured.monitoring["4dx"].enabled = true;
     configured.monitoring.gnss.enabledSignalIds.push("beidou-b1i");
-    const settings = applyMonitoringMission(configured, TEST_CATALOG, "multi-band-survey");
+    const settings = applyMonitoringMission(configured, TEST_CATALOG, "gnss-survey");
     const targetIds = new Set(compileEffectiveBands(TEST_CATALOG, settings).map((band) => band.captureTargetId));
     expect(settings.scan.profile).toBe("fast-gnss");
     expect(settings.monitoring.startrack.enabled).toBe(false);
     expect(settings.monitoring["4dx"].enabled).toBe(false);
     expect(targetIds).toEqual(new Set(TEST_CATALOG.captureTargets.filter((target) => target.service === "gnss" && target.tier === "tier1").map((target) => target.id)));
-    expect(monitoringMissionForSettings(settings, TEST_CATALOG)).toBe("multi-band-survey");
+    expect(monitoringMissionForSettings(settings, TEST_CATALOG)).toBe("gnss-survey");
   });
 
-  it("lets Multi-band Survey combine selected GNSS and Fugro frequency windows", () => {
+  it("lets GNSS + Fugro combine selected GNSS and Fugro frequency windows", () => {
     const selectedIds = ["gnss-l1-e1-b1c-sbas", "gnss-l5-e5a-b2a", "fugro-corrections-lband"];
     const configured = defaults();
     configured.monitoring.fugro.selectedBeamIds = ["fugro-ersat", "fugro-easat"];
-    const settings = applyMonitoringMission(configured, TEST_CATALOG, "multi-band-survey", selectedIds);
+    const settings = applyMonitoringMission(configured, TEST_CATALOG, "gnss-fugro-survey", selectedIds);
     expect(selectedMonitoringTargetIds(settings, TEST_CATALOG)).toEqual(selectedIds);
     expect(settings.monitoring.fugro.enabled).toBe(true);
     expect(settings.monitoring.fugro.selectedBeamIds).toEqual(["fugro-ersat", "fugro-easat"]);
     expect(new Set(compileEffectiveBands(TEST_CATALOG, settings).map((band) => band.captureTargetId))).toEqual(new Set(selectedIds));
-    expect(monitoringMissionForSettings(settings, TEST_CATALOG)).toBe("multi-band-survey");
+    expect(monitoringMissionForSettings(settings, TEST_CATALOG)).toBe("gnss-fugro-survey");
   });
 
   it("keeps Radio Survey exclusive from GNSS and admits its stitched sweeps", () => {
@@ -217,15 +217,15 @@ describe("operational monitoring settings", () => {
     delete legacySettings.scan.maxPriorityGapMs;
     const settings = validateOperationalSettings(legacySettings, catalog);
     expect(settings).toMatchObject({
-      schemaVersion: 4,
-      scan: { profile: "balanced", maxPriorityGapMs: 10_000 },
+      schemaVersion: 5,
+      scan: { profile: "balanced", maxPriorityGapMs: 10_000, revisitObjectiveOverridesMs: {} },
       monitoring: { fugro: { enabled: false, selectedBeamIds: [] } },
     });
     expect(settings.monitoring.gnss.enabledSignalIds).not.toContain("sbas-l1");
   });
 
-  it("migrates v3 settings to v4 without changing the active mission or stored choices", () => {
-    const current = applyMonitoringMission(defaults(), TEST_CATALOG, "multi-band-survey");
+  it("migrates v3 settings to v5 without changing the active mission or stored choices", () => {
+    const current = applyMonitoringMission(defaults(), TEST_CATALOG, "gnss-survey");
     current.revision = 17;
     current.retention.retentionMs = 7 * 86_400_000;
     const legacy = structuredClone(current) as any;
@@ -233,16 +233,17 @@ describe("operational monitoring settings", () => {
     delete legacy.monitoring.fugro;
     delete legacy.scan.dwellMs.fugro;
     delete legacy.scan.priority.fugro;
+    delete legacy.scan.revisitObjectiveOverridesMs;
 
     const migrated = validateOperationalSettings(legacy, TEST_CATALOG);
     expect(migrated).toMatchObject({
-      schemaVersion: 4,
+      schemaVersion: 5,
       revision: 17,
-      scan: { profile: "fast-gnss", dwellMs: { fugro: 1_000 }, priority: { fugro: 10 } },
+      scan: { profile: "fast-gnss", dwellMs: { fugro: 1_000 }, priority: { fugro: 10 }, revisitObjectiveOverridesMs: {} },
       monitoring: { fugro: { enabled: false, selectedBeamIds: [] } },
       retention: { retentionMs: 7 * 86_400_000 },
     });
-    expect(monitoringMissionForSettings(migrated, TEST_CATALOG)).toBe("multi-band-survey");
+    expect(monitoringMissionForSettings(migrated, TEST_CATALOG)).toBe("gnss-survey");
   });
 
   it("catalogs the published Fugro carriers with one shared capture target", () => {
@@ -272,7 +273,7 @@ describe("operational monitoring settings", () => {
   });
 
   it("returns structured feasibility facts and recalculates an unsaved draft", () => {
-    const settings = applyMonitoringMission(defaults(), TEST_CATALOG, "multi-band-survey");
+    const settings = applyMonitoringMission(defaults(), TEST_CATALOG, "gnss-survey");
     const full = evaluateSettingsFeasibility({ settings, catalog: TEST_CATALOG, sampleRateHz: 10_000_000 });
     expect(full).toMatchObject({
       scheduleCapacity: "full",
@@ -297,7 +298,7 @@ describe("operational monitoring settings", () => {
   });
 
   it("uses measured scheduler status without turning objectives into guarantees", () => {
-    const settings = applyMonitoringMission(defaults(), TEST_CATALOG, "multi-band-survey");
+    const settings = applyMonitoringMission(defaults(), TEST_CATALOG, "gnss-survey");
     const schedulerHealth = {
       profile: "fast-gnss" as const,
       configurationEpoch: 1,
@@ -329,5 +330,99 @@ describe("operational monitoring settings", () => {
 
   it("keeps the shipped rule set id", () => {
     expect(ROBUST_DETECTION_DEFAULTS.ruleSetId).toBe("rf-relative-mad-v1");
+  });
+
+  describe("per-window revisit objective overrides", () => {
+    function expectOverrideRejected(settings: OperationalSettings) {
+      try {
+        validateOperationalSettings(settings, TEST_CATALOG);
+        throw new Error("expected the revisit-objective override to be rejected");
+      } catch (error) {
+        expect(error).toBeInstanceOf(SettingsValidationError);
+        expect((error as SettingsValidationError).fields["scan.revisitObjectiveOverridesMs"]).toBe(
+          "Revisit objectives must name a catalog window and be between its visit length and 10 minutes",
+        );
+      }
+    }
+
+    it("migrates a v4 profile to v5 and gains an empty override map, with every other field preserved", () => {
+      const v5 = applyMonitoringMission(defaults(), TEST_CATALOG, "gnss-survey");
+      v5.revision = 9;
+      const legacy = structuredClone(v5) as any;
+      legacy.schemaVersion = 4;
+      delete legacy.scan.revisitObjectiveOverridesMs;
+
+      const migrated = validateOperationalSettings(legacy, TEST_CATALOG);
+      expect(migrated).toMatchObject({
+        schemaVersion: 5,
+        revision: 9,
+        siteName: v5.siteName,
+        scan: { profile: v5.scan.profile, priorityWindowId: v5.scan.priorityWindowId, revisitObjectiveOverridesMs: {} },
+        monitoring: { gnss: { enabledSignalIds: v5.monitoring.gnss.enabledSignalIds } },
+      });
+      expect(monitoringMissionForSettings(migrated, TEST_CATALOG)).toBe("gnss-survey");
+    });
+
+    it("rejects an override naming a capture target absent from the catalog", () => {
+      const settings = defaults();
+      settings.scan.revisitObjectiveOverridesMs = { "not-a-catalog-window": 5_000 };
+      expectOverrideRejected(settings);
+    });
+
+    it("rejects an override below the target's nominalVisitMs, and accepts one equal to it", () => {
+      const settings = defaults();
+      settings.scan.revisitObjectiveOverridesMs = { "gnss-gps-l2c": 999 };
+      expectOverrideRejected(settings);
+
+      settings.scan.revisitObjectiveOverridesMs = { "gnss-gps-l2c": 1_000 };
+      expect(validateOperationalSettings(settings, TEST_CATALOG).scan.revisitObjectiveOverridesMs).toEqual({ "gnss-gps-l2c": 1_000 });
+    });
+
+    it("rejects an override above 600000 ms", () => {
+      const settings = defaults();
+      settings.scan.revisitObjectiveOverridesMs = { "gnss-gps-l2c": 600_001 };
+      expectOverrideRejected(settings);
+    });
+
+    it("applies GNSS: selects the tier-1 GNSS windows, leaves Fugro off, and clears the override map", () => {
+      const configured = defaults();
+      configured.scan.revisitObjectiveOverridesMs = { "gnss-gps-l2c": 18_000 };
+      const settings = applyMonitoringMission(configured, TEST_CATALOG, "gnss-survey");
+      const targetIds = new Set(compileEffectiveBands(TEST_CATALOG, settings).map((band) => band.captureTargetId));
+      expect(targetIds).toEqual(new Set(TEST_CATALOG.captureTargets.filter((target) => target.service === "gnss" && target.tier === "tier1").map((target) => target.id)));
+      expect(settings.monitoring.fugro.enabled).toBe(false);
+      expect(settings.scan.revisitObjectiveOverridesMs).toEqual({});
+    });
+
+    it("applies GNSS + Fugro: enables Fugro, includes its capture target, and sets exactly the four relaxed objectives", () => {
+      const settings = applyMonitoringMission(defaults(), TEST_CATALOG, "gnss-fugro-survey");
+      expect(settings.monitoring.fugro.enabled).toBe(true);
+      expect(selectedMonitoringTargetIds(settings, TEST_CATALOG)).toContain("fugro-corrections-lband");
+      expect(settings.scan.revisitObjectiveOverridesMs).toEqual({
+        "fugro-corrections-lband": 4_000,
+        "gnss-gps-l2c": 18_000,
+        "gnss-l5-e5a-b2a": 18_000,
+        "gnss-glonass-g1": 18_000,
+      });
+    });
+
+    it("fits the relaxed GNSS + Fugro selection at 0.917 utilization, which is overloaded without the overrides", () => {
+      const settings = applyMonitoringMission(defaults(), TEST_CATALOG, "gnss-fugro-survey");
+      const feasibility = evaluateSettingsFeasibility({ settings, catalog: TEST_CATALOG, sampleRateHz: 10_000_000 });
+      expect(feasibility.scheduleCapacity).toBe("available");
+      expect(Math.abs(feasibility.tier1Utilization - 0.917)).toBeLessThan(0.001);
+
+      const withoutOverrides = structuredClone(settings);
+      withoutOverrides.scan.revisitObjectiveOverridesMs = {};
+      const unrelaxed = evaluateSettingsFeasibility({ settings: withoutOverrides, catalog: TEST_CATALOG, sampleRateHz: 10_000_000 });
+      expect(unrelaxed.scheduleCapacity).toBe("overloaded");
+    });
+
+    it("round-trips all four missions through monitoringMissionForSettings", () => {
+      for (const mission of ["continuous-watch", "gnss-survey", "gnss-fugro-survey", "radio-survey"] as const) {
+        const settings = applyMonitoringMission(defaults(), TEST_CATALOG, mission);
+        expect(monitoringMissionForSettings(settings, TEST_CATALOG)).toBe(mission);
+      }
+    });
   });
 });

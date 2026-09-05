@@ -1,4 +1,4 @@
-import { captureTargetTierForProfile } from "../shared/settings";
+import { captureTargetTierForProfile, effectiveRevisitObjectiveMs } from "../shared/settings";
 import type { BandCatalog, OperationalSettings, PhysicalCaptureTarget, SettingsFeasibility } from "../shared/types";
 
 export interface WindowSchedule {
@@ -17,7 +17,9 @@ export function windowSchedule(input: {
 }): WindowSchedule {
   const { target, settings, catalog } = input;
   const enforced = captureTargetTierForProfile(target, settings, catalog) === "tier1";
-  const objectiveMs = target.revisitObjectiveMs;
+  // The task may relax this window's objective, and the row must state the
+  // cadence the scheduler will actually use, not the catalog default.
+  const objectiveMs = effectiveRevisitObjectiveMs(target, settings);
   const utilization = objectiveMs > 0 ? target.nominalVisitMs / objectiveMs : 0;
   return { targetId: target.id, enforced, objectiveMs, utilization };
 }

@@ -29,7 +29,7 @@ export interface RecoveryOperationHealth {
   maxAttempts?: number;
 }
 export type ScanProfile = "balanced" | "gnss-priority" | "fast-gnss" | "correction-watch";
-export type MonitoringMission = "continuous-watch" | "multi-band-survey" | "radio-survey" | "custom";
+export type MonitoringMission = "continuous-watch" | "gnss-survey" | "gnss-fugro-survey" | "radio-survey" | "custom";
 export type TuneState = "idle" | "commanded" | "confirming" | "settling" | "confirmed" | "timed-out";
 export type ChannelLifecycle = "clear" | "detecting" | "active" | "recovering";
 export type IncidentLifecycle = "active" | "recovering" | "cleared" | "ended-unknown";
@@ -271,7 +271,7 @@ export interface MonitoringProfile {
 }
 
 export interface OperationalSettings {
-  schemaVersion: 4;
+  schemaVersion: 5;
   revision: number;
   updatedAt: string;
   siteName: string;
@@ -284,6 +284,12 @@ export interface OperationalSettings {
     maxPriorityGapMs: number;
     dwellMs: Record<ServiceGroup, number>;
     priority: Record<ServiceGroup, number>;
+    /**
+     * Per-window revisit objectives for the selected task, keyed by capture target id.
+     * A task may relax an objective so several windows fit one receiver; the catalog
+     * value applies wherever there is no entry.
+     */
+    revisitObjectiveOverridesMs?: Record<string, number>;
   };
   detection: DetectionRuleSettings;
   retention: EvidenceRetentionPolicy;

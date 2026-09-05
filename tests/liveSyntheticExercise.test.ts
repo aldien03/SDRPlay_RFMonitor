@@ -30,11 +30,11 @@ async function config(exercises = true) {
     RF_MONITOR_SIMULATION: "on",
     RF_MONITOR_SYNTHETIC_EXERCISES: exercises ? "true" : "false",
   });
-  // These tests exercise every Tier-1 target. New installations intentionally
-  // default to one-target Continuous Watch, so opt this fixture into Multi-band.
+  // These tests exercise every Tier-1 GNSS target. New installations intentionally
+  // default to one-target Continuous Watch, so opt this fixture into GNSS.
   const value = withOperationalSettings(
     base,
-    applyMonitoringMission(base.operationalSettings, base.bandCatalog, "multi-band-survey"),
+    applyMonitoringMission(base.operationalSettings, base.bandCatalog, "gnss-survey"),
   );
   value.settingsPaths.operational = path.join(root, "operational.json");
   value.settingsPaths.audit = path.join(root, "audit.jsonl");

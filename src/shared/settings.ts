@@ -27,6 +27,12 @@ export function captureTargetTierForProfile(
   return target.relatedBandIds.some((bandId) => priorityBands.has(bandId)) ? "tier1" : "survey";
 }
 
+/** The revisit objective a schedule actually uses: a task's override when set, else the catalog value. */
+export function effectiveRevisitObjectiveMs(target: PhysicalCaptureTarget, settings: OperationalSettings): number {
+  const override = settings.scan.revisitObjectiveOverridesMs?.[target.id];
+  return override !== undefined && override > 0 ? override : target.revisitObjectiveMs;
+}
+
 /**
  * Produces the same machine-readable feasibility result for saved settings and
  * unsaved client drafts. Human-facing copy deliberately stays in the client.
@@ -50,7 +56,7 @@ export function evaluateSettingsFeasibility(input: {
   if (settings.monitoring.fugro?.enabled) for (const beamId of settings.monitoring.fugro.selectedBeamIds) enabledSignalIds.add(beamId);
   const enabledTargets = catalog.captureTargets.filter((target) => target.relatedBandIds.some((bandId) => enabledSignalIds.has(bandId)));
   const tier1Targets = enabledTargets.filter((target) => captureTargetTierForProfile(target, settings, catalog) === "tier1");
-  const tier1Utilization = tier1Targets.reduce((total, target) => total + target.nominalVisitMs / target.revisitObjectiveMs, 0);
+  const tier1Utilization = tier1Targets.reduce((total, target) => total + target.nominalVisitMs / effectiveRevisitObjectiveMs(target, settings), 0);
   const roundedUtilization = Number(tier1Utilization.toFixed(4));
   const scheduleCapacity = tier1Utilization > 1.0001 ? "overloaded" : tier1Utilization >= 0.9999 ? "full" : "available";
   const optionalTargets = catalog.captureTargets.filter((target) => captureTargetTierForProfile(target, settings, catalog) !== "tier1");
@@ -131,7 +137,11 @@ export function monitoringMissionForSettings(settings: OperationalSettings, cata
   const radiosEnabled = settings.monitoring.startrack.enabled || settings.monitoring["4dx"].enabled;
   const selectedTargets = selectedMonitoringTargetIds(settings, catalog);
   if (!radiosEnabled && selectedTargets.length === 1 && ["gnss-priority", "correction-watch"].includes(settings.scan.profile)) return "continuous-watch";
-  if (!radiosEnabled && settings.scan.profile === "fast-gnss" && selectedTargets.length >= 2) return "multi-band-survey";
+  if (!radiosEnabled && settings.scan.profile === "fast-gnss" && selectedTargets.length >= 2) {
+    return selectedTargets.some((id) => catalog.captureTargets.find((target) => target.id === id)?.service === "fugro")
+      ? "gnss-fugro-survey"
+      : "gnss-survey";
+  }
   if (settings.scan.profile === "balanced" && !settings.monitoring.gnss.enabled && !settings.monitoring.fugro?.enabled && radiosEnabled) return "radio-survey";
   return "custom";
 }
@@ -199,23 +209,44 @@ export function applyMonitoringMission(
     } else {
       setGnssSignals(next, catalog, target.relatedBandIds);
     }
+    next.scan.revisitObjectiveOverridesMs = {};
     return next;
   }
-  if (mission === "multi-band-survey") {
-    const availableTargets = catalog.captureTargets.filter((target) => ["gnss", "fugro"].includes(target.service));
+  if (mission === "gnss-survey") {
+    const availableTargets = catalog.captureTargets.filter((target) => target.service === "gnss");
     const requestedIds = Array.isArray(requestedTargetId)
       ? requestedTargetId.filter((id) => availableTargets.some((target) => target.id === id))
       : [];
-    const defaultIds = availableTargets.filter((target) => target.service === "gnss" && target.tier === "tier1").map((target) => target.id);
+    const defaultIds = availableTargets.filter((target) => target.tier === "tier1").map((target) => target.id);
     const selectedIds = requestedIds.length >= 2 ? requestedIds : defaultIds;
     if (selectedIds.length < 2) throw new SettingsValidationError({ monitoring: "Select at least two frequency windows" });
     const selectedTargets = availableTargets.filter((target) => selectedIds.includes(target.id));
     next.scan.profile = "fast-gnss";
     next.monitoring.startrack.enabled = false;
     next.monitoring["4dx"].enabled = false;
-    next.monitoring.fugro.enabled = selectedTargets.some((target) => target.service === "fugro");
-    if (next.monitoring.fugro.enabled) ensureFugroBeamSelection(next, catalog);
+    next.monitoring.fugro.enabled = false;
+    setGnssSignals(next, catalog, selectedTargets.flatMap((target) => target.relatedBandIds));
+    next.scan.revisitObjectiveOverridesMs = {};
+    return next;
+  }
+  if (mission === "gnss-fugro-survey") {
+    const availableTargets = catalog.captureTargets.filter((target) => ["gnss", "fugro"].includes(target.service));
+    const requestedIds = Array.isArray(requestedTargetId)
+      ? requestedTargetId.filter((id) => availableTargets.some((target) => target.id === id))
+      : [];
+    const defaultIds = availableTargets.filter((target) => target.tier === "tier1").map((target) => target.id);
+    const selectedIds = requestedIds.length >= 2 ? requestedIds : defaultIds;
+    if (selectedIds.length < 2) throw new SettingsValidationError({ monitoring: "Select at least two frequency windows" });
+    const selectedTargets = availableTargets.filter((target) => selectedIds.includes(target.id));
+    next.scan.profile = "fast-gnss";
+    next.monitoring.startrack.enabled = false;
+    next.monitoring["4dx"].enabled = false;
+    next.monitoring.fugro.enabled = true;
+    ensureFugroBeamSelection(next, catalog);
     setGnssSignals(next, catalog, selectedTargets.filter((target) => target.service === "gnss").flatMap((target) => target.relatedBandIds));
+    next.scan.revisitObjectiveOverridesMs = Object.fromEntries(
+      Object.entries(GNSS_FUGRO_SURVEY_OBJECTIVES_MS).filter(([id]) => catalog.captureTargets.some((target) => target.id === id)),
+    );
     return next;
   }
   next.scan.profile = "balanced";
@@ -223,8 +254,22 @@ export function applyMonitoringMission(
   next.monitoring.fugro.enabled = false;
   next.monitoring.startrack.enabled = true;
   next.monitoring["4dx"].enabled = true;
+  next.scan.revisitObjectiveOverridesMs = {};
   return next;
 }
+
+/**
+ * GNSS + Fugro asks for five windows on one receiver. L1 keeps its 2 s objective
+ * because jammers target it; the rest are relaxed until the selection fits with
+ * reserve. Ids absent from the catalog are skipped, so a custom catalog simply
+ * keeps its own objectives and the capacity line reports the result.
+ */
+const GNSS_FUGRO_SURVEY_OBJECTIVES_MS: Readonly<Record<string, number>> = {
+  "fugro-corrections-lband": 4_000,
+  "gnss-gps-l2c": 18_000,
+  "gnss-l5-e5a-b2a": 18_000,
+  "gnss-glonass-g1": 18_000,
+};
 
 export const ROBUST_DETECTION_DEFAULTS: OperationalSettings["detection"] = {
   ruleSetId: "rf-relative-mad-v1",
@@ -286,7 +331,7 @@ export function createDefaultOperationalSettings(catalog: BandCatalog, seed: Ope
   ])) as OperationalSettings["monitoring"]["gnss"]["constellations"];
   const enabledSystemIds = GNSS_CONSTELLATIONS.filter((constellation) => constellations[constellation].enabled);
   const defaults: OperationalSettings = {
-    schemaVersion: 4,
+    schemaVersion: 5,
     revision: 1,
     updatedAt: seed.updatedAt ?? new Date().toISOString(),
     siteName: seed.siteName,
@@ -304,6 +349,7 @@ export function createDefaultOperationalSettings(catalog: BandCatalog, seed: Ope
       maxPriorityGapMs: 2_000,
       dwellMs: { startrack: 8_000, "4dx": 8_000, gnss: 1_000, fugro: 1_000 },
       priority: { startrack: 1, "4dx": 1, gnss: 10, fugro: 10 },
+      revisitObjectiveOverridesMs: {},
     },
     detection: { ...seed.detection },
     retention: { ...seed.retention },
@@ -526,7 +572,7 @@ export function validateBandCatalog(input: BandCatalog): BandCatalog {
 export function validateOperationalSettings(input: OperationalSettings, catalog: BandCatalog): OperationalSettings {
   const fields: Record<string, string> = {};
   if (!input || typeof input !== "object") throw new SettingsValidationError({ settings: "Operational settings are required" });
-  const settings = structuredClone(input) as Omit<OperationalSettings, "schemaVersion"> & { schemaVersion: 1 | 2 | 3 | 4; scan: OperationalSettings["scan"] & { profile?: OperationalSettings["scan"]["profile"]; priorityWindowId?: string; maxPriorityGapMs?: number } };
+  const settings = structuredClone(input) as Omit<OperationalSettings, "schemaVersion"> & { schemaVersion: 1 | 2 | 3 | 4 | 5; scan: OperationalSettings["scan"] & { profile?: OperationalSettings["scan"]["profile"]; priorityWindowId?: string; maxPriorityGapMs?: number } };
   if (settings?.schemaVersion === 1) {
     settings.schemaVersion = 2;
     settings.scan.profile = "balanced";
@@ -548,7 +594,11 @@ export function validateOperationalSettings(input: OperationalSettings, catalog:
     settings.scan.dwellMs.fugro = 1_000;
     settings.scan.priority.fugro = 10;
   }
-  if (settings?.schemaVersion !== 4) fields.schemaVersion = "Unsupported operational-settings schema";
+  if (settings?.schemaVersion === 4) {
+    settings.schemaVersion = 5;
+    settings.scan.revisitObjectiveOverridesMs = {};
+  }
+  if (settings?.schemaVersion !== 5) fields.schemaVersion = "Unsupported operational-settings schema";
   if (!Number.isInteger(settings?.revision) || settings.revision < 1) fields.revision = "Revision must be a positive integer";
   if (typeof settings?.siteName !== "string" || !settings.siteName.trim() || settings.siteName.length > 80) fields.siteName = "Site name must contain 1 to 80 characters";
   settings.siteName = settings.siteName?.trim();
@@ -644,6 +694,20 @@ export function validateOperationalSettings(input: OperationalSettings, catalog:
       fields[`scan.priority.${service}`] = "Priority must be between 0 and 10";
     }
   }
+  const overrides = settings.scan.revisitObjectiveOverridesMs;
+  if (overrides !== undefined) {
+    if (typeof overrides !== "object" || overrides === null || Array.isArray(overrides)) {
+      fields["scan.revisitObjectiveOverridesMs"] = "Revisit objectives must name a catalog window and be between its visit length and 10 minutes";
+    } else {
+      for (const [targetId, value] of Object.entries(overrides)) {
+        const target = catalog.captureTargets.find((candidate) => candidate.id === targetId);
+        if (!target || !Number.isInteger(value) || value < target.nominalVisitMs || value > 600_000) {
+          fields["scan.revisitObjectiveOverridesMs"] = "Revisit objectives must name a catalog window and be between its visit length and 10 minutes";
+          break;
+        }
+      }
+    }
+  }
   if (settings.detection.ruleSetId !== "rf-relative-mad-v1") fields["detection.ruleSetId"] = "Unsupported detector rule set";
   for (const key of ["scaleFloorBins", "widebandObservationSigma", "interferenceSigma", "narrowbandPeakSigma", "driftSigma"] as const) {
     if (!finite(settings.detection[key]) || settings.detection[key] <= 0) fields[`detection.${key}`] = "Value must be greater than zero";
@@ -710,7 +774,7 @@ export function compileEffectiveBands(catalog: BandCatalog, settings: Operationa
         captureCenterHz: target?.centerHz,
         captureSpanHz: target?.captureSpanHz,
         analysisSpanHz: target?.analysisSpanHz,
-        revisitObjectiveMs: target?.revisitObjectiveMs,
+        revisitObjectiveMs: target ? effectiveRevisitObjectiveMs(target, settings) : undefined,
         captureTier: target?.tier,
         nominalVisitMs: target?.nominalVisitMs,
         maxVisitMs: target?.maxVisitMs,
@@ -736,7 +800,7 @@ export function compileEffectiveBands(catalog: BandCatalog, settings: Operationa
         captureCenterHz: target.centerHz,
         captureSpanHz: target.captureSpanHz,
         analysisSpanHz: target.analysisSpanHz,
-        revisitObjectiveMs: target.revisitObjectiveMs,
+        revisitObjectiveMs: effectiveRevisitObjectiveMs(target, settings),
         captureTier: target.tier,
         nominalVisitMs: target.nominalVisitMs,
         maxVisitMs: target.maxVisitMs,

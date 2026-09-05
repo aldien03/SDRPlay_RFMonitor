@@ -57,7 +57,7 @@ describe("settings signal learning presentation", () => {
   });
 
   it("shows active services for the selected mission and uses the least-complete target for progress", () => {
-    const configured = applyMonitoringMission(settings(), TEST_CATALOG, "multi-band-survey");
+    const configured = applyMonitoringMission(settings(), TEST_CATALOG, "gnss-survey");
     const baselines = [
       baseline("gnss-l1-e1-b1c-sbas", "provisional", 10),
       baseline("gnss-gps-l2c", "reviewable", 24),
@@ -159,7 +159,7 @@ describe("settings signal learning presentation", () => {
   });
 
   it("names an active frequency the same way the restart dialog does", () => {
-    const configured = applyMonitoringMission(settings(), TEST_CATALOG, "multi-band-survey", ["fugro-corrections-lband", "gnss-l1-e1-b1c-sbas"]);
+    const configured = applyMonitoringMission(settings(), TEST_CATALOG, "gnss-fugro-survey", ["fugro-corrections-lband", "gnss-l1-e1-b1c-sbas"]);
     const presentation = buildSignalLearningPresentation({
       catalog: TEST_CATALOG,
       effectiveBands: compileEffectiveBands(TEST_CATALOG, configured),

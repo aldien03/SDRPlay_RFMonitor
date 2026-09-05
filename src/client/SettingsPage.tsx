@@ -691,9 +691,9 @@ function MonitoringSettings({ response, draft, current, setDraft, errors, disabl
         </div>
       ) : null}
 
-      {mission === "multi-band-survey" ? (
+      {mission === "gnss-survey" || mission === "gnss-fugro-survey" ? (
         <div className="mission-panel">
-          <div className="mission-panel-heading"><strong>Frequency windows</strong><span>{selectedTargetIds.length} checked in turn</span></div>
+          <div className="mission-panel-heading"><strong>Frequency windows</strong><span>{mission === "gnss-fugro-survey" ? "Navigation and corrections on one receiver" : `${selectedTargetIds.length} checked in turn`}</span></div>
           <p className="correction-watch-note">One receiver checks the selected windows in turn.</p>
           {draftState && capacity ? (
             <div className={`schedule-capacity ${capacity.state === "available" ? "" : "attention"}`} role={capacity.state === "overloaded" ? "alert" : "status"}>
@@ -711,7 +711,7 @@ function MonitoringSettings({ response, draft, current, setDraft, errors, disabl
             onToggle={(targetId) => {
               const checked = selectedTargetIds.includes(targetId);
               const nextIds = checked ? selectedTargetIds.filter((id) => id !== targetId) : [...selectedTargetIds, targetId];
-              if (nextIds.length >= 2) setDraft(applyMonitoringMission(draft, response.catalog, "multi-band-survey", nextIds));
+              if (nextIds.length >= 2) setDraft(applyMonitoringMission(draft, response.catalog, mission === "gnss-fugro-survey" ? "gnss-fugro-survey" : "gnss-survey", nextIds));
             }}
           />
           {viewSettings.monitoring.fugro.enabled ? <FugroBeamPicker beams={fugroBeams} selectedIds={viewSettings.monitoring.fugro.selectedBeamIds} disabled={disabled} error={errors["monitoring.fugro.selectedBeamIds"]} onChange={(selectedBeamIds) => update((next) => { next.monitoring.fugro.selectedBeamIds = selectedBeamIds; })} /> : null}
@@ -763,7 +763,8 @@ function MonitoringSettings({ response, draft, current, setDraft, errors, disabl
 
 const MISSION_OPTIONS: Array<{ value: Exclude<MonitoringMission, "custom">; label: string; detail: string }> = [
   { value: "continuous-watch", label: "Continuous Watch", detail: "One frequency window" },
-  { value: "multi-band-survey", label: "Multi-band Survey", detail: "Choose frequency windows" },
+  { value: "gnss-survey", label: "GNSS", detail: "Priority navigation windows" },
+  { value: "gnss-fugro-survey", label: "GNSS + Fugro", detail: "Navigation windows and corrections" },
   { value: "radio-survey", label: "Radio Survey", detail: "StarTrack and 4DX" },
 ];
 

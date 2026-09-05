@@ -102,7 +102,7 @@ describe("bounded monitor runtime", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-23T12:00:00.000Z"));
     const base = await temporaryConfig("operator-observation-target");
-    const multiBand = applyMonitoringMission(base.operationalSettings, base.bandCatalog, "multi-band-survey");
+    const multiBand = applyMonitoringMission(base.operationalSettings, base.bandCatalog, "gnss-survey");
     const monitor = new MonitorService(withOperationalSettings(base, multiBand));
     await monitor.start();
     const targets = monitor.getSnapshot().monitorTargets;
@@ -280,7 +280,7 @@ describe("bounded monitor runtime", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-20T12:00:00.000Z"));
     const base = await temporaryConfig("deadline");
-    const multiBand = applyMonitoringMission(base.operationalSettings, base.bandCatalog, "multi-band-survey");
+    const multiBand = applyMonitoringMission(base.operationalSettings, base.bandCatalog, "gnss-survey");
     const monitor = new MonitorService(withOperationalSettings(base, multiBand));
     await monitor.start();
 
@@ -862,7 +862,7 @@ describe("bounded monitor runtime", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-20T12:00:00.000Z"));
     const base = await temporaryConfig("target-scoped-learning-freeze");
-    const multiBand = applyMonitoringMission(base.operationalSettings, base.bandCatalog, "multi-band-survey");
+    const multiBand = applyMonitoringMission(base.operationalSettings, base.bandCatalog, "gnss-survey");
     const monitor = new MonitorService(withOperationalSettings(base, multiBand));
     await monitor.start();
     const internal = monitor as unknown as {

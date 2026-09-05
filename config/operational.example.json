@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 4,
+  "schemaVersion": 5,
   "revision": 1,
   "updatedAt": "2026-08-20T00:00:00.000Z",
   "siteName": "RF Monitoring Site",
@@ -27,7 +27,8 @@
     "priorityWindowId": "gnss-l1-core",
     "maxPriorityGapMs": 2000,
     "dwellMs": { "startrack": 8000, "4dx": 8000, "gnss": 1000, "fugro": 1000 },
-    "priority": { "startrack": 1, "4dx": 1, "gnss": 10, "fugro": 10 }
+    "priority": { "startrack": 1, "4dx": 1, "gnss": 10, "fugro": 10 },
+    "revisitObjectiveOverridesMs": {}
   },
   "detection": {
     "ruleSetId": "rf-relative-mad-v1",
