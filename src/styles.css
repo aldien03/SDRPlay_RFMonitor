@@ -780,8 +780,10 @@ td.description-cell { max-width: 220px; white-space: normal; }
 
 .settings-page {
   min-height: 100vh;
-  display: grid;
-  grid-template-rows: auto 1fr auto;
+  /* Flex column, not a fixed row grid: the alert banner is conditional, so a
+     row template would shift every surface below it whenever it appears. */
+  display: flex;
+  flex-direction: column;
   background: #f4f6f7;
 }
 
@@ -816,6 +818,7 @@ td.description-cell { max-width: 220px; white-space: normal; }
 .admin-mode-active { display: inline-flex; align-items: center; gap: 6px; color: #16703a; font-size: 11px; font-weight: 700; white-space: nowrap; }
 
 .settings-layout {
+  flex: 1 1 auto;
   min-height: 0;
   display: grid;
   grid-template-columns: 230px minmax(0, 1fr);
@@ -1832,7 +1835,7 @@ td.description-cell { max-width: 220px; white-space: normal; }
 
 .feed-manager-backdrop,
 .focus-confirm-backdrop { position: fixed; z-index: 120; inset: 0; display: grid; place-items: center; padding: 24px; background: rgba(4, 17, 34, .55); }
-.feed-manager { width: min(700px, 94vw); max-height: min(780px, 92dvh); display: grid; grid-template-rows: 62px 42px minmax(0, 1fr) 62px; overflow: hidden; background: #f4f6f9; border: 1px solid #304968; border-radius: 6px; box-shadow: 0 20px 54px rgba(2, 13, 27, .34); }
+.feed-manager { width: min(700px, 94vw); max-height: min(780px, 92dvh); display: grid; grid-template-rows: 62px 42px auto minmax(0, 1fr) 62px; overflow: hidden; background: #f4f6f9; border: 1px solid #304968; border-radius: 6px; box-shadow: 0 20px 54px rgba(2, 13, 27, .34); }
 .feed-manager > header,
 .focus-confirm > header { display: flex; align-items: center; justify-content: space-between; padding: 0 18px; color: #fff; background: #071a33; }
 .feed-manager > header span { display: block; color: #aebed0; font-size: 9px; text-transform: uppercase; }
