@@ -1,5 +1,28 @@
 import { describe, expect, it } from "vitest";
-import { carrierViewRange, visibleBinWindow, waterfallColor, waterfallTimeMarkers } from "../src/client/SpectrumViews";
+import {
+  carrierViewRange,
+  spectrumReadoutAt,
+  spectrumReadoutCopy,
+  visibleBinWindow,
+  waterfallColor,
+  waterfallLegendFits,
+  waterfallTimeMarkers,
+} from "../src/client/SpectrumViews";
+import type { SpectrumFrame } from "../src/shared/types";
+
+function makeFrame(bins: number[], startHz: number, endHz: number): SpectrumFrame {
+  return {
+    id: "frame-1",
+    timestamp: "2026-08-23T04:00:00.000Z",
+    receiver: 0,
+    bandId: "gps-l1",
+    startHz,
+    endHz,
+    bins: new Uint8Array(bins),
+    source: "sdrconnect",
+    calibrated: false,
+  };
+}
 
 describe("carrierViewRange", () => {
   it("returns undefined when the guide list is empty", () => {
@@ -177,5 +200,91 @@ describe("waterfallTimeMarkers", () => {
     expect(at(125_000)).toBe("2m ago");
     expect(at(7_530_000)).toBe("2h ago");
     expect(at(-5_000)).toBe("now"); // a future timestamp must clamp to zero elapsed, not go negative
+  });
+});
+
+describe("waterfallLegendFits", () => {
+  it("is false below either threshold and true at exactly 180 by 48", () => {
+    expect(waterfallLegendFits(179, 48)).toBe(false);
+    expect(waterfallLegendFits(180, 47)).toBe(false);
+    expect(waterfallLegendFits(180, 48)).toBe(true);
+  });
+});
+
+describe("spectrumReadoutAt", () => {
+  it("returns undefined for no frame, and separately for a pointer left of plotLeft and right of the plot", () => {
+    expect(spectrumReadoutAt({ frame: undefined, plotLeft: 0, plotWidth: 100, pointerX: 50 })).toBeUndefined();
+    const frame = makeFrame([1, 2, 3, 4, 5], 0, 10_000_000);
+    expect(spectrumReadoutAt({ frame, plotLeft: 10, plotWidth: 100, pointerX: 9 })).toBeUndefined();
+    expect(spectrumReadoutAt({ frame, plotLeft: 10, plotWidth: 100, pointerX: 111 })).toBeUndefined();
+  });
+
+  it("a pointer at the exact left edge returns the window's first bin; at the right edge, its last", () => {
+    const frame = makeFrame([1, 2, 3, 4, 5], 0, 10_000_000);
+    const left = spectrumReadoutAt({ frame, plotLeft: 0, plotWidth: 100, pointerX: 0 });
+    const right = spectrumReadoutAt({ frame, plotLeft: 0, plotWidth: 100, pointerX: 100 });
+    expect(left?.binIndex).toBe(0);
+    expect(right?.binIndex).toBe(4);
+  });
+
+  it("a pointer at the middle of an uncropped frame returns a frequency within one bin width of the frame's centre", () => {
+    const bins = Array.from({ length: 100 }, (_, index) => index);
+    const startHz = 0;
+    const endHz = 100_000_000;
+    const frame = makeFrame(bins, startHz, endHz);
+    const readout = spectrumReadoutAt({ frame, plotLeft: 0, plotWidth: 1000, pointerX: 500 });
+    const centre = (startHz + endHz) / 2;
+    const binWidth = (endHz - startHz) / (bins.length - 1);
+    expect(readout).toBeDefined();
+    expect(Math.abs(readout!.frequencyHz - centre)).toBeLessThanOrEqual(binWidth);
+  });
+
+  it("level equals frame.bins[binIndex] for a fixture with distinct bin values", () => {
+    const bins = [10, 40, 90, 150, 210, 250];
+    const frame = makeFrame(bins, 0, 6_000_000);
+    const readout = spectrumReadoutAt({ frame, plotLeft: 0, plotWidth: 60, pointerX: 33 });
+    expect(readout).toBeDefined();
+    expect(readout!.level).toBe(frame.bins[readout!.binIndex]);
+  });
+
+  // 2048 bins over 2,047,000 Hz so 1 bin == 1000 Hz exactly, and the crop below lands on bin
+  // edges — the same alignment visibleBinWindow's own fixtures above use.
+  const alignedBinCount = 2048;
+  const alignedStartHz = 0;
+  const alignedEndHz = 2_047_000;
+  const alignedView = { startHz: 900_000, endHz: 1_100_000 }; // the middle tenth of the frame
+  const alignedBins = Array.from({ length: alignedBinCount }, (_, index) => index % 256);
+
+  it("with a view cropping to the middle tenth, binIndex lies inside the cropped window and the frequency lies inside the cropped range", () => {
+    const frame = makeFrame(alignedBins, alignedStartHz, alignedEndHz);
+    // Pointer at 90% across the plot, deliberately off-centre: reading it against the frame's
+    // full, uncropped bin range (i.e. forgetting to apply visibleBinWindow) lands close to the
+    // full frame's own 90% mark — far outside this narrow crop — so that bug fails the assertions below.
+    const readout = spectrumReadoutAt({ frame, view: alignedView, plotLeft: 0, plotWidth: 1000, pointerX: 900 });
+    const window = visibleBinWindow({ binCount: alignedBinCount, startHz: alignedStartHz, endHz: alignedEndHz, view: alignedView });
+    expect(readout).toBeDefined();
+    expect(readout!.binIndex).toBeGreaterThanOrEqual(window.startBin);
+    expect(readout!.binIndex).toBeLessThanOrEqual(window.endBin - 1);
+    expect(readout!.frequencyHz).toBeGreaterThanOrEqual(alignedView.startHz);
+    expect(readout!.frequencyHz).toBeLessThanOrEqual(alignedView.endHz);
+  });
+
+  it("frequencyHz is derived from the frame's full bin grid, not a position within the crop", () => {
+    const frame = makeFrame(alignedBins, alignedStartHz, alignedEndHz);
+    const plotLeft = 0;
+    const plotWidth = 1000;
+    const pointerX = 333; // an awkward ratio, so bin rounding pulls the true bin frequency away from a naive crop-position interpolation
+    const readout = spectrumReadoutAt({ frame, view: alignedView, plotLeft, plotWidth, pointerX });
+    expect(readout).toBeDefined();
+    const trueFrequency = alignedStartHz + (readout!.binIndex / (alignedBins.length - 1)) * (alignedEndHz - alignedStartHz);
+    expect(readout!.frequencyHz).toBe(trueFrequency);
+    const naiveCropPosition = alignedView.startHz + ((pointerX - plotLeft) / plotWidth) * (alignedView.endHz - alignedView.startHz);
+    expect(readout!.frequencyHz).not.toBe(naiveCropPosition);
+  });
+});
+
+describe("spectrumReadoutCopy", () => {
+  it("formats three decimals and the raw level, for example 1575.420 MHz · 128/255", () => {
+    expect(spectrumReadoutCopy({ binIndex: 0, frequencyHz: 1_575_420_000, level: 128 })).toBe("1575.420 MHz · 128/255");
   });
 });

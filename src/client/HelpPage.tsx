@@ -98,7 +98,7 @@ export function HelpPage({ snapshot, onClose, onOpenHealth, onOpenRecording, onO
           </ul>
           <p>Restart learning after an approved RF setup change or a confirmed contaminated learning period.</p>
           <ol>
-            <li>Open Settings, then Advanced, then Signal learning.</li>
+            <li>Open Settings, then Signal learning.</li>
             <li>Select Unlock to edit and enter the settings password.</li>
             <li>Select Restart learning on one frequency, or Restart signal learning for every active frequency.</li>
           </ol>

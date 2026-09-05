@@ -4,7 +4,7 @@ import { Header } from "./client/Header";
 import { EvidenceArchive, OptionsPanel, type DisplayOptions } from "./client/BottomPanels";
 import { IncidentPanel } from "./client/MonitorPanels";
 import { NoteModal } from "./client/Modals";
-import { SettingsPage, type SettingsSection, type SettingsTab } from "./client/SettingsPage";
+import { SettingsPage, type SettingsTab } from "./client/SettingsPage";
 import { EngineerWorkspace } from "./client/EngineerWorkspace";
 import { SystemHealth, SystemHealthIndicator } from "./client/SystemHealth";
 import { useDiagnostics } from "./client/useDiagnostics";
@@ -20,7 +20,7 @@ import {
 } from "./client/signalWallPreferences";
 import { formatRange } from "./client/format";
 import { surfacedVisibleFeedIds } from "./client/feedVisibility";
-import { currentOperatorEvent, isRealOperatorAlert, operatorAffectedTargetIds, operatorAnnouncement, operatorObservationForSurface } from "./client/operatorViewModel";
+import { affectedTargetsCopy, currentOperatorEvent, isRealOperatorAlert, operatorAffectedTargetIds, operatorAnnouncement, operatorObservationForSurface } from "./client/operatorViewModel";
 import { useMonitor } from "./client/useMonitor";
 import { DialogShell } from "./client/DialogShell";
 import { HelpPage } from "./client/HelpPage";
@@ -112,7 +112,6 @@ export function App() {
   const [focusFeed, setFocusFeed] = useState<MonitorFeed>();
   const [noteOpen, setNoteOpen] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>();
-  const [settingsSection, setSettingsSection] = useState<SettingsSection>();
   const [helpOpen, setHelpOpen] = useState(() => location.pathname === "/help");
   const [toast, setToast] = useState<string>();
   const [selectedEventId, setSelectedEventId] = useState<string>();
@@ -240,12 +239,11 @@ export function App() {
     setOptions((current) => current.engineer ? { ...current, engineer: false } : current);
   };
 
-  const openSettings = (tab: SettingsTab = "monitoring", section?: SettingsSection) => {
+  const openSettings = (tab: SettingsTab = "monitoring") => {
     if (location.pathname === "/help") history.replaceState(null, "", `/${retainedQaSearch()}`);
     setHelpOpen(false);
     setDetailsView(undefined);
     setOptions((current) => current.engineer ? { ...current, engineer: false } : current);
-    setSettingsSection(section);
     setSettingsTab(tab);
   };
 
@@ -334,7 +332,7 @@ export function App() {
         openSettings("recording");
         return;
       case "open-signal-learning":
-        openSettings("advanced", "signal-learning");
+        openSettings("learning");
         return;
       case "review-qualification":
         openSettings("health");
@@ -363,9 +361,8 @@ export function App() {
       <>
         <SettingsPage
           initialTab={settingsTab}
-          initialSection={settingsSection}
           snapshot={snapshot}
-          onClose={() => { setSettingsTab(undefined); setSettingsSection(undefined); }}
+          onClose={() => setSettingsTab(undefined)}
           onToast={showTemporaryToast}
           getSettings={monitor.getSettings}
           unlockSettings={monitor.unlockSettings}
@@ -395,7 +392,7 @@ export function App() {
   }
 
   const activeIncidentCount = operatorIncident ? 1 : 0;
-  const affectedLabel = snapshot.operatorSummary.affectedTargets.map((target) => target.label).join(", ");
+  const affectedLabel = affectedTargetsCopy(snapshot.operatorSummary);
   const operatorObservation = operatorIncident?.observation ?? operator.observation;
   const operatorAction = operatorIncident?.recommendedAction ?? operator.action;
   const observationClock = operatorObservationForSurface(snapshot.operatorSummary, "footer");

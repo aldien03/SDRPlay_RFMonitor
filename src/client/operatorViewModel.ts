@@ -92,9 +92,15 @@ export function mergeCanonicalOperatorSummary(
 /** Whether the summary's single observation belongs to this feed. */
 export function operatorObservationMatchesTargets(summary: OperatorSummaryV1, targetIds: readonly string[]): boolean {
   if (summary.observation.targetId) return targetIds.includes(summary.observation.targetId);
-  // One-release compatibility for a legacy summary that named exactly one
-  // affected target but omitted the new attribution field.
-  return summary.affectedTargets.length === 1 && targetIds.includes(summary.affectedTargets[0].id);
+  return summary.affectedTargets.some((target) => targetIds.includes(target.id));
+}
+
+/** Names every affected target so the footer never reads several signals as one long-named one. */
+export function affectedTargetsCopy(summary: OperatorSummaryV1): string {
+  const labels = summary.affectedTargets.map((target) => target.label);
+  if (labels.length === 0) return "";
+  if (labels.length === 1) return labels[0];
+  return `${labels.length} signals affected: ${labels.join(", ")}`;
 }
 
 export function isRealOperatorAlert(summary: OperatorSummaryV1): boolean {

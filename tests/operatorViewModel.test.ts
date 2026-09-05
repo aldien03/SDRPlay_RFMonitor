@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  affectedTargetsCopy,
   currentOperatorEvent,
   isRealOperatorAlert,
   mergeCanonicalOperatorSummary,
@@ -156,5 +157,39 @@ describe("operator dashboard view model", () => {
     }
 
     expect(lastAtMs).toBe(baseMs + 100_000 * 1_000);
+  });
+});
+
+describe("B9 — several affected signals", () => {
+  const twoTargets = [
+    { id: "gnss-l1", label: "GNSS L1" },
+    { id: "gnss-l5", label: "GNSS L5" },
+  ];
+
+  it("still prefers the attributed target over any affected target", () => {
+    const attributed = summary({ affectedTargets: twoTargets, observation: { at: generatedAt, coverage: "observed", targetId: "gnss-l1" } });
+    expect(operatorObservationMatchesTargets(attributed, ["gnss-l5"])).toBe(false);
+  });
+
+  it("regression: matches either affected target when no target is attributed", () => {
+    const untargeted = summary({ affectedTargets: twoTargets, observation: { at: generatedAt, coverage: "observed", targetId: undefined } });
+    expect(operatorObservationMatchesTargets(untargeted, ["gnss-l1"])).toBe(true);
+    expect(operatorObservationMatchesTargets(untargeted, ["gnss-l5"])).toBe(true);
+  });
+
+  it("matches nothing with no attributed target and no affected targets", () => {
+    const empty = summary({ affectedTargets: [], observation: { at: generatedAt, coverage: "observed", targetId: undefined } });
+    expect(operatorObservationMatchesTargets(empty, ["gnss-l1"])).toBe(false);
+  });
+
+  it("affectedTargetsCopy names one target plainly and counts three", () => {
+    const one = summary({ affectedTargets: [{ id: "gnss-l1", label: "GNSS L1" }] });
+    const three = summary({ affectedTargets: [...twoTargets, { id: "fugro-1", label: "Fugro Beam 1" }] });
+    expect(affectedTargetsCopy(one)).toBe("GNSS L1");
+    expect(affectedTargetsCopy(three)).toBe("3 signals affected: GNSS L1, GNSS L5, Fugro Beam 1");
+  });
+
+  it("affectedTargetsCopy returns an empty string when nothing is affected", () => {
+    expect(affectedTargetsCopy(summary({ affectedTargets: [] }))).toBe("");
   });
 });

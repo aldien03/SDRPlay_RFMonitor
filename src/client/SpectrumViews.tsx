@@ -51,6 +51,32 @@ export function visibleBinWindow(input: {
   };
 }
 
+export interface SpectrumReadout { binIndex: number; frequencyHz: number; level: number }
+
+/** Value under the pointer, read off the frame's own bin grid so a cropped Fugro view still reports the true frequency. */
+export function spectrumReadoutAt(input: {
+  frame: SpectrumFrame | undefined;
+  view?: ViewRange;
+  plotLeft: number;
+  plotWidth: number;
+  pointerX: number;
+}): SpectrumReadout | undefined {
+  const { frame, view, plotLeft, plotWidth, pointerX } = input;
+  if (!frame || frame.bins.length < 2 || plotWidth <= 0) return undefined;
+  if (pointerX < plotLeft || pointerX > plotLeft + plotWidth) return undefined;
+  const window = visibleBinWindow({ binCount: frame.bins.length, startHz: frame.startHz, endHz: frame.endHz, view });
+  const clamp = (value: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, value));
+  const ratio = (pointerX - plotLeft) / plotWidth;
+  const binIndex = clamp(window.startBin + Math.round(ratio * (window.endBin - window.startBin - 1)), window.startBin, window.endBin - 1);
+  // Frequency from the frame's own full start/end/bin-count, never the cropped window's.
+  const frequencyHz = frame.startHz + (binIndex / Math.max(1, frame.bins.length - 1)) * (frame.endHz - frame.startHz);
+  return { binIndex, frequencyHz, level: frame.bins[binIndex] };
+}
+
+export function spectrumReadoutCopy(readout: SpectrumReadout): string {
+  return `${(readout.frequencyHz / 1_000_000).toFixed(3)} MHz · ${readout.level}/255`;
+}
+
 interface SpectrumViewProps {
   frame?: SpectrumFrame;
   metrics?: SignalMetricSample;
@@ -101,6 +127,8 @@ export const SpectrumView = memo(function SpectrumView({
   view,
 }: SpectrumViewProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  // Ref, not state: pointer moves at 4 spectrum updates/sec across up to nine cards must not re-render this memoised component.
+  const pointerXRef = useRef<number | undefined>(undefined);
   const frameDetectorAnalysis = detectorAnalysisForFrame(frame);
   const draw = () => {
     const canvas = canvasRef.current;
@@ -293,14 +321,45 @@ export const SpectrumView = memo(function SpectrumView({
         context.setLineDash([]);
       }
     }
+    const pointerX = pointerXRef.current;
+    if (pointerX !== undefined) {
+      const readout = spectrumReadoutAt({ frame, view, plotLeft, plotWidth, pointerX });
+      if (readout) {
+        context.strokeStyle = "rgba(38, 51, 63, 0.55)";
+        context.lineWidth = 1;
+        context.beginPath();
+        context.moveTo(pointerX + 0.5, plotTop);
+        context.lineTo(pointerX + 0.5, plotBottom);
+        context.stroke();
+        const copy = spectrumReadoutCopy(readout);
+        context.font = "700 8px Arial, sans-serif";
+        const padding = 3;
+        const labelWidth = context.measureText(copy).width + padding * 2;
+        const overflowsRight = pointerX + 4 + labelWidth > plotRight;
+        const labelX = overflowsRight ? pointerX - 4 - labelWidth : pointerX + 4;
+        const labelY = plotTop + 1;
+        context.fillStyle = "rgba(255, 255, 255, 0.92)";
+        context.fillRect(labelX, labelY, labelWidth, 11);
+        context.fillStyle = "#26333f";
+        context.textAlign = "left";
+        context.fillText(copy, labelX + padding, labelY + 9);
+      }
+    }
     canvas.dataset.renderReady = "true";
   };
   useRedraw(canvasRef, draw);
 
+  const clearPointer = () => { pointerXRef.current = undefined; draw(); };
   return (
     <canvas
       ref={canvasRef}
       className="spectrum-canvas"
+      onPointerMove={(event) => {
+        pointerXRef.current = event.clientX - event.currentTarget.getBoundingClientRect().left;
+        draw();
+      }}
+      onPointerLeave={clearPointer}
+      onPointerCancel={clearPointer}
       aria-label={frame ? `${frame.syntheticExercise ? "Synthetic exercise " : ""}spectrum for ${frame.bandId}; relative scale 0 to 255; peak ${metrics?.peakLevel ?? 0}; higher values mean stronger received activity; shaded outer bins are guard roll-off and are not analyzed${frameDetectorAnalysis?.overload ? "; receiver overloaded; no RF anomaly bins attributed" : frameDetectorAnalysis?.anomalyBinRanges.length ? `; detector marked ${frameDetectorAnalysis.anomalyBinRanges.length} anomaly ${frameDetectorAnalysis.anomalyBinRanges.length === 1 ? "range" : "ranges"}` : "; no detector anomaly ranges"}${view ? "; view zoomed to the correction carriers" : ""}${frequencyGuides.length ? `; ${frequencyGuides.length} expected correction carrier guides` : ""}` : "Spectrum waiting for data"}
     />
   );
@@ -330,6 +389,11 @@ export function waterfallColor(value: number): string {
   const t = (level - lower.level) / span;
   const mix = (from: number, to: number) => Math.round(from + (to - from) * t);
   return `rgb(${mix(lower.rgb[0], upper.rgb[0])}, ${mix(lower.rgb[1], upper.rgb[1])}, ${mix(lower.rgb[2], upper.rgb[2])})`;
+}
+
+/** A legend is only drawn where it will not crowd the rows it explains. */
+export function waterfallLegendFits(width: number, height: number): boolean {
+  return width >= 180 && height >= 48;
 }
 
 export interface WaterfallTimeMarker { index: number; label: string }
@@ -457,6 +521,31 @@ export const WaterfallView = memo(function WaterfallView({ frames, frequencyGuid
       }
       context.textAlign = "left";
     }
+    if (waterfallLegendFits(width, height)) {
+      const rampWidth = 64;
+      const rampHeight = 6;
+      const rampY = height - 8 - rampHeight;
+      context.font = "700 8px Arial, sans-serif";
+      const quietWidth = context.measureText("Quiet").width;
+      const strongWidth = context.measureText("Strong").width;
+      // Lay the group out from the left edge so the first label cannot fall
+      // outside the canvas; measuring back from the ramp used to clip "Quiet".
+      const groupLeft = 8;
+      const quietX = groupLeft + 4;
+      const rampX = quietX + quietWidth + 4;
+      const strongX = rampX + rampWidth + 4;
+      const groupRight = strongX + strongWidth + 4;
+      context.fillStyle = "rgba(2, 10, 26, 0.72)";
+      context.fillRect(groupLeft, rampY - 5, groupRight - groupLeft, rampHeight + 10);
+      for (let step = 0; step < 32; step += 1) {
+        context.fillStyle = waterfallColor((step / 31) * 255);
+        context.fillRect(rampX + (step / 32) * rampWidth, rampY, rampWidth / 32 + 0.5, rampHeight);
+      }
+      context.fillStyle = "#eef4ff";
+      context.textAlign = "left";
+      context.fillText("Quiet", quietX, rampY + rampHeight - 1);
+      context.fillText("Strong", strongX, rampY + rampHeight - 1);
+    }
     context.strokeStyle = "rgba(255, 255, 255, 0.22)";
     context.lineWidth = 1;
     for (let column = 0; column <= 6; column += 1) {
@@ -478,5 +567,5 @@ export const WaterfallView = memo(function WaterfallView({ frames, frequencyGuid
     : timeMarkers.length === 1
       ? `; covering ${timeMarkers[0].label}`
       : `; covering ${timeMarkers[1].label} to ${timeMarkers[0].label}`;
-  return <canvas ref={canvasRef} className="waterfall-canvas" aria-label={`${frames.some((frame) => frame.syntheticExercise) ? "Synthetic exercise " : ""}waterfall with ${frames.length} recent spectrum frames; newest row on top; ${anomalyRows} detector-marked anomaly ${anomalyRows === 1 ? "row" : "rows"}${coverageClause}; shaded outer columns are guard roll-off and are not analyzed${view ? "; view zoomed to the correction carriers" : ""}${frequencyGuides.length ? `; ${frequencyGuides.length} expected correction carrier guides` : ""}`} />;
+  return <canvas ref={canvasRef} className="waterfall-canvas" aria-label={`${frames.some((frame) => frame.syntheticExercise) ? "Synthetic exercise " : ""}waterfall with ${frames.length} recent spectrum frames; newest row on top; ${anomalyRows} detector-marked anomaly ${anomalyRows === 1 ? "row" : "rows"}${coverageClause}; colour scale runs quiet to strong; shaded outer columns are guard roll-off and are not analyzed${view ? "; view zoomed to the correction carriers" : ""}${frequencyGuides.length ? `; ${frequencyGuides.length} expected correction carrier guides` : ""}`} />;
 });

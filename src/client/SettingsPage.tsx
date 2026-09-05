@@ -40,14 +40,12 @@ import {
 import { DialogShell } from "./DialogShell";
 import { SurfaceAlertBanner } from "./SurfaceAlertBanner";
 
-export type SettingsTab = "monitoring" | "health" | "recording" | "site" | "advanced";
-export type SettingsSection = "signal-learning";
+export type SettingsTab = "monitoring" | "health" | "recording" | "site" | "advanced" | "learning";
 
 type ServiceDisplayState = "Monitoring" | "Paused" | "Will monitor" | "Off";
 
 interface SettingsPageProps {
   initialTab?: SettingsTab;
-  initialSection?: SettingsSection;
   snapshot: MonitorSnapshot;
   onClose: () => void;
   onToast: (message: string) => void;
@@ -105,6 +103,7 @@ const TAB_ITEMS: Array<{ id: SettingsTab; label: string; icon: React.ReactNode }
   { id: "monitoring", label: "Monitoring", icon: <RadioTower size={18} aria-hidden="true" /> },
   { id: "health", label: "System health", icon: <Activity size={18} aria-hidden="true" /> },
   { id: "recording", label: "Recording", icon: <Database size={18} aria-hidden="true" /> },
+  { id: "learning", label: "Signal learning", icon: <RotateCcw size={18} aria-hidden="true" /> },
   { id: "site", label: "Site", icon: <Clock3 size={18} aria-hidden="true" /> },
   { id: "advanced", label: "Advanced", icon: <SlidersHorizontal size={18} aria-hidden="true" /> },
 ];
@@ -486,8 +485,9 @@ export function SettingsPage(props: SettingsPageProps) {
                 {tab === "monitoring" ? <MonitoringSettings response={response} draft={draft} current={response.settings} setDraft={setDraft} errors={fieldErrors} disabled={!unlocked} /> : null}
                 {tab === "health" ? (props.renderSystemHealth?.({ openTab: setTab }) ?? <SystemHealthPlaceholder />) : null}
                 {tab === "recording" ? <EvidenceSettings draft={draft} setDraft={setDraft} response={response} errors={fieldErrors} disabled={!unlocked} dataDomain={props.snapshot.dataDomain} onMaintenance={openMaintenance} /> : null}
+                {tab === "learning" ? <SignalLearningSettings response={response} unlocked={unlocked} onMaintenance={openMaintenance} onBaselineAction={async (action, baseline) => { if (action === "restart") setPendingBaselineRestart(baseline); else await updateBaseline(action, baseline); }} onOpenTab={setTab} /> : null}
                 {tab === "site" ? <SiteSettings draft={draft} setDraft={setDraft} response={response} errors={fieldErrors} disabled={!unlocked} /> : null}
-                {tab === "advanced" ? <AdvancedSettings response={response} draft={draft} setDraft={setDraft} errors={fieldErrors} unlocked={unlocked} onMaintenance={openMaintenance} onBaselineAction={async (action, baseline) => { if (action === "restart") setPendingBaselineRestart(baseline); else await updateBaseline(action, baseline); }} onOpenTab={setTab} initialSection={props.initialSection} /> : null}
+                {tab === "advanced" ? <AdvancedSettings response={response} draft={draft} setDraft={setDraft} errors={fieldErrors} unlocked={unlocked} onMaintenance={openMaintenance} /> : null}
               </div>
             </>
           )}
@@ -940,42 +940,20 @@ function EvidenceSettings({ draft, setDraft, response, errors, disabled, dataDom
   );
 }
 
-function AdvancedSettings({ response, draft, setDraft, errors, unlocked, onBaselineAction, onMaintenance, onOpenTab, initialSection }: {
+function AdvancedSettings({ response, draft, setDraft, errors, unlocked, onMaintenance }: {
   response: SettingsRevision;
   draft: OperationalSettings;
   setDraft: (value: OperationalSettings) => void;
   errors: Record<string, string>;
   unlocked: boolean;
-  onBaselineAction: (action: "approve" | "restart", baseline: BaselineDescriptor) => Promise<void>;
   onMaintenance: (action: MaintenanceAction) => void;
-  onOpenTab: (tab: SettingsTab) => void;
-  initialSection?: SettingsSection;
 }) {
   const updateDetection = (key: keyof OperationalSettings["detection"], value: number) => setDraft({ ...draft, detection: { ...draft.detection, [key]: value } });
   const updateScan = (kind: "dwellMs" | "priority", service: "startrack" | "4dx" | "gnss" | "fugro", value: number) => setDraft({ ...draft, scan: { ...draft.scan, [kind]: { ...draft.scan[kind], [service]: value } } });
-  const learning = useMemo(() => buildSignalLearningPresentation({
-    catalog: response.catalog,
-    effectiveBands: response.effectiveBands,
-    sampleRateHz: response.infrastructure.sampleRateHz,
-    baselines: response.baselineStates,
-  }), [response.baselineStates, response.catalog, response.effectiveBands, response.infrastructure.sampleRateHz]);
-  const approvalByBaseline = useMemo(() => new Map(
-    (response.baselineApprovals ?? []).map((approval) => [baselineApprovalKey(approval), approval]),
-  ), [response.baselineApprovals]);
-  const restartableCount = learning.activeTargets.filter((target) => target.baseline).length;
-  const blockedApproval = useMemo(() => learning.activeTargets.flatMap((target) => {
-    if (target.baseline?.lifecycle !== "reviewable") return [];
-    const approval = approvalByBaseline.get(baselineApprovalKey(target.baseline));
-    return approval && !approval.eligible ? [approval] : [];
-  })[0], [approvalByBaseline, learning.activeTargets]);
   const detectionIsDefault = useMemo(
     () => JSON.stringify(draft.detection) === JSON.stringify(ROBUST_DETECTION_DEFAULTS),
     [draft.detection],
   );
-  useEffect(() => {
-    if (initialSection !== "signal-learning") return;
-    document.getElementById("signal-learning")?.scrollIntoView({ block: "start" });
-  }, [initialSection]);
   return (
     <section className="settings-section" aria-labelledby="advanced-settings-title">
       <h1 id="advanced-settings-title">Advanced</h1>
@@ -1018,67 +996,6 @@ function AdvancedSettings({ response, draft, setDraft, errors, unlocked, onBasel
           </div>
         </details>
 
-        <details className="advanced-settings-group" id="signal-learning" open={initialSection === "signal-learning"}>
-          <summary><span><strong>Signal learning</strong></span><ChevronDown size={18} aria-hidden="true" /></summary>
-          <div className="advanced-settings-body">
-            <div className="baseline-requirement"><span>Minimum learning</span><strong>{SIGNAL_LEARNING_REQUIRED_HOURS} hours</strong></div>
-            <div className="baseline-list">
-              {learning.activeServices.length ? learning.activeServices.map((service) => (
-                <div className="baseline-row" key={service.id}>
-                  <span><strong>{service.label}</strong><small>{countLabel(service.targets.length, "frequency check")} · {signalLearningProgressLabel(service.representativeHours)}</small></span>
-                  <span className={`evidence-pill ${signalLearningPillClass(service.state)}`}>{signalLearningStateLabel(service.state)}</span>
-                </div>
-              )) : <div className="selection-summary">No active services.</div>}
-            </div>
-            {blockedApproval ? <div className="baseline-approval-status" id="baseline-approval-status" role="status"><strong>{blockedApproval.label}</strong>{approvalDetail(blockedApproval) ? <span>{approvalDetail(blockedApproval)}</span> : null}{blockedApproval.action && blockedApproval.action !== "Wait." ? <span>{blockedApproval.action}</span> : null}</div> : null}
-
-            <h3 className="settings-subheading">Active frequencies</h3>
-            <div className="baseline-list">
-              {learning.activeTargets.length ? learning.activeTargets.map((target) => {
-                const approval = target.baseline ? approvalByBaseline.get(baselineApprovalKey(target.baseline)) : undefined;
-                return (
-                  <div className="baseline-row" key={target.targetId}>
-                    <span><strong>{target.label}</strong><small>{target.signalsLabel ? `${target.signalsLabel} · ` : ""}{signalLearningProgressLabel(target.representativeHours)}</small></span>
-                    <span className={`evidence-pill ${signalLearningPillClass(target.state)}`}>{signalLearningStateLabel(target.state)}</span>
-                    {unlocked && target.baseline?.lifecycle === "reviewable" ? <button className="button secondary compact" type="button" disabled={!approval?.eligible} aria-describedby={!approval?.eligible && blockedApproval ? "baseline-approval-status" : undefined} onClick={() => void onBaselineAction("approve", target.baseline!)}>Approve</button> : null}
-                    {/* The control stays visible with its blocking reason so a
-                        missing baseline never looks like a missing feature. */}
-                    {unlocked ? <button className="button secondary compact" type="button" disabled={!target.baseline} title={target.baseline ? undefined : "No learned data to restart yet."} onClick={() => { if (target.baseline) void onBaselineAction("restart", target.baseline); }}>Restart learning</button> : null}
-                  </div>
-                );
-              }) : <div className="selection-summary">No active frequencies.</div>}
-            </div>
-
-            <div className="protected-action-row">
-              <span><strong>Restart signal learning</strong><small>Starts a new learning period for every active frequency with learned data. Recordings, incidents and saved learning records are kept.</small></span>
-              <button className="button danger compact" type="button" disabled={!unlocked || !restartableCount} title={restartableCount ? undefined : "No learned data to restart yet."} onClick={() => onMaintenance("restart-learning")}>Restart learning</button>
-            </div>
-            {!unlocked ? <p className="protected-action-hint">Unlock to use this action.</p> : null}
-
-            {learning.saved.length ? (
-              <details className="advanced-settings-group">
-                <summary><span><strong>Saved learning</strong><small>{countLabel(learning.saved.length, "saved record")}</small></span><ChevronDown size={18} aria-hidden="true" /></summary>
-                <div className="advanced-settings-body">
-                  <p className="protected-action-hint">Saved records are kept for reference. Learning can only be restarted for frequencies that are being monitored now.</p>
-                  <div className="baseline-list">
-                    {learning.saved.map((saved) => (
-                      <div className="baseline-row" key={saved.key}>
-                        <span>
-                          <strong>{saved.label}</strong>
-                          <small>{saved.observationCount} observations · {signalLearningProgressLabel(saved.representativeHours)}</small>
-                          {saved.targetActive ? null : <small>Not monitored now. Turn this frequency on in Monitoring to restart its learning.</small>}
-                        </span>
-                        <span className={`evidence-pill ${signalLearningPillClass(saved.state)}`}>{signalLearningStateLabel(saved.state)}</span>
-                        {saved.targetActive ? null : <button className="button secondary compact" type="button" onClick={() => onOpenTab("monitoring")}>Open Monitoring</button>}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </details>
-            ) : null}
-          </div>
-        </details>
-
         <details className="advanced-settings-group">
           <summary><span><strong>Receiver</strong></span><ChevronDown size={18} aria-hidden="true" /></summary>
           <div className="advanced-settings-body">
@@ -1098,6 +1015,90 @@ function AdvancedSettings({ response, draft, setDraft, errors, unlocked, onBasel
           </div>
         </details>
       </div>
+    </section>
+  );
+}
+
+function SignalLearningSettings({ response, unlocked, onBaselineAction, onMaintenance, onOpenTab }: {
+  response: SettingsRevision;
+  unlocked: boolean;
+  onBaselineAction: (action: "approve" | "restart", baseline: BaselineDescriptor) => Promise<void>;
+  onMaintenance: (action: MaintenanceAction) => void;
+  onOpenTab: (tab: SettingsTab) => void;
+}) {
+  const learning = useMemo(() => buildSignalLearningPresentation({
+    catalog: response.catalog,
+    effectiveBands: response.effectiveBands,
+    sampleRateHz: response.infrastructure.sampleRateHz,
+    baselines: response.baselineStates,
+  }), [response.baselineStates, response.catalog, response.effectiveBands, response.infrastructure.sampleRateHz]);
+  const approvalByBaseline = useMemo(() => new Map(
+    (response.baselineApprovals ?? []).map((approval) => [baselineApprovalKey(approval), approval]),
+  ), [response.baselineApprovals]);
+  const restartableCount = learning.activeTargets.filter((target) => target.baseline).length;
+  const blockedApproval = useMemo(() => learning.activeTargets.flatMap((target) => {
+    if (target.baseline?.lifecycle !== "reviewable") return [];
+    const approval = approvalByBaseline.get(baselineApprovalKey(target.baseline));
+    return approval && !approval.eligible ? [approval] : [];
+  })[0], [approvalByBaseline, learning.activeTargets]);
+  return (
+    <section className="settings-section" aria-labelledby="signal-learning-title">
+      <h1 id="signal-learning-title">Signal learning</h1>
+      <div className="baseline-requirement"><span>Minimum learning</span><strong>{SIGNAL_LEARNING_REQUIRED_HOURS} hours</strong></div>
+      <div className="baseline-list">
+        {learning.activeServices.length ? learning.activeServices.map((service) => (
+          <div className="baseline-row" key={service.id}>
+            <span><strong>{service.label}</strong><small>{countLabel(service.targets.length, "frequency check")} · {signalLearningProgressLabel(service.representativeHours)}</small></span>
+            <span className={`evidence-pill ${signalLearningPillClass(service.state)}`}>{signalLearningStateLabel(service.state)}</span>
+          </div>
+        )) : <div className="selection-summary">No active services.</div>}
+      </div>
+      {blockedApproval ? <div className="baseline-approval-status" id="baseline-approval-status" role="status"><strong>{blockedApproval.label}</strong>{approvalDetail(blockedApproval) ? <span>{approvalDetail(blockedApproval)}</span> : null}{blockedApproval.action && blockedApproval.action !== "Wait." ? <span>{blockedApproval.action}</span> : null}</div> : null}
+
+      <h3 className="settings-subheading">Active frequencies</h3>
+      <div className="baseline-list">
+        {learning.activeTargets.length ? learning.activeTargets.map((target) => {
+          const approval = target.baseline ? approvalByBaseline.get(baselineApprovalKey(target.baseline)) : undefined;
+          return (
+            <div className="baseline-row" key={target.targetId}>
+              <span><strong>{target.label}</strong><small>{target.signalsLabel ? `${target.signalsLabel} · ` : ""}{signalLearningProgressLabel(target.representativeHours)}</small></span>
+              <span className={`evidence-pill ${signalLearningPillClass(target.state)}`}>{signalLearningStateLabel(target.state)}</span>
+              {unlocked && target.baseline?.lifecycle === "reviewable" ? <button className="button secondary compact" type="button" disabled={!approval?.eligible} aria-describedby={!approval?.eligible && blockedApproval ? "baseline-approval-status" : undefined} onClick={() => void onBaselineAction("approve", target.baseline!)}>Approve</button> : null}
+              {/* The control stays visible with its blocking reason so a
+                  missing baseline never looks like a missing feature. */}
+              {unlocked ? <button className="button secondary compact" type="button" disabled={!target.baseline} title={target.baseline ? undefined : "No learned data to restart yet."} onClick={() => { if (target.baseline) void onBaselineAction("restart", target.baseline); }}>Restart learning</button> : null}
+            </div>
+          );
+        }) : <div className="selection-summary">No active frequencies.</div>}
+      </div>
+
+      <div className="protected-action-row">
+        <span><strong>Restart signal learning</strong><small>Starts a new learning period for every active frequency with learned data. Recordings, incidents and saved learning records are kept.</small></span>
+        <button className="button danger compact" type="button" disabled={!unlocked || !restartableCount} title={restartableCount ? undefined : "No learned data to restart yet."} onClick={() => onMaintenance("restart-learning")}>Restart learning</button>
+      </div>
+      {!unlocked ? <p className="protected-action-hint">Unlock to use this action.</p> : null}
+
+      {learning.saved.length ? (
+        <details className="advanced-settings-group">
+          <summary><span><strong>Saved learning</strong><small>{countLabel(learning.saved.length, "saved record")}</small></span><ChevronDown size={18} aria-hidden="true" /></summary>
+          <div className="advanced-settings-body">
+            <p className="protected-action-hint">Saved records are kept for reference. Learning can only be restarted for frequencies that are being monitored now.</p>
+            <div className="baseline-list">
+              {learning.saved.map((saved) => (
+                <div className="baseline-row" key={saved.key}>
+                  <span>
+                    <strong>{saved.label}</strong>
+                    <small>{saved.observationCount} observations · {signalLearningProgressLabel(saved.representativeHours)}</small>
+                    {saved.targetActive ? null : <small>Not monitored now. Turn this frequency on in Monitoring to restart its learning.</small>}
+                  </span>
+                  <span className={`evidence-pill ${signalLearningPillClass(saved.state)}`}>{signalLearningStateLabel(saved.state)}</span>
+                  {saved.targetActive ? null : <button className="button secondary compact" type="button" onClick={() => onOpenTab("monitoring")}>Open Monitoring</button>}
+                </div>
+              ))}
+            </div>
+          </div>
+        </details>
+      ) : null}
     </section>
   );
 }
