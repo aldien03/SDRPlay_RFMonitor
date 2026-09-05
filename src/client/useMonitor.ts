@@ -784,6 +784,43 @@ async function queueExportDownload(body: object, fallbackFilename: string): Prom
   }
 }
 
+/**
+ * Identity for one live-connection lifecycle. React may tear down and re-run an
+ * effect before its bootstrap request settles, and a callback from a superseded
+ * run must not open a second socket or write shared connection state.
+ */
+export class LiveConnectionGenerations {
+  private currentGeneration = 0;
+
+  /** Starts a new lifecycle and returns its generation. */
+  begin(): number {
+    this.currentGeneration += 1;
+    return this.currentGeneration;
+  }
+
+  /** True only for the lifecycle that is currently allowed to own the socket. */
+  isCurrent(generation: number): boolean {
+    return generation === this.currentGeneration;
+  }
+
+  /** Invalidates the current lifecycle without starting a new one. */
+  supersede(): void {
+    this.currentGeneration += 1;
+  }
+}
+
+/**
+ * Detach every handler before closing. A socket that is closing must not be able
+ * to advance the control cursor, feed a watchdog, or schedule a reconnect.
+ */
+function detachLiveSocket(socket: WebSocket): void {
+  socket.onopen = null;
+  socket.onmessage = null;
+  socket.onerror = null;
+  socket.onclose = null;
+  if (socket.readyState !== WebSocket.CLOSED) socket.close(1000, "Live connection replaced");
+}
+
 export function useMonitor() {
   const [snapshot, setSnapshot] = useState<MonitorSnapshot>(emptySnapshot);
   const [targetFrames, setTargetFrames] = useState<Record<string, TargetFrameState>>({});
@@ -807,6 +844,7 @@ export function useMonitor() {
   const visibleFeedIds = useRef<string[]>([]);
   const detailFeedIds = useRef<string[]>([]);
   const lastSubscriptionSignature = useRef<string | undefined>(undefined);
+  const generations = useRef(new LiveConnectionGenerations());
   useEffect(() => { targetFramesRef.current = targetFrames; }, [targetFrames]);
 
   const sendSubscription = useCallback(() => {
@@ -829,9 +867,9 @@ export function useMonitor() {
     socket.send(JSON.stringify(subscription));
   }, []);
 
-  const connect = useCallback(() => {
+  const connect = useCallback((generation: number) => {
     try {
-      if (stopped.current || reloadRequiredRef.current) return;
+      if (!generations.current.isCurrent(generation) || stopped.current || reloadRequiredRef.current) return;
       freshnessWatchdog.current?.stop();
       const watchdog = new CanonicalStateFreshnessWatchdog(
         () => {
@@ -845,6 +883,9 @@ export function useMonitor() {
         },
       );
       freshnessWatchdog.current = watchdog;
+      const previous = socketRef.current;
+      socketRef.current = undefined;
+      if (previous) detachLiveSocket(previous);
       const protocol = location.protocol === "https:" ? "wss:" : "ws:";
       const socket = new WebSocket(`${protocol}//${location.host}/live`);
       socket.binaryType = "arraybuffer";
@@ -983,6 +1024,7 @@ export function useMonitor() {
         if (message.type === "error") setError(message.payload.message);
       };
       socket.onerror = () => {
+        if (!generations.current.isCurrent(generation)) return;
         setSnapshot((current) => snapshotWithClientDataLate(current));
         setError("Live data is late. Reconnecting.");
       };
@@ -991,22 +1033,27 @@ export function useMonitor() {
         if (freshnessWatchdog.current === watchdog) freshnessWatchdog.current = undefined;
         lastSubscriptionSignature.current = undefined;
         if (stopped.current || reloadRequiredRef.current) return;
+        if (!generations.current.isCurrent(generation)) return;
         setSnapshot((current) => snapshotWithClientDataLate(current));
         setError("Live data is late. Reconnecting.");
         const delay = Math.min(15_000, 1_000 * (2 ** Math.min(4, reconnectAttempt.current++))) + Math.round(Math.random() * 500);
-        reconnectTimer.current = window.setTimeout(() => void connect(), delay);
+        reconnectTimer.current = window.setTimeout(() => void connect(generation), delay);
       };
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
-      setSnapshot((current) => snapshotWithClientDataLate(current));
-      if (!stopped.current) reconnectTimer.current = window.setTimeout(() => void connect(), 2_000);
+      if (generations.current.isCurrent(generation)) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+        setSnapshot((current) => snapshotWithClientDataLate(current));
+      }
+      if (!stopped.current) reconnectTimer.current = window.setTimeout(() => void connect(generation), 2_000);
     }
   }, [sendSubscription]);
 
   useEffect(() => {
+    const generation = generations.current.begin();
     stopped.current = false;
     void request<MonitorSnapshot>("/api/snapshot")
       .then((next) => {
+        if (!generations.current.isCurrent(generation)) return;
         const payloadIssue = canonicalControlPayloadIssue(next, embeddedClientBuildId());
         if (payloadIssue) {
           reloadRequiredRef.current = true;
@@ -1018,11 +1065,17 @@ export function useMonitor() {
         setError(undefined);
         setSnapshot(next);
       })
-      .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)))
-      .finally(() => { if (!reloadRequiredRef.current) connect(); });
+      .catch((reason) => {
+        if (!generations.current.isCurrent(generation)) return;
+        setError(reason instanceof Error ? reason.message : String(reason));
+      })
+      .finally(() => { if (!reloadRequiredRef.current) connect(generation); });
     return () => {
+      generations.current.supersede();
       stopped.current = true;
-      socketRef.current?.close();
+      const socket = socketRef.current;
+      socketRef.current = undefined;
+      if (socket) detachLiveSocket(socket);
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       if (hiddenReleaseTimer.current) clearTimeout(hiddenReleaseTimer.current);
       freshnessWatchdog.current?.stop();

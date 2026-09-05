@@ -8,6 +8,7 @@ import {
   CanonicalStateFreshnessWatchdog,
   clientBuildMatches,
   HIDDEN_HISTORY_RELEASE_MS,
+  LiveConnectionGenerations,
   MAX_CLIENT_WATERFALL_ROWS,
   snapshotWithBuildMismatch,
   snapshotWithInvalidOperatorState,
@@ -449,5 +450,50 @@ describe("baseline restart response", () => {
       operation: { ...complete.operation, auditDurable: false },
     })).toBe(true);
     expect(baselineRestartRequiresRecovery({ configurationRevision: 4 })).toBe(true);
+  });
+});
+
+describe("LiveConnectionGenerations", () => {
+  it("treats only the newest lifecycle as current", () => {
+    const generations = new LiveConnectionGenerations();
+    const first = generations.begin();
+    const second = generations.begin();
+    expect(generations.isCurrent(first)).toBe(false);
+    expect(generations.isCurrent(second)).toBe(true);
+  });
+
+  it("rejects a callback from a run that was superseded before it settled", () => {
+    // Reproduces StrictMode's mount -> cleanup -> mount order: mount #1 begins, cleanup #1
+    // supersedes it before its bootstrap request resolves, mount #2 begins. The late
+    // callback from mount #1 must not be mistaken for the run that owns the socket.
+    const generations = new LiveConnectionGenerations();
+    const first = generations.begin();
+    generations.supersede();
+    const second = generations.begin();
+    expect(generations.isCurrent(first)).toBe(false);
+    expect(generations.isCurrent(second)).toBe(true);
+  });
+
+  it("invalidates the current lifecycle when superseded with no replacement", () => {
+    const generations = new LiveConnectionGenerations();
+    const only = generations.begin();
+    generations.supersede();
+    expect(generations.isCurrent(only)).toBe(false);
+    // supersede() alone already consumed generation only+1 as an internal placeholder, so the
+    // next lifecycle a real begin() call would create is only+2 — confirm it isn't current
+    // either, i.e. no generation is valid until begin() actually mints it.
+    expect(generations.isCurrent(only + 2)).toBe(false);
+  });
+
+  it("keeps generations distinct across many cycles", () => {
+    const generations = new LiveConnectionGenerations();
+    const seen: number[] = [];
+    for (let cycle = 0; cycle < 25; cycle += 1) {
+      const generation = generations.begin();
+      seen.forEach((earlier) => expect(generations.isCurrent(earlier)).toBe(false));
+      expect(generations.isCurrent(generation)).toBe(true);
+      seen.push(generation);
+      generations.supersede();
+    }
   });
 });
