@@ -1,0 +1,121 @@
+import { describe, expect, it } from "vitest";
+import { carrierViewRange, visibleBinWindow } from "../src/client/SpectrumViews";
+
+describe("carrierViewRange", () => {
+  it("returns undefined when the guide list is empty", () => {
+    expect(carrierViewRange({ guides: [], startHz: 0, endHz: 10_000_000 })).toBeUndefined();
+  });
+
+  it("returns undefined when every guide lies outside the frame", () => {
+    expect(carrierViewRange({
+      guides: [{ frequencyHz: 20_000_000 }, { frequencyHz: -5_000_000 }],
+      startHz: 0,
+      endHz: 10_000_000,
+    })).toBeUndefined();
+  });
+
+  it("returns undefined when the crop would cover 80% or more of the frame span", () => {
+    // Guides near opposite edges force a span that, once clamped, spans the whole frame.
+    expect(carrierViewRange({
+      guides: [{ frequencyHz: 50_000 }, { frequencyHz: 950_000 }],
+      startHz: 0,
+      endHz: 1_000_000,
+    })).toBeUndefined();
+  });
+
+  it("contains all six real Fugro carriers in a range narrower than 2 MHz", () => {
+    const guides = [
+      { frequencyHz: 1_545_245_000 },
+      { frequencyHz: 1_545_815_000 },
+      { frequencyHz: 1_545_875_000 },
+      { frequencyHz: 1_545_950_000 },
+      { frequencyHz: 1_546_230_000 },
+      { frequencyHz: 1_546_240_000 },
+    ];
+    const result = carrierViewRange({ guides, startHz: 1_540_742_500, endHz: 1_550_742_500 });
+    expect(result).toBeDefined();
+    for (const guide of guides) {
+      expect(guide.frequencyHz).toBeGreaterThanOrEqual(result!.startHz);
+      expect(guide.frequencyHz).toBeLessThanOrEqual(result!.endHz);
+    }
+    expect(result!.endHz - result!.startHz).toBeLessThan(2_000_000);
+  });
+
+  it("applies MIN_CARRIER_SPAN_HZ so a single carrier still produces a real span", () => {
+    const result = carrierViewRange({
+      guides: [{ frequencyHz: 1_545_000_000 }],
+      startHz: 1_540_000_000,
+      endHz: 1_550_000_000,
+    });
+    expect(result).toBeDefined();
+    expect(result!.endHz - result!.startHz).toBeGreaterThanOrEqual(200_000);
+  });
+
+  it("clamps to the frame edges so a cluster near the start does not undershoot startHz", () => {
+    const result = carrierViewRange({
+      guides: [{ frequencyHz: 50_000 }, { frequencyHz: 60_000 }],
+      startHz: 0,
+      endHz: 10_000_000,
+    });
+    expect(result).toBeDefined();
+    expect(result!.startHz).toBe(0);
+  });
+});
+
+describe("visibleBinWindow", () => {
+  it("with no view, returns the full window and the frame's own frequencies unchanged", () => {
+    const result = visibleBinWindow({ binCount: 2048, startHz: 1_540_742_500, endHz: 1_550_742_500 });
+    expect(result).toEqual({ startBin: 0, endBin: 2048, startHz: 1_540_742_500, endHz: 1_550_742_500 });
+  });
+
+  // Frame span chosen so 1 bin == 1000 Hz exactly (2048 bins over 2,047,000 Hz), so the
+  // view edges below land precisely on bin boundaries and the round-trip is exact.
+  const alignedBinCount = 2048;
+  const alignedStartHz = 0;
+  const alignedEndHz = 2_047_000;
+  const alignedView = { startHz: 900_000, endHz: 1_100_000 }; // ~ a tenth of the frame, centred
+
+  it("crops to roughly a tenth of the bins for a view covering the middle tenth of the frame", () => {
+    const result = visibleBinWindow({ binCount: alignedBinCount, startHz: alignedStartHz, endHz: alignedEndHz, view: alignedView });
+    const width = result.endBin - result.startBin;
+    expect(width).toBeGreaterThan(150);
+    expect(width).toBeLessThan(250);
+  });
+
+  it("returns startHz/endHz that fully cover the requested view, even between bin edges", () => {
+    // Deliberately off a bin boundary. Rounding out must widen the window, never
+    // clip it, or a carrier sitting at the edge of the view would be cropped away.
+    const view = { startHz: 900_450, endHz: 1_100_550 };
+    const result = visibleBinWindow({ binCount: alignedBinCount, startHz: alignedStartHz, endHz: alignedEndHz, view });
+    expect(result.startHz).toBeLessThanOrEqual(view.startHz);
+    expect(result.endHz).toBeGreaterThanOrEqual(view.endHz);
+    expect(result.startHz).toBeLessThan(result.endHz);
+    expect(result.startBin).toBeLessThan(result.endBin);
+  });
+
+  it("returns startHz/endHz exactly on the view when it lands on bin edges", () => {
+    const result = visibleBinWindow({ binCount: alignedBinCount, startHz: alignedStartHz, endHz: alignedEndHz, view: alignedView });
+    expect(result.startHz).toBe(alignedView.startHz);
+    expect(result.endHz).toBe(alignedView.endHz);
+  });
+
+  it("returns the full window for degenerate inputs: binCount of 1", () => {
+    const result = visibleBinWindow({
+      binCount: 1,
+      startHz: 0,
+      endHz: 10_000_000,
+      view: { startHz: 1_000_000, endHz: 2_000_000 },
+    });
+    expect(result).toEqual({ startBin: 0, endBin: 1, startHz: 0, endHz: 10_000_000 });
+  });
+
+  it("returns the full window for degenerate inputs: endHz <= startHz", () => {
+    const result = visibleBinWindow({
+      binCount: 2048,
+      startHz: 10_000_000,
+      endHz: 10_000_000,
+      view: { startHz: 1_000_000, endHz: 2_000_000 },
+    });
+    expect(result).toEqual({ startBin: 0, endBin: 2048, startHz: 10_000_000, endHz: 10_000_000 });
+  });
+});

@@ -2,12 +2,62 @@ import { memo, useEffect, useRef } from "react";
 import type { SignalMetricSample, SpectrumFrame } from "../shared/types";
 import { detectorAnalysisForFrame, detectorAnomalyRanges, detectorBaselineAvailable } from "./detectorPresentation";
 
+export interface ViewRange { startHz: number; endHz: number }
+
+const MIN_CARRIER_SPAN_HZ = 200_000;
+const CARRIER_MARGIN_RATIO = 0.18;
+const MAX_USEFUL_COVERAGE = 0.8;
+
+/** The display window that brings a cluster of carrier guides up to full width. */
+export function carrierViewRange(input: {
+  guides: ReadonlyArray<{ frequencyHz: number }>;
+  startHz: number;
+  endHz: number;
+}): ViewRange | undefined {
+  const { guides, startHz, endHz } = input;
+  if (endHz <= startHz) return undefined;
+  const inRange = guides.filter((guide) => guide.frequencyHz >= startHz && guide.frequencyHz <= endHz);
+  if (!inRange.length) return undefined;
+  const lo = Math.min(...inRange.map((guide) => guide.frequencyHz));
+  const hi = Math.max(...inRange.map((guide) => guide.frequencyHz));
+  const centre = (lo + hi) / 2;
+  const span = Math.max(hi - lo, MIN_CARRIER_SPAN_HZ) * (1 + 2 * CARRIER_MARGIN_RATIO);
+  const rangeStartHz = Math.max(startHz, Math.min(endHz, centre - span / 2));
+  const rangeEndHz = Math.max(startHz, Math.min(endHz, centre + span / 2));
+  // A crop that changes almost nothing must not be applied.
+  if ((rangeEndHz - rangeStartHz) / (endHz - startHz) >= MAX_USEFUL_COVERAGE) return undefined;
+  return { startHz: rangeStartHz, endHz: rangeEndHz };
+}
+
+/** Bin window to draw, and the exact frequencies its edges fall on. */
+export function visibleBinWindow(input: {
+  binCount: number;
+  startHz: number;
+  endHz: number;
+  view?: ViewRange;
+}): { startBin: number; endBin: number; startHz: number; endHz: number } {
+  const { binCount, startHz, endHz, view } = input;
+  // Every non-Fugro feed passes no view; this must be exactly today's full-width behaviour.
+  if (!view || binCount < 2 || endHz <= startHz) return { startBin: 0, endBin: binCount, startHz, endHz };
+  const binFor = (hz: number) => ((hz - startHz) / (endHz - startHz)) * (binCount - 1);
+  const clamp = (value: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, value));
+  const startBin = clamp(Math.floor(binFor(view.startHz)), 0, binCount - 2);
+  const endBin = clamp(Math.ceil(binFor(view.endHz)) + 1, startBin + 2, binCount);
+  return {
+    startBin,
+    endBin,
+    startHz: startHz + (startBin / (binCount - 1)) * (endHz - startHz),
+    endHz: startHz + ((endBin - 1) / (binCount - 1)) * (endHz - startHz),
+  };
+}
+
 interface SpectrumViewProps {
   frame?: SpectrumFrame;
   metrics?: SignalMetricSample;
   showBaseline: boolean;
   showMarkers: boolean;
   frequencyGuides?: ReadonlyArray<{ frequencyHz: number; label: string }>;
+  view?: ViewRange;
 }
 
 function guideX(frequencyHz: number, startHz: number, endHz: number, width: number): number {
@@ -48,6 +98,7 @@ export const SpectrumView = memo(function SpectrumView({
   showBaseline,
   showMarkers,
   frequencyGuides = [],
+  view,
 }: SpectrumViewProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const frameDetectorAnalysis = detectorAnalysisForFrame(frame);
@@ -92,25 +143,31 @@ export const SpectrumView = memo(function SpectrumView({
     }
 
     const bins = frame.bins;
-    const xFor = (index: number) => plotLeft + (index / Math.max(1, bins.length - 1)) * plotWidth;
+    const window = visibleBinWindow({ binCount: bins.length, startHz: frame.startHz, endHz: frame.endHz, view });
+    const xFor = (index: number) => plotLeft + ((index - window.startBin) / Math.max(1, window.endBin - window.startBin - 1)) * plotWidth;
     const yFor = (value: number) => plotBottom - (Math.max(0, Math.min(255, value)) / 255) * plotHeight;
-    const analysisStartRatio = Math.max(0, Math.min(1, (frame.analysisStartBin ?? 0) / Math.max(1, bins.length)));
-    const analysisEndRatio = Math.max(analysisStartRatio, Math.min(1, (frame.analysisEndBin ?? bins.length) / Math.max(1, bins.length)));
+    const analysisStartRatio = Math.max(0, Math.min(1, ((frame.analysisStartBin ?? 0) - window.startBin) / Math.max(1, window.endBin - window.startBin)));
+    const analysisEndRatio = Math.max(analysisStartRatio, Math.min(1, ((frame.analysisEndBin ?? bins.length) - window.startBin) / Math.max(1, window.endBin - window.startBin)));
     const anomalyRanges = detectorAnomalyRanges(frame);
+    // Clips a detector range to the visible window; undefined when it falls entirely outside it.
+    const clipToWindow = (range: { startBin: number; endBin: number }) =>
+      range.endBin <= window.startBin || range.startBin >= window.endBin
+        ? undefined
+        : { startBin: Math.max(range.startBin, window.startBin), endBin: Math.min(range.endBin, window.endBin) };
 
     context.beginPath();
     context.moveTo(plotLeft, plotBottom);
-    for (let index = 0; index < bins.length; index += 1) context.lineTo(xFor(index), yFor(bins[index]));
+    for (let index = window.startBin; index < window.endBin; index += 1) context.lineTo(xFor(index), yFor(bins[index]));
     context.lineTo(plotRight, plotBottom);
     context.closePath();
     context.fillStyle = "rgba(0, 105, 205, 0.13)";
     context.fill();
 
     context.beginPath();
-    for (let index = 0; index < bins.length; index += 1) {
+    for (let index = window.startBin; index < window.endBin; index += 1) {
       const x = xFor(index);
       const y = yFor(bins[index]);
-      if (index === 0) context.moveTo(x, y);
+      if (index === window.startBin) context.moveTo(x, y);
       else context.lineTo(x, y);
     }
     context.strokeStyle = "#0867c9";
@@ -140,7 +197,7 @@ export const SpectrumView = memo(function SpectrumView({
       context.textAlign = "left";
     }
 
-    const visibleGuides = frequencyGuides.filter((guide) => guide.frequencyHz >= frame.startHz && guide.frequencyHz <= frame.endHz);
+    const visibleGuides = frequencyGuides.filter((guide) => guide.frequencyHz >= window.startHz && guide.frequencyHz <= window.endHz);
     if (visibleGuides.length) {
       context.strokeStyle = "rgba(206, 121, 0, 0.78)";
       context.fillStyle = "#865300";
@@ -149,7 +206,7 @@ export const SpectrumView = memo(function SpectrumView({
       context.textAlign = "center";
       const laneRight = [-Infinity, -Infinity, -Infinity];
       for (const guide of [...visibleGuides].sort((left, right) => left.frequencyHz - right.frequencyHz)) {
-        const x = guideX(guide.frequencyHz, frame.startHz, frame.endHz, plotWidth);
+        const x = guideX(guide.frequencyHz, window.startHz, window.endHz, plotWidth);
         context.setLineDash([2, 3]);
         context.beginPath();
         context.moveTo(x + 0.5, plotTop);
@@ -184,16 +241,18 @@ export const SpectrumView = memo(function SpectrumView({
     }
 
     for (const range of anomalyRanges) {
+      const clipped = clipToWindow(range);
+      if (!clipped) continue;
       context.beginPath();
-      for (let index = range.startBin; index < range.endBin; index += 1) {
+      for (let index = clipped.startBin; index < clipped.endBin; index += 1) {
         const x = xFor(index);
         const y = yFor(bins[index]);
-        if (index === range.startBin) context.moveTo(x, y);
+        if (index === clipped.startBin) context.moveTo(x, y);
         else context.lineTo(x, y);
       }
-      if (range.endBin - range.startBin === 1) {
-        const x = xFor(range.startBin);
-        const y = yFor(bins[range.startBin]);
+      if (clipped.endBin - clipped.startBin === 1) {
+        const x = xFor(clipped.startBin);
+        const y = yFor(bins[clipped.startBin]);
         context.moveTo(Math.max(plotLeft, x - 2), y);
         context.lineTo(Math.min(plotRight, x + 2), y);
       }
@@ -215,21 +274,24 @@ export const SpectrumView = memo(function SpectrumView({
     }
 
     if (showMarkers && anomalyRanges.length) {
-      let peakIndex = anomalyRanges[0].startBin;
-      for (const range of anomalyRanges) {
-        for (let index = range.startBin; index < range.endBin; index += 1) {
-          if (bins[index] > bins[peakIndex]) peakIndex = index;
+      const clippedRanges = anomalyRanges.map(clipToWindow).filter((range): range is { startBin: number; endBin: number } => Boolean(range));
+      if (clippedRanges.length) {
+        let peakIndex = clippedRanges[0].startBin;
+        for (const range of clippedRanges) {
+          for (let index = range.startBin; index < range.endBin; index += 1) {
+            if (bins[index] > bins[peakIndex]) peakIndex = index;
+          }
         }
+        const x = xFor(peakIndex);
+        context.beginPath();
+        context.moveTo(x, plotTop);
+        context.lineTo(x, plotBottom);
+        context.strokeStyle = "#e31616";
+        context.lineWidth = 1.4;
+        context.setLineDash([4, 3]);
+        context.stroke();
+        context.setLineDash([]);
       }
-      const x = xFor(peakIndex);
-      context.beginPath();
-      context.moveTo(x, plotTop);
-      context.lineTo(x, plotBottom);
-      context.strokeStyle = "#e31616";
-      context.lineWidth = 1.4;
-      context.setLineDash([4, 3]);
-      context.stroke();
-      context.setLineDash([]);
     }
     canvas.dataset.renderReady = "true";
   };
@@ -239,7 +301,7 @@ export const SpectrumView = memo(function SpectrumView({
     <canvas
       ref={canvasRef}
       className="spectrum-canvas"
-      aria-label={frame ? `${frame.syntheticExercise ? "Synthetic exercise " : ""}spectrum for ${frame.bandId}; relative scale 0 to 255; peak ${metrics?.peakLevel ?? 0}; higher values mean stronger received activity; shaded outer bins are guard roll-off and are not analyzed${frameDetectorAnalysis?.overload ? "; receiver overloaded; no RF anomaly bins attributed" : frameDetectorAnalysis?.anomalyBinRanges.length ? `; detector marked ${frameDetectorAnalysis.anomalyBinRanges.length} anomaly ${frameDetectorAnalysis.anomalyBinRanges.length === 1 ? "range" : "ranges"}` : "; no detector anomaly ranges"}${frequencyGuides.length ? `; ${frequencyGuides.length} expected correction carrier guides` : ""}` : "Spectrum waiting for data"}
+      aria-label={frame ? `${frame.syntheticExercise ? "Synthetic exercise " : ""}spectrum for ${frame.bandId}; relative scale 0 to 255; peak ${metrics?.peakLevel ?? 0}; higher values mean stronger received activity; shaded outer bins are guard roll-off and are not analyzed${frameDetectorAnalysis?.overload ? "; receiver overloaded; no RF anomaly bins attributed" : frameDetectorAnalysis?.anomalyBinRanges.length ? `; detector marked ${frameDetectorAnalysis.anomalyBinRanges.length} anomaly ${frameDetectorAnalysis.anomalyBinRanges.length === 1 ? "range" : "ranges"}` : "; no detector anomaly ranges"}${view ? "; view zoomed to the correction carriers" : ""}${frequencyGuides.length ? `; ${frequencyGuides.length} expected correction carrier guides` : ""}` : "Spectrum waiting for data"}
     />
   );
 });
@@ -252,7 +314,7 @@ function waterfallColor(value: number): string {
   return `rgb(${Math.round(230 + level * 25)}, ${Math.round(210 - level * 190)}, 0)`;
 }
 
-export const WaterfallView = memo(function WaterfallView({ frames, frequencyGuides = [] }: { frames: SpectrumFrame[]; frequencyGuides?: ReadonlyArray<{ frequencyHz: number; label: string }> }) {
+export const WaterfallView = memo(function WaterfallView({ frames, frequencyGuides = [], view }: { frames: SpectrumFrame[]; frequencyGuides?: ReadonlyArray<{ frequencyHz: number; label: string }>; view?: ViewRange }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const draw = () => {
     const canvas = canvasRef.current;
@@ -273,24 +335,30 @@ export const WaterfallView = memo(function WaterfallView({ frames, frequencyGuid
     const rowHeight = Math.max(1, height / Math.max(24, newestFirst.length));
     newestFirst.forEach((frame, row) => {
       const bins = frame.bins;
-      const visibleBins = Math.min(Math.ceil(width), bins.length);
+      // History frames can carry a different tune than the current one, so each gets its own window.
+      const frameWindow = visibleBinWindow({ binCount: bins.length, startHz: frame.startHz, endHz: frame.endHz, view });
+      const visibleBins = Math.min(Math.ceil(width), frameWindow.endBin - frameWindow.startBin);
       for (let column = 0; column < visibleBins; column += 1) {
-        const sourceIndex = Math.min(bins.length - 1, Math.floor((column / visibleBins) * bins.length));
+        const sourceIndex = frameWindow.startBin + Math.min(frameWindow.endBin - frameWindow.startBin - 1, Math.floor((column / visibleBins) * (frameWindow.endBin - frameWindow.startBin)));
         const x = (column / visibleBins) * width;
         context.fillStyle = waterfallColor(bins[sourceIndex]);
         context.fillRect(x, row * rowHeight, width / visibleBins + 1, rowHeight + 0.5);
       }
       context.fillStyle = "rgba(227, 22, 22, 0.32)";
       for (const range of detectorAnomalyRanges(frame)) {
-        const startX = (range.startBin / Math.max(1, bins.length)) * width;
-        const endX = (range.endBin / Math.max(1, bins.length)) * width;
+        if (range.endBin <= frameWindow.startBin || range.startBin >= frameWindow.endBin) continue;
+        const clippedStart = Math.max(range.startBin, frameWindow.startBin);
+        const clippedEnd = Math.min(range.endBin, frameWindow.endBin);
+        const startX = ((clippedStart - frameWindow.startBin) / Math.max(1, frameWindow.endBin - frameWindow.startBin)) * width;
+        const endX = ((clippedEnd - frameWindow.startBin) / Math.max(1, frameWindow.endBin - frameWindow.startBin)) * width;
         context.fillRect(startX, row * rowHeight, Math.max(1, endX - startX), rowHeight + 0.5);
       }
     });
     const guideFrame = newestFirst[0];
     if (guideFrame?.bins.length) {
-      const analysisStartRatio = Math.max(0, Math.min(1, (guideFrame.analysisStartBin ?? 0) / guideFrame.bins.length));
-      const analysisEndRatio = Math.max(analysisStartRatio, Math.min(1, (guideFrame.analysisEndBin ?? guideFrame.bins.length) / guideFrame.bins.length));
+      const guideWindow = visibleBinWindow({ binCount: guideFrame.bins.length, startHz: guideFrame.startHz, endHz: guideFrame.endHz, view });
+      const analysisStartRatio = Math.max(0, Math.min(1, ((guideFrame.analysisStartBin ?? 0) - guideWindow.startBin) / Math.max(1, guideWindow.endBin - guideWindow.startBin)));
+      const analysisEndRatio = Math.max(analysisStartRatio, Math.min(1, ((guideFrame.analysisEndBin ?? guideFrame.bins.length) - guideWindow.startBin) / Math.max(1, guideWindow.endBin - guideWindow.startBin)));
       if (analysisStartRatio > 0 || analysisEndRatio < 1) {
         const analysisStartX = width * analysisStartRatio;
         const analysisEndX = width * analysisEndRatio;
@@ -311,8 +379,8 @@ export const WaterfallView = memo(function WaterfallView({ frames, frequencyGuid
       context.lineWidth = 1;
       context.setLineDash([2, 3]);
       for (const guide of frequencyGuides) {
-        if (guide.frequencyHz < guideFrame.startHz || guide.frequencyHz > guideFrame.endHz) continue;
-        const x = guideX(guide.frequencyHz, guideFrame.startHz, guideFrame.endHz, width);
+        if (guide.frequencyHz < guideWindow.startHz || guide.frequencyHz > guideWindow.endHz) continue;
+        const x = guideX(guide.frequencyHz, guideWindow.startHz, guideWindow.endHz, width);
         context.beginPath();
         context.moveTo(x + 0.5, 0);
         context.lineTo(x + 0.5, height);
@@ -334,5 +402,5 @@ export const WaterfallView = memo(function WaterfallView({ frames, frequencyGuid
   useRedraw(canvasRef, draw);
 
   const anomalyRows = frames.filter((frame) => detectorAnomalyRanges(frame).length > 0).length;
-  return <canvas ref={canvasRef} className="waterfall-canvas" aria-label={`${frames.some((frame) => frame.syntheticExercise) ? "Synthetic exercise " : ""}waterfall with ${frames.length} recent spectrum frames; newest row on top; ${anomalyRows} detector-marked anomaly ${anomalyRows === 1 ? "row" : "rows"}; shaded outer columns are guard roll-off and are not analyzed${frequencyGuides.length ? `; ${frequencyGuides.length} expected correction carrier guides` : ""}`} />;
+  return <canvas ref={canvasRef} className="waterfall-canvas" aria-label={`${frames.some((frame) => frame.syntheticExercise) ? "Synthetic exercise " : ""}waterfall with ${frames.length} recent spectrum frames; newest row on top; ${anomalyRows} detector-marked anomaly ${anomalyRows === 1 ? "row" : "rows"}; shaded outer columns are guard roll-off and are not analyzed${view ? "; view zoomed to the correction carriers" : ""}${frequencyGuides.length ? `; ${frequencyGuides.length} expected correction carrier guides` : ""}`} />;
 });

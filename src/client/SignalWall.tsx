@@ -24,7 +24,7 @@ import type {
 import type { DisplayOptions } from "./BottomPanels";
 import type { SweepFrameState, TargetFrameState } from "./useMonitor";
 import { formatFrequency } from "./format";
-import { SpectrumView, WaterfallView } from "./SpectrumViews";
+import { carrierViewRange, SpectrumView, WaterfallView } from "./SpectrumViews";
 import { detectorBaselineAvailable } from "./detectorPresentation";
 import { SIGNAL_WALL_CAPACITY, type SignalWallLayout } from "./signalWallPreferences";
 import { preferencesForWall, surfacedVisibleFeedIds } from "./feedVisibility";
@@ -279,12 +279,16 @@ function SignalFeedCard({
   const stateCopy = SIGNAL_STATE_COPY[signalState];
   const cardState = off ? "off" : signalState;
   const stateLabel = off ? "Off" : stateCopy.label;
-  const displayStartHz = frame ? frame.startHz : feed.startHz;
-  const displayEndHz = frame ? frame.endHz : feed.endHz;
   const displayCoverage = isLive && frame ? `${formatFrequency(frame.startHz, 3).replace(" MHz", "")}-${formatFrequency(frame.endHz, 3)}` : feed.coverageLabel;
   const frequencyGuides = useMemo(() => snapshot.bands
     .filter((band) => feed.bandIds.includes(band.id) && band.service === "fugro" && band.correctionBeam)
     .map((band) => ({ frequencyHz: band.centerHz, label: band.label })), [feed.bandIds, snapshot.bands]);
+  const carrierView = useMemo(
+    () => frame ? carrierViewRange({ guides: frequencyGuides, startHz: frame.startHz, endHz: frame.endHz }) : undefined,
+    [frame, frequencyGuides],
+  );
+  const displayStartHz = carrierView ? carrierView.startHz : frame ? frame.startHz : feed.startHz;
+  const displayEndHz = carrierView ? carrierView.endHz : frame ? frame.endHz : feed.endHz;
 
   return (
     <article className={`mission-feed-card ${selected ? "selected" : ""} ${cardState} ${paused ? "paused" : ""} ${exercise ? "simulation" : ""}`}>
@@ -305,13 +309,13 @@ function SignalFeedCard({
         <span>{exercise ? "SIMULATION" : isLive || feed.kind === "capture-window" ? "One receiver window" : "Stitched sweep"}</span>
         <span>{exercise ? `${exercise.scenarioName} · ${exercise.phase === "waiting-for-target" ? "Starting" : exercise.phase === "alert" ? "Test alert" : exercise.phase === "recovering" ? `Recovering ${exercise.cleanChecks} of ${exercise.requiredCleanChecks}` : exercise.phase === "complete" ? exercise.verdict ?? "Test complete" : exercise.phase === "inconclusive" ? "Test inconclusive" : "Test running"}` : coverageLabel}</span>
       </div>
-      <div className="feed-chart-heading"><strong>Relative signal level</strong>{metricReadout ? <span className={`feed-metrics ${metricReadout.overload ? "overload" : ""}`}>{metricReadout.chips.map((chip) => <b key={chip}>{chip}</b>)}</span> : null}<div><span><i className="legend-current" />{feed.kind === "stitched-sweep" && !isLive ? "Last full sweep" : "Current"}</span>{options.baseline && (feed.kind !== "stitched-sweep" || isLive) && detectorBaselineAvailable(frame, metrics) ? <span><i className="legend-usual" />Usual level</span> : null}</div></div>
+      <div className="feed-chart-heading"><strong>Relative signal level</strong>{metricReadout ? <span className={`feed-metrics ${metricReadout.overload ? "overload" : ""}`}>{metricReadout.chips.map((chip) => <b key={chip}>{chip}</b>)}</span> : null}{carrierView ? <span className="feed-zoom-note">Zoomed to carriers</span> : null}<div><span><i className="legend-current" />{feed.kind === "stitched-sweep" && !isLive ? "Last full sweep" : "Current"}</span>{options.baseline && (feed.kind !== "stitched-sweep" || isLive) && detectorBaselineAvailable(frame, metrics) ? <span><i className="legend-usual" />Usual level</span> : null}</div></div>
       <div className="feed-spectrum-grid">
         <div className="plain-level-axis" aria-hidden="true"><span>High</span><span>Usual</span><span>Low</span></div>
-        <div className="feed-spectrum"><SpectrumView frame={frame} metrics={metrics} showBaseline={options.baseline && (feed.kind !== "stitched-sweep" || isLive)} showMarkers={options.markers} frequencyGuides={frequencyGuides} />{off ? <p className="feed-off-notice">Off. Turn this window on in Settings, Monitoring.</p> : null}</div>
+        <div className="feed-spectrum"><SpectrumView frame={frame} metrics={metrics} showBaseline={options.baseline && (feed.kind !== "stitched-sweep" || isLive)} showMarkers={options.markers} frequencyGuides={frequencyGuides} view={carrierView} />{off ? <p className="feed-off-notice">Off. Turn this window on in Settings, Monitoring.</p> : null}</div>
       </div>
       <FeedFrequencyAxis startHz={displayStartHz} endHz={displayEndHz} />
-      <div className="feed-waterfall"><WaterfallView frames={history} frequencyGuides={frequencyGuides} /></div>
+      <div className="feed-waterfall"><WaterfallView frames={history} frequencyGuides={frequencyGuides} view={carrierView} /></div>
       <FeedFrequencyAxis startHz={displayStartHz} endHz={displayEndHz} />
       {feed.kind === "stitched-sweep" ? <div className="sweep-progress"><span>{paused ? `Paused at ${progress}%` : sweep?.status === "complete" && sweep.lastCompletedAt ? `Sweep ready · ${ageLabel(sweep.lastCompletedAt, now)}` : sweep?.lastCompletedAt ? `Scanning ${progress}% · Last sweep ${ageLabel(sweep.lastCompletedAt, now)}` : `First sweep ${progress}%`}</span><div><i style={{ width: `${progress}%` }} /></div></div> : null}
     </article>
@@ -319,7 +323,7 @@ function SignalFeedCard({
 }
 
 function FeedFrequencyAxis({ startHz, endHz }: { startHz: number; endHz: number }) {
-  const digits = endHz - startHz < 30_000_000 ? 2 : 0;
+  const digits = endHz - startHz < 3_000_000 ? 3 : endHz - startHz < 30_000_000 ? 2 : 0;
   const values = Array.from({ length: 7 }, (_, index) => startHz + ((endHz - startHz) * index) / 6);
   return <div className="feed-frequency-axis">{values.map((value, index) => <span key={index}>{formatFrequency(value, digits).replace(" MHz", "")}</span>)}<strong>MHz</strong></div>;
 }
