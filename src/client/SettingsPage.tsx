@@ -445,7 +445,6 @@ export function SettingsPage(props: SettingsPageProps) {
       className="settings-page"
       data-rf-monitor-surface="settings"
       data-rf-data-mode={props.snapshot.dataDomain}
-      data-rf-monitoring-state={props.snapshot.operatorSummary.monitoring.state}
     >
       <header className="settings-header">
         <div className="settings-header-copy">

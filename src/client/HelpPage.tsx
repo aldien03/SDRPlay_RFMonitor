@@ -20,7 +20,6 @@ export function HelpPage({ snapshot, onClose, onOpenHealth, onOpenRecording, onO
       className="help-page"
       data-rf-monitor-surface="help"
       data-rf-data-mode={snapshot.dataDomain}
-      data-rf-monitoring-state={snapshot.operatorSummary.monitoring.state}
     >
       <header className="help-header">
         <div><Radio size={22} aria-hidden="true" /><strong>RF Monitor help</strong></div>

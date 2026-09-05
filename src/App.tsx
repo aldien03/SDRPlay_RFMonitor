@@ -414,7 +414,6 @@ export function App() {
       className="app-shell monitor-app mission-app"
       data-rf-monitor-surface="dashboard"
       data-rf-data-mode={snapshot.dataDomain}
-      data-rf-monitoring-state={snapshot.operatorSummary.monitoring.state}
     >
       <Header
         snapshot={snapshot}
