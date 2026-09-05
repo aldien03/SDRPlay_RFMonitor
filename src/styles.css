@@ -3010,3 +3010,5 @@ body { color: var(--text); background: var(--background); }
 .surface-alert-banner button { flex-shrink: 0; min-height: 28px; padding: 0 11px; color: #7a1c1c; background: #fff; border: 1px solid #d99; border-radius: 4px; font-size: 11px; font-weight: 800; cursor: pointer; }
 .surface-alert-banner.simulation { color: #4b2d86; background: #f3eefc; border-bottom-color: #7c5cc4; }
 .surface-alert-banner.simulation button { color: #4b2d86; border-color: #b7a3e0; }
+.schedule-capacity { display: flex; align-items: baseline; gap: 10px; margin: 0 0 10px; padding: 9px 11px; color: #37505f; background: #f2f5f7; border-left: 3px solid #7a8b96; font-size: 11px; }
+.schedule-capacity.attention { color: #5f4a13; background: #fff8e8; border-left-color: var(--amber); }

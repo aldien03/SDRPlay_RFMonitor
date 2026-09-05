@@ -18,6 +18,7 @@ import { estimateRevisitMs } from "../shared/bands";
 import { captureWindowNaming } from "../shared/monitorGroups";
 import { presentOperatorSummary } from "../shared/operatorSummary";
 import { applyMonitoringMission, compileEffectiveBands, continuousWatchTargetId, evaluateSettingsFeasibility, monitoringMissionForSettings, ROBUST_DETECTION_DEFAULTS, selectedMonitoringTargetIds } from "../shared/settings";
+import { scheduleCapacityCopy, windowSchedule, windowScheduleCopy } from "./schedulePresentation";
 import type { BandCatalog, BandPreset, BaselineApprovalEligibility, BaselineDescriptor, MonitorSnapshot, MonitoringMission, OperationalSettings, PhysicalCaptureTarget, SettingsRevision } from "../shared/types";
 import { formatBytes, formatFrequency, formatRange } from "./format";
 import {
@@ -661,6 +662,7 @@ function MonitoringSettings({ response, draft, current, setDraft, errors, disabl
     : draftState?.feasibility.revisitObjective === "missed"
       ? "Misses"
       : "Not verified";
+  const capacity = draftState ? scheduleCapacityCopy(draftState.feasibility) : undefined;
   return (
     <section className="settings-section" aria-labelledby="monitoring-settings-title">
       <div className="settings-title-row">
@@ -679,6 +681,7 @@ function MonitoringSettings({ response, draft, current, setDraft, errors, disabl
             mode="single"
             targets={monitoringTargets}
             catalog={response.catalog}
+            settings={viewSettings}
             selectedIds={continuousTarget ? [continuousTarget.id] : []}
             disabled={disabled}
             onToggle={(targetId) => setDraft(applyMonitoringMission(draft, response.catalog, "continuous-watch", targetId))}
@@ -692,10 +695,17 @@ function MonitoringSettings({ response, draft, current, setDraft, errors, disabl
         <div className="mission-panel">
           <div className="mission-panel-heading"><strong>Frequency windows</strong><span>{selectedTargetIds.length} checked in turn</span></div>
           <p className="correction-watch-note">One receiver checks the selected windows in turn.</p>
+          {draftState && capacity ? (
+            <div className={`schedule-capacity ${capacity.state === "available" ? "" : "attention"}`} role={capacity.state === "overloaded" ? "alert" : "status"}>
+              <strong>{capacity.headline}</strong>
+              <span>{capacity.detail}</span>
+            </div>
+          ) : null}
           <FrequencyWindowPicker
             mode="multiple"
             targets={monitoringTargets}
             catalog={response.catalog}
+            settings={viewSettings}
             selectedIds={selectedTargetIds}
             disabled={disabled}
             onToggle={(targetId) => {
@@ -757,10 +767,11 @@ const MISSION_OPTIONS: Array<{ value: Exclude<MonitoringMission, "custom">; labe
   { value: "radio-survey", label: "Radio Survey", detail: "StarTrack and 4DX" },
 ];
 
-function FrequencyWindowPicker({ mode, targets, catalog, selectedIds, disabled, onToggle }: {
+function FrequencyWindowPicker({ mode, targets, catalog, settings, selectedIds, disabled, onToggle }: {
   mode: "single" | "multiple";
   targets: PhysicalCaptureTarget[];
   catalog: BandCatalog;
+  settings: OperationalSettings;
   selectedIds: string[];
   disabled: boolean;
   onToggle: (targetId: string) => void;
@@ -780,7 +791,7 @@ function FrequencyWindowPicker({ mode, targets, catalog, selectedIds, disabled, 
     });
     return <label key={target.id} className={checked ? "selected" : ""}>
       <input type={mode === "single" ? "radio" : "checkbox"} name={mode === "single" ? "continuous-frequency-window" : undefined} checked={checked} disabled={disabled || (mode === "multiple" && checked && selectedIds.length <= 2)} onChange={() => onToggle(target.id)} />
-      <span><strong>{naming.label}</strong><small>{naming.signalsLabel ?? (target.service === "fugro" ? "Fugro corrections" : "GNSS")}{target.tier === "tier1" ? " · Priority" : ""}</small></span>
+      <span><strong>{naming.label}</strong><small>{naming.signalsLabel ?? (target.service === "fugro" ? "Fugro corrections" : "GNSS")} · {windowScheduleCopy(windowSchedule({ target, settings, catalog }))}</small></span>
       <b>{formatFrequency(target.nominalDisplayHz ?? target.centerHz, 3)}</b>
     </label>;
   })}</div>;
