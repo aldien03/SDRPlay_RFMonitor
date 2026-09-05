@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { carrierViewRange, visibleBinWindow } from "../src/client/SpectrumViews";
+import { carrierViewRange, visibleBinWindow, waterfallColor, waterfallTimeMarkers } from "../src/client/SpectrumViews";
 
 describe("carrierViewRange", () => {
   it("returns undefined when the guide list is empty", () => {
@@ -117,5 +117,65 @@ describe("visibleBinWindow", () => {
       view: { startHz: 1_000_000, endHz: 2_000_000 },
     });
     expect(result).toEqual({ startBin: 0, endBin: 2048, startHz: 10_000_000, endHz: 10_000_000 });
+  });
+});
+
+describe("waterfallColor", () => {
+  it("regression: 143 and 255 no longer render identically (the old mapping saturated at bin 143)", () => {
+    expect(waterfallColor(143)).not.toBe(waterfallColor(255));
+  });
+
+  it("samples across the full range yield nine distinct colours", () => {
+    const samples = [0, 32, 64, 96, 128, 160, 192, 224, 255].map(waterfallColor);
+    expect(new Set(samples).size).toBe(9);
+  });
+
+  it("bin 0 is the darkest stop and bin 255 is the final stop, exactly", () => {
+    expect(waterfallColor(0)).toBe("rgb(4, 32, 84)");
+    expect(waterfallColor(255)).toBe("rgb(255, 60, 30)");
+  });
+
+  it("clamps out-of-range input instead of extrapolating", () => {
+    expect(waterfallColor(-40)).toBe(waterfallColor(0));
+    expect(waterfallColor(999)).toBe(waterfallColor(255));
+  });
+});
+
+describe("waterfallTimeMarkers", () => {
+  it("returns [] for no frames", () => {
+    expect(waterfallTimeMarkers({ frames: [], nowMs: 1_000 })).toEqual([]);
+  });
+
+  it("returns exactly one marker at index 0 for a single frame", () => {
+    const markers = waterfallTimeMarkers({
+      frames: [{ timestamp: "2024-01-01T00:00:00.000Z" }],
+      nowMs: Date.parse("2024-01-01T00:00:00.000Z") + 5_000,
+    });
+    expect(markers).toEqual([{ index: 0, label: "5s ago" }]);
+  });
+
+  it("several frames get two markers, and index 0 describes the newest (last) frame, not the first", () => {
+    // Ascending timestamps: the fixture would read backwards if index 0 were wrongly taken
+    // from frames[0] instead of the last element.
+    const frames = [
+      { timestamp: "2024-01-01T00:00:00.000Z" },
+      { timestamp: "2024-01-01T00:01:00.000Z" },
+      { timestamp: "2024-01-01T00:05:00.000Z" },
+    ];
+    const nowMs = Date.parse("2024-01-01T00:05:00.000Z") + 500;
+    const markers = waterfallTimeMarkers({ frames, nowMs });
+    expect(markers).toEqual([
+      { index: 0, label: "now" },
+      { index: 2, label: "5m ago" },
+    ]);
+  });
+
+  it("formats ages across the now/seconds/minutes/hours boundaries, never negative", () => {
+    const at = (nowMs: number) => waterfallTimeMarkers({ frames: [{ timestamp: "1970-01-01T00:00:00.000Z" }], nowMs })[0].label;
+    expect(at(1_999)).toBe("now");
+    expect(at(45_000)).toBe("45s ago");
+    expect(at(125_000)).toBe("2m ago");
+    expect(at(7_530_000)).toBe("2h ago");
+    expect(at(-5_000)).toBe("now"); // a future timestamp must clamp to zero elapsed, not go negative
   });
 });

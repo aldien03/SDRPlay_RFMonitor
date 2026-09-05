@@ -306,16 +306,68 @@ export const SpectrumView = memo(function SpectrumView({
   );
 });
 
-function waterfallColor(value: number): string {
-  const level = Math.max(0, Math.min(1, (value - 18) / 125));
-  if (level < 0.28) return `rgb(0, ${Math.round(25 + level * 175)}, ${Math.round(92 + level * 360)})`;
-  if (level < 0.52) return `rgb(0, ${Math.round(120 + level * 230)}, ${Math.round(190 - level * 240)})`;
-  if (level < 0.76) return `rgb(${Math.round(110 + level * 185)}, ${Math.round(225 - level * 35)}, 0)`;
-  return `rgb(${Math.round(230 + level * 25)}, ${Math.round(210 - level * 190)}, 0)`;
+const WATERFALL_STOPS: ReadonlyArray<{ level: number; rgb: [number, number, number] }> = [
+  { level: 0.00, rgb: [4, 32, 84] },
+  { level: 0.25, rgb: [0, 120, 190] },
+  { level: 0.50, rgb: [0, 180, 130] },
+  { level: 0.70, rgb: [180, 210, 0] },
+  { level: 0.85, rgb: [255, 180, 0] },
+  { level: 1.00, rgb: [255, 60, 30] },
+];
+
+export function waterfallColor(value: number): string {
+  const level = Math.max(0, Math.min(1, value / 255));
+  let lower = WATERFALL_STOPS[0];
+  let upper = WATERFALL_STOPS[WATERFALL_STOPS.length - 1];
+  for (let index = 0; index < WATERFALL_STOPS.length - 1; index += 1) {
+    if (level >= WATERFALL_STOPS[index].level && level <= WATERFALL_STOPS[index + 1].level) {
+      lower = WATERFALL_STOPS[index];
+      upper = WATERFALL_STOPS[index + 1];
+      break;
+    }
+  }
+  const span = upper.level - lower.level || 1;
+  const t = (level - lower.level) / span;
+  const mix = (from: number, to: number) => Math.round(from + (to - from) * t);
+  return `rgb(${mix(lower.rgb[0], upper.rgb[0])}, ${mix(lower.rgb[1], upper.rgb[1])}, ${mix(lower.rgb[2], upper.rgb[2])})`;
+}
+
+export interface WaterfallTimeMarker { index: number; label: string }
+
+/** "12s ago" style age, never negative — a clock skewed frame must not read as a future one. */
+function waterfallAgeLabel(elapsedMs: number): string {
+  const elapsed = Math.max(0, elapsedMs);
+  if (elapsed < 2_000) return "now";
+  if (elapsed < 60_000) return `${Math.floor(elapsed / 1_000)}s ago`;
+  if (elapsed < 3_600_000) return `${Math.floor(elapsed / 60_000)}m ago`;
+  return `${Math.floor(elapsed / 3_600_000)}h ago`;
+}
+
+/** Age labels for the newest and oldest rows, so the covered time span is visible. */
+export function waterfallTimeMarkers(input: {
+  frames: ReadonlyArray<{ timestamp: string }>;
+  nowMs: number;
+}): WaterfallTimeMarker[] {
+  const { frames, nowMs } = input;
+  if (!frames.length) return [];
+  // Rows draw newest first via [...frames].reverse(), so index 0 is the LAST element here.
+  const ageOf = (frame: { timestamp: string }): string | undefined => {
+    const parsed = Date.parse(frame.timestamp);
+    return Number.isNaN(parsed) ? undefined : waterfallAgeLabel(nowMs - parsed);
+  };
+  const markers: WaterfallTimeMarker[] = [];
+  const newestLabel = ageOf(frames[frames.length - 1]);
+  if (newestLabel !== undefined) markers.push({ index: 0, label: newestLabel });
+  if (frames.length >= 2) {
+    const oldestLabel = ageOf(frames[0]);
+    if (oldestLabel !== undefined) markers.push({ index: frames.length - 1, label: oldestLabel });
+  }
+  return markers;
 }
 
 export const WaterfallView = memo(function WaterfallView({ frames, frequencyGuides = [], view }: { frames: SpectrumFrame[]; frequencyGuides?: ReadonlyArray<{ frequencyHz: number; label: string }>; view?: ViewRange }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const timeMarkers = waterfallTimeMarkers({ frames, nowMs: Date.now() });
   const draw = () => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -388,6 +440,23 @@ export const WaterfallView = memo(function WaterfallView({ frames, frequencyGuid
       }
       context.setLineDash([]);
     }
+    if (timeMarkers.length) {
+      // Same measure-plate-text treatment as the frequency guide labels above, but a dark plate:
+      // a waterfall row can be any colour, unlike the fixed light plot background.
+      context.font = "700 8px Arial, sans-serif";
+      context.textAlign = "right";
+      const rightEdge = width - 4;
+      for (const marker of timeMarkers) {
+        if (marker.index !== 0 && height < 40) continue; // a short card has room for only the newest label
+        const y = Math.min(height - 2, marker.index * rowHeight + rowHeight / 2 + 3);
+        const labelWidth = context.measureText(marker.label).width + 6;
+        context.fillStyle = "rgba(2, 10, 26, 0.72)";
+        context.fillRect(rightEdge - labelWidth, y - 9, labelWidth, 11);
+        context.fillStyle = "#eef4ff";
+        context.fillText(marker.label, rightEdge, y);
+      }
+      context.textAlign = "left";
+    }
     context.strokeStyle = "rgba(255, 255, 255, 0.22)";
     context.lineWidth = 1;
     for (let column = 0; column <= 6; column += 1) {
@@ -402,5 +471,12 @@ export const WaterfallView = memo(function WaterfallView({ frames, frequencyGuid
   useRedraw(canvasRef, draw);
 
   const anomalyRows = frames.filter((frame) => detectorAnomalyRanges(frame).length > 0).length;
-  return <canvas ref={canvasRef} className="waterfall-canvas" aria-label={`${frames.some((frame) => frame.syntheticExercise) ? "Synthetic exercise " : ""}waterfall with ${frames.length} recent spectrum frames; newest row on top; ${anomalyRows} detector-marked anomaly ${anomalyRows === 1 ? "row" : "rows"}; shaded outer columns are guard roll-off and are not analyzed${view ? "; view zoomed to the correction carriers" : ""}${frequencyGuides.length ? `; ${frequencyGuides.length} expected correction carrier guides` : ""}`} />;
+  // timeMarkers[0], when present, is always the newest row; timeMarkers[1], when present, the oldest.
+  // A single row spans no interval, so name the one moment rather than "now to now".
+  const coverageClause = timeMarkers.length === 0
+    ? ""
+    : timeMarkers.length === 1
+      ? `; covering ${timeMarkers[0].label}`
+      : `; covering ${timeMarkers[1].label} to ${timeMarkers[0].label}`;
+  return <canvas ref={canvasRef} className="waterfall-canvas" aria-label={`${frames.some((frame) => frame.syntheticExercise) ? "Synthetic exercise " : ""}waterfall with ${frames.length} recent spectrum frames; newest row on top; ${anomalyRows} detector-marked anomaly ${anomalyRows === 1 ? "row" : "rows"}${coverageClause}; shaded outer columns are guard roll-off and are not analyzed${view ? "; view zoomed to the correction carriers" : ""}${frequencyGuides.length ? `; ${frequencyGuides.length} expected correction carrier guides` : ""}`} />;
 });
