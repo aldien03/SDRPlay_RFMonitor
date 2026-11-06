@@ -69,6 +69,10 @@ interface BaselineState {
   binCount: number;
   medians: Uint8Array;
   mads: Uint8Array;
+  /** Bumped whenever a reservoir slot is written; medians/mads are derived from it alone. */
+  reservoirRevision: number;
+  /** The reservoirRevision the current medians/mads were derived from; -1 means never derived. */
+  derivedRevision: number;
   representativeHours: Map<string, { valid: number; expected: number; eligible: boolean }>;
   votes: CandidateVote[];
   driftExposureMs: number;
@@ -659,6 +663,8 @@ export class DetectionEngine {
       binCount,
       medians: new Uint8Array(binCount),
       mads: new Uint8Array(binCount),
+      reservoirRevision: 0,
+      derivedRevision: -1,
       representativeHours: new Map(),
       votes: [],
       driftExposureMs: 0,
@@ -676,9 +682,17 @@ export class DetectionEngine {
       slot = candidate;
     }
     state.reservoir.set(bins, slot * state.binCount);
+    state.reservoirRevision += 1;
   }
 
+  /**
+   * Per-bin median and MAD of the reservoir. They are a pure function of the reservoir, which
+   * changes only on a write (every row while it fills, then with probability size/observationsSeen),
+   * so unchanged reservoirs skip the roughly two-million-operation recompute.
+   */
   private deriveRobustBaseline(state: BaselineState): void {
+    if (state.derivedRevision === state.reservoirRevision) return;
+    state.derivedRevision = state.reservoirRevision;
     for (let bin = 0; bin < state.binCount; bin += 1) {
       this.histogram.fill(0);
       for (let row = 0; row < state.reservoirCount; row += 1) this.histogram[state.reservoir[row * state.binCount + bin]] += 1;
