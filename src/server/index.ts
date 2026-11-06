@@ -49,6 +49,7 @@ import type { SyntheticRunMode } from "../shared/syntheticValidation";
 import { detectorQualificationPlan } from "../shared/detectorQualification";
 import { sha256Canonical } from "./syntheticValidation";
 import { StabilityIncidentStore } from "./stabilityIncidentStore";
+import { createShutdownCoordinator, guardUpgradeSocket, guardWebSocket } from "./processSafety";
 
 const streamingStartedAt = Date.now();
 const streamingCounters = {
@@ -1935,6 +1936,7 @@ function queueFrame(socket: WebSocket, message: Extract<ServiceMessage, { type: 
 }
 
 server.on("upgrade", (request, socket, head) => {
+  guardUpgradeSocket(socket, reportSocketFault);
   const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
   if (url.pathname !== "/live" || !originAllowed(request)) {
     socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
@@ -1957,6 +1959,7 @@ server.on("upgrade", (request, socket, head) => {
 });
 
 liveServer.on("connection", (socket) => {
+  guardWebSocket(socket, reportSocketFault);
   const initialSubscription = normalizeLiveSubscription({ type: "subscribe", protocolVersion: 2, rateHz: 2, engineer: false })!;
   const bootstrap = compactSnapshot(authoritativeSnapshot().snapshot);
   const state: LiveClientState = {
@@ -2105,23 +2108,51 @@ server.listen(config.port, config.host, () => {
   console.log(`Evidence archive: ${config.storageRoot}`);
 });
 
-async function shutdown(): Promise<void> {
-  const forcedExit = setTimeout(() => process.exit(1), 30_000);
-  forcedExit.unref();
-  const serverClosed = new Promise<void>((resolve) => server.close(() => resolve()));
-  clearInterval(heartbeatTimer);
-  clearInterval(eventLoopSampleTimer);
-  clearInterval(recoveryStatusTimer);
-  diagnosticsCollector.stop();
-  eventLoopHistogram.disable();
-  for (const client of liveServer.clients) client.terminate();
-  liveServer.close();
-  await productionQualificationStore.flush();
-  await stabilityIncidents.flush();
-  await monitor.stop();
-  await serverClosed;
-  process.exit(0);
+let lastSocketFaultLogAt = 0;
+function reportSocketFault(error: Error): void {
+  const now = Date.now();
+  if (now - lastSocketFaultLogAt < 10_000) return;
+  lastSocketFaultLogAt = now;
+  console.warn(`Live socket fault closed: ${error.message}`);
 }
 
-process.on("SIGINT", () => void shutdown());
-process.on("SIGTERM", () => void shutdown());
+let serverClosed: Promise<void> = Promise.resolve();
+const shutdown = createShutdownCoordinator({
+  log: (message) => console.log(message),
+  exit: (code) => process.exit(code),
+  steps: [
+    {
+      name: "stop accepting connections",
+      run: () => {
+        serverClosed = new Promise<void>((resolve) => server.close(() => resolve()));
+        clearInterval(heartbeatTimer);
+        clearInterval(eventLoopSampleTimer);
+        clearInterval(recoveryStatusTimer);
+        diagnosticsCollector.stop();
+        eventLoopHistogram.disable();
+        for (const client of liveServer.clients) client.terminate();
+        liveServer.close();
+        server.closeIdleConnections();
+      },
+    },
+    { name: "flush production qualification", run: () => productionQualificationStore.flush() },
+    { name: "flush stability incidents", run: () => stabilityIncidents.flush() },
+    // Closes the evidence session and releases the data-domain lease; must always be reached.
+    { name: "stop monitor", run: () => monitor.stop() },
+    // Evidence is safe by now; anything still open (a long download) is cut rather than waited for.
+    { name: "close remaining connections", run: () => server.closeAllConnections() },
+    { name: "wait for server close", run: () => serverClosed },
+  ],
+});
+
+process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+// An unexpected fault still ends the process (systemd restarts it), but evidence is closed first.
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught exception:", error);
+  void shutdown("uncaughtException", 1);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled rejection:", reason);
+  void shutdown("unhandledRejection", 1);
+});
