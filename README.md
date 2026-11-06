@@ -12,6 +12,8 @@ bash deploy/install-ubuntu.sh
 
 Run that command as the normal Ubuntu user, not with `sudo`. The installer asks for `sudo` only when it needs to change the computer.
 
+**Windows 11 (evaluation only, never production-qualified):** see [Install RF Monitor on Windows 11](docs/windows-11.md).
+
 ## Operator Design
 
 The default dashboard shows only what an operator needs:
