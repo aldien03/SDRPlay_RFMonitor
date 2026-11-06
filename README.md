@@ -14,6 +14,8 @@ Run that command as the normal Ubuntu user, not with `sudo`. The installer asks 
 
 **Windows 11 (evaluation only, never production-qualified):** see [Install RF Monitor on Windows 11](docs/windows-11.md).
 
+**Required download:** [SDRconnect for Windows, Linux and macOS](https://sdrplay.com/sdrconnect/#) from SDRplay. RF Monitor reads its spectrum from SDRconnect, so install it before you start.
+
 ## Operator Design
 
 The default dashboard shows only what an operator needs:
