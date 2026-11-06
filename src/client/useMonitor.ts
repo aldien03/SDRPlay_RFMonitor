@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { CLIENT_DATA_LATE_AFTER_MS, decodeSpectrumEnvelope } from "../shared/liveProtocol";
+import { detectorAnomalyRanges } from "./detectorPresentation";
+import { buildWaterfallPalette, composeWaterfall, rasterizeRow } from "./waterfallRaster";
 import { liveSubscriptionSignature, MAX_VISIBLE_TARGETS, normalizeLiveSubscription, sameStringSet } from "../shared/liveSubscription";
 import {
   MAX_OPERATOR_AFFECTED_TARGETS,
@@ -619,14 +621,6 @@ export class ApiError extends Error {
   }
 }
 
-function evidenceColor(value: number): string {
-  const level = Math.max(0, Math.min(1, (value - 18) / 125));
-  if (level < 0.28) return `rgb(0, ${Math.round(25 + level * 175)}, ${Math.round(92 + level * 360)})`;
-  if (level < 0.52) return `rgb(0, ${Math.round(120 + level * 230)}, ${Math.round(190 - level * 240)})`;
-  if (level < 0.76) return `rgb(${Math.round(110 + level * 185)}, ${Math.round(225 - level * 35)}, 0)`;
-  return `rgb(${Math.round(230 + level * 25)}, ${Math.round(210 - level * 190)}, 0)`;
-}
-
 function fitCanvasText(context: CanvasRenderingContext2D, value: string, maxWidth: number): string {
   if (context.measureText(value).width <= maxWidth) return value;
   let end = value.length;
@@ -684,22 +678,37 @@ function drawEvidencePlot(context: CanvasRenderingContext2D, snapshot: MonitorSn
 }
 
 function drawEvidenceWaterfall(context: CanvasRenderingContext2D, snapshot: MonitorSnapshot, top: number, width: number, height: number): void {
+  const palette = buildWaterfallPalette();
   context.fillStyle = "#06285d";
   context.fillRect(0, top, width, height);
-  const frames = [...snapshot.waterfall].reverse();
+  const frames = snapshot.waterfall;
   if (!frames.length) return;
-  const rowHeight = Math.max(1, height / Math.max(24, frames.length));
-  frames.forEach((frame, row) => {
-    const visibleBins = Math.min(width, frame.bins.length);
-    for (let column = 0; column < visibleBins; column += 1) {
-      const sourceIndex = Math.min(frame.bins.length - 1, Math.floor((column / visibleBins) * frame.bins.length));
-      context.fillStyle = evidenceColor(frame.bins[sourceIndex]);
-      context.fillRect((column / visibleBins) * width, top + row * rowHeight, width / visibleBins + 1, rowHeight + 0.5);
-    }
-  });
+  // Same rasteriser and palette as the live waterfall, so the saved image is what the operator saw.
+  const rowCapacity = Math.max(24, frames.length);
+  const rows: Uint32Array[] = [];
+  for (let index = frames.length - 1; index >= 0; index -= 1) {
+    const frame = frames[index];
+    rows.push(rasterizeRow({
+      bins: frame.bins,
+      startBin: 0,
+      endBin: frame.bins.length,
+      widthPx: width,
+      anomalyRanges: detectorAnomalyRanges(frame),
+      palette,
+      hatch: true,
+    }));
+  }
+  const pixels = new Uint32Array(width * rowCapacity);
+  composeWaterfall(rows, width, rowCapacity, palette, pixels);
+  const surface = document.createElement("canvas");
+  surface.width = width;
+  surface.height = rowCapacity;
+  surface.getContext("2d")?.putImageData(new ImageData(new Uint8ClampedArray(pixels.buffer), width, rowCapacity), 0, 0);
+  context.imageSmoothingEnabled = false;
+  context.drawImage(surface, 0, 0, width, rowCapacity, 0, top, width, height);
 }
 
-async function createEvidenceScreenshot(snapshot: MonitorSnapshot, eventId: string): Promise<Blob | null> {
+export async function createEvidenceScreenshot(snapshot: MonitorSnapshot, eventId: string): Promise<Blob | null> {
   const width = 1_200;
   const headerHeight = 126;
   const spectrumHeight = 360;
@@ -727,7 +736,8 @@ async function createEvidenceScreenshot(snapshot: MonitorSnapshot, eventId: stri
   drawEvidenceWaterfall(context, snapshot, headerHeight + spectrumHeight + gap, width, waterfallHeight);
   context.fillStyle = "#142536";
   context.font = "16px Arial, sans-serif";
-  context.fillText("Spectrum above. Signal history below, newest first. Full RF data is included with the incident.", 24, canvas.height - 20);
+  context.fillText("Spectrum above. Signal history below, newest first. Full RF data is included with the incident.", 24, canvas.height - 34);
+  context.fillText("History colour: dark blue is quiet, red is strong (relative, uncalibrated). Striped red marks detector-flagged bins.", 24, canvas.height - 12);
   return new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
 }
 
