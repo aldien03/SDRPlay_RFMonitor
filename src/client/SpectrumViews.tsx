@@ -1,5 +1,6 @@
 import { memo, useEffect, useRef } from "react";
 import type { SignalMetricSample, SpectrumFrame } from "../shared/types";
+import { waterfallColor } from "./waterfallRaster";
 import { detectorAnalysisForFrame, detectorAnomalyRanges, detectorBaselineAvailable } from "./detectorPresentation";
 
 export interface ViewRange { startHz: number; endHz: number }
@@ -365,31 +366,7 @@ export const SpectrumView = memo(function SpectrumView({
   );
 });
 
-const WATERFALL_STOPS: ReadonlyArray<{ level: number; rgb: [number, number, number] }> = [
-  { level: 0.00, rgb: [4, 32, 84] },
-  { level: 0.25, rgb: [0, 120, 190] },
-  { level: 0.50, rgb: [0, 180, 130] },
-  { level: 0.70, rgb: [180, 210, 0] },
-  { level: 0.85, rgb: [255, 180, 0] },
-  { level: 1.00, rgb: [255, 60, 30] },
-];
-
-export function waterfallColor(value: number): string {
-  const level = Math.max(0, Math.min(1, value / 255));
-  let lower = WATERFALL_STOPS[0];
-  let upper = WATERFALL_STOPS[WATERFALL_STOPS.length - 1];
-  for (let index = 0; index < WATERFALL_STOPS.length - 1; index += 1) {
-    if (level >= WATERFALL_STOPS[index].level && level <= WATERFALL_STOPS[index + 1].level) {
-      lower = WATERFALL_STOPS[index];
-      upper = WATERFALL_STOPS[index + 1];
-      break;
-    }
-  }
-  const span = upper.level - lower.level || 1;
-  const t = (level - lower.level) / span;
-  const mix = (from: number, to: number) => Math.round(from + (to - from) * t);
-  return `rgb(${mix(lower.rgb[0], upper.rgb[0])}, ${mix(lower.rgb[1], upper.rgb[1])}, ${mix(lower.rgb[2], upper.rgb[2])})`;
-}
+export { waterfallColor };
 
 /** A legend is only drawn where it will not crowd the rows it explains. */
 export function waterfallLegendFits(width: number, height: number): boolean {
