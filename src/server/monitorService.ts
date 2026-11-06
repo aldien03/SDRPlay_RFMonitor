@@ -51,7 +51,7 @@ import type {
   SweepCycle,
   SweepSegment,
 } from "../shared/types";
-import { EvidenceStore, type EvidenceInterruptionContext } from "./evidenceStore";
+import { EvidenceStore, WRITER_ORDINARY_MAX_BYTES, WRITER_ORDINARY_MAX_ITEMS, type EvidenceInterruptionContext } from "./evidenceStore";
 import {
   type ScreenshotAdmissionLease,
   validateScreenshotPng,
@@ -464,12 +464,17 @@ export class MonitorService extends EventEmitter {
     if (this.simulator) clearInterval(this.simulator);
     if (this.maintenanceTimer) clearInterval(this.maintenanceTimer);
     if (this.snapshotTimer) clearTimeout(this.snapshotTimer);
+    if (this.storageReprobeTimer) clearTimeout(this.storageReprobeTimer);
     if (this.receiverHealthTimer) clearInterval(this.receiverHealthTimer);
     if (this.sessionContextTimer) clearTimeout(this.sessionContextTimer);
     if (this.evidence.currentSession) await this.checkpointSessionContext("service-stopping").catch(() => undefined);
     for (const client of this.clients) client.close();
     await this.baselineStore?.close().catch(() => undefined);
-    if (this.evidence.currentSession) await this.evidence.closeActive().catch(() => undefined);
+    if (this.evidence.currentSession) {
+      await this.evidence.closeActive().catch((error) => {
+        console.error(`Evidence session could not be closed cleanly; it will be reconciled as interrupted on next start: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }
     await this.domainLease?.release().catch(() => undefined);
     this.domainLease = undefined;
   }
@@ -1098,7 +1103,7 @@ export class MonitorService extends EventEmitter {
       return { ...common, eligible: false, state: "blocked", label: "Receiver offline", detail: "RF data is unavailable.", action: "Restore RF data." };
     }
     const writer = this.getWriterHealth();
-    if (!this.evidenceHealthy || this.storageMaintenance.pressure || writer.oldestAgeMs >= 2_000 || writer.queueItems >= 64 || writer.queueBytes >= 2 * 1024 * 1024) {
+    if (!this.evidenceHealthy || this.storageMaintenance.pressure || writer.oldestAgeMs >= 2_000 || writer.queueItems >= WRITER_ORDINARY_MAX_ITEMS || writer.queueBytes >= WRITER_ORDINARY_MAX_BYTES) {
       return { ...common, eligible: false, state: "blocked", label: "Recording issue", detail: "Current evidence recording is not healthy.", action: "Open Recording." };
     }
     if (this.resourceHealthState !== "normal" || this.hostMemoryPressureActive || this.applicationRecoveryActive || this.receiverRecoveryActive) {
@@ -1847,7 +1852,7 @@ export class MonitorService extends EventEmitter {
   async recordConfigurationAudit(entries: ConfigurationAuditEntry | ConfigurationAuditEntry[]): Promise<void> {
     if (!this.evidenceHealthy) return;
     for (const entry of Array.isArray(entries) ? entries : [entries]) {
-      await this.evidence.recordConfigurationAudit(entry).catch(() => this.markStorageError());
+      await this.evidence.recordConfigurationAudit(entry).catch((error) => this.markStorageError(error));
     }
   }
 
@@ -1877,7 +1882,7 @@ export class MonitorService extends EventEmitter {
         event.lifecycle = "ended-unknown";
         event.endedAt = interruptedAt;
         event.endReason = "RF configuration changed before ten clean observations";
-        if (this.evidenceHealthy) await this.persistEvent({ ...event }).catch(() => this.markStorageError());
+        if (this.evidenceHealthy) await this.persistEvent({ ...event }).catch((error) => this.markStorageError(error));
       }
       if (this.evidenceHealthy && (interruptedEvents.length || this.postClearUntilByTarget.size)) {
         await this.evidence.recordOperationalAction({
@@ -1885,7 +1890,7 @@ export class MonitorService extends EventEmitter {
           timestamp: interruptedAt,
           interruptedEventIds: interruptedEvents.map((event) => event.id),
           interruptedPostClearTargetIds: [...this.postClearUntilByTarget.keys()],
-        }).catch(() => this.markStorageError());
+        }).catch((error) => this.markStorageError(error));
       }
       if (this.evidence.currentSession) {
         await this.checkpointSessionContext("settings-change-closing");
@@ -2033,7 +2038,7 @@ export class MonitorService extends EventEmitter {
         targetId: target.id,
         revisitObjectiveMs: target.revisitObjectiveMs ?? target.dwellMs,
       })),
-    }).catch(() => this.markStorageError());
+    }).catch((error) => this.markStorageError(error));
     this.broadcastSnapshot();
     return { ...this.activeFocus };
   }
@@ -2045,7 +2050,7 @@ export class MonitorService extends EventEmitter {
     this.activeFocusEpoch = undefined;
     const assignment = this.assignments.find((candidate) => candidate.receiver === focus.receiver);
     this.sweepBuilders.clear();
-    if (this.evidenceHealthy) await this.evidence.recordOperationalAction({ type: "live-focus-stopped", focusId: focus.id, bandId: focus.bandId, timestamp: new Date().toISOString(), reason }).catch(() => this.markStorageError());
+    if (this.evidenceHealthy) await this.evidence.recordOperationalAction({ type: "live-focus-stopped", focusId: focus.id, bandId: focus.bandId, timestamp: new Date().toISOString(), reason }).catch((error) => this.markStorageError(error));
     if (assignment) this.scheduleAssignment(assignment);
     this.broadcastSnapshot();
   }
@@ -2055,7 +2060,7 @@ export class MonitorService extends EventEmitter {
     if (!event) return undefined;
     event.acknowledgedAt = new Date().toISOString();
     if (this.activeEvent?.id === eventId) this.activeEvent = event;
-    if (!event.syntheticExercise && this.evidenceHealthy) await this.persistEvent({ ...event }).catch(() => this.markStorageError());
+    if (!event.syntheticExercise && this.evidenceHealthy) await this.persistEvent({ ...event }).catch((error) => this.markStorageError(error));
     this.broadcastSnapshot();
     return event;
   }
@@ -2074,8 +2079,8 @@ export class MonitorService extends EventEmitter {
       ? currentSessionId
       : event.sessionId;
     if (!event.syntheticExercise && this.evidenceHealthy) {
-      await this.evidence.addNote(destinationSessionId, eventId, note.text).catch(() => this.markStorageError());
-      await this.persistEvent({ ...event }, destinationSessionId).catch(() => this.markStorageError());
+      await this.evidence.addNote(destinationSessionId, eventId, note.text).catch((error) => this.markStorageError(error));
+      await this.persistEvent({ ...event }, destinationSessionId).catch((error) => this.markStorageError(error));
     }
     this.broadcastSnapshot();
     return event;
@@ -2715,7 +2720,7 @@ export class MonitorService extends EventEmitter {
         dataDomain: this.config.dataDomain,
         visit: active.visit,
         syntheticExercise: marker,
-      }).catch(() => this.markStorageError());
+      }).catch((error) => this.markStorageError(error));
     }
     assignment.active = undefined;
     this.scheduleAssignment(assignment);
@@ -2751,7 +2756,7 @@ export class MonitorService extends EventEmitter {
         dataDomain: this.config.dataDomain,
         visit: active.visit,
         syntheticExercise: marker,
-      }).catch(() => this.markStorageError());
+      }).catch((error) => this.markStorageError(error));
     }
     assignment.active = undefined;
     this.syntheticExercise?.noteUnknown();
@@ -2830,7 +2835,7 @@ export class MonitorService extends EventEmitter {
         this.emitServiceError(error instanceof Error ? error.message : String(error));
       }
     }
-    if (this.evidenceHealthy) void this.evidence.recordOperationalAction({ type: "target-visit-unknown", visit: active.visit }).catch(() => this.markStorageError());
+    if (this.evidenceHealthy) void this.evidence.recordOperationalAction({ type: "target-visit-unknown", visit: active.visit }).catch((error) => this.markStorageError(error));
     this.broadcastSnapshot();
     this.scheduleAssignment(assignment);
   }
@@ -3117,7 +3122,7 @@ export class MonitorService extends EventEmitter {
     }
     if (assignment!.timer) clearTimeout(assignment!.timer);
     assignment!.active = undefined;
-    if (this.evidenceHealthy) void this.evidence.recordOperationalAction({ type: "target-visit-completed", visit: active!.visit }).catch(() => this.markStorageError());
+    if (this.evidenceHealthy) void this.evidence.recordOperationalAction({ type: "target-visit-completed", visit: active!.visit }).catch((error) => this.markStorageError(error));
     this.scheduleAssignment(assignment!);
   }
 
@@ -3410,7 +3415,7 @@ export class MonitorService extends EventEmitter {
         this.config.retentionPolicy.sessionMaxBytes,
         this.config.retentionPolicy.sessionMaxMs,
       )) void this.runStorageMaintenance();
-    }).catch(() => this.markStorageError()).finally(() => {
+    }).catch((error) => this.markStorageError(error)).finally(() => {
       this.evidenceWritesInFlight = Math.max(0, this.evidenceWritesInFlight - 1);
       this.evidenceWriteBytesInFlight = Math.max(0, this.evidenceWriteBytesInFlight - estimatedBytes);
       const startedIndex = this.evidenceWriteStartedAt.indexOf(writeStartedAt);
@@ -3447,7 +3452,7 @@ export class MonitorService extends EventEmitter {
     }))).then(() => {
       this.evidenceFramesRecorded += frames.length;
       this.evidenceWriteSamples.push({ at: Date.now(), bytes: estimatedBytes });
-    }).catch(() => this.markStorageError());
+    }).catch((error) => this.markStorageError(error));
   }
 
   private releasePrehistoryFreeze(receiverId: number, now: number): void {
@@ -3556,7 +3561,7 @@ export class MonitorService extends EventEmitter {
           if (!event.syntheticExercise) {
             this.postClearUntilByTarget.set(targetId, Date.parse(timestamp) + 10 * 60_000);
           }
-          if (this.evidenceHealthy) void this.persistEvent({ ...event }).catch(() => this.markStorageError());
+          if (this.evidenceHealthy) void this.persistEvent({ ...event }).catch((error) => this.markStorageError(error));
         }
         next = { ...this.clearTargetState(targetId), requiredCount, lastObservedAt: timestamp, clearedAt: timestamp, observationDisposition: "clean", baselineLifecycle: result.baseline.lifecycle };
       } else {
@@ -3593,7 +3598,7 @@ export class MonitorService extends EventEmitter {
     if (existing) {
       existing.lifecycle = "cleared";
       existing.clearedAt = candidate.startedAt;
-      if (this.evidenceHealthy) void this.persistEvent({ ...existing }).catch(() => this.markStorageError());
+      if (this.evidenceHealthy) void this.persistEvent({ ...existing }).catch((error) => this.markStorageError(error));
     }
     const event: DetectionEvent = {
       ...candidate,
@@ -3608,7 +3613,7 @@ export class MonitorService extends EventEmitter {
     this.activeEventsByTarget.set(targetId, event);
     this.events = [event, ...this.events].slice(0, 100);
     this.refreshActiveEvent();
-    if (this.evidenceHealthy) void this.persistEvent(event).catch(() => this.markStorageError());
+    if (this.evidenceHealthy) void this.persistEvent(event).catch((error) => this.markStorageError(error));
     return event;
   }
 
@@ -3725,7 +3730,7 @@ export class MonitorService extends EventEmitter {
     if (message.property === "api_version") { receiver.apiVersion = String(value ?? ""); receiver.apiReady = Boolean(receiver.apiVersion); }
     this.receiverMetrics.set(receiverId, metrics);
     if (!this.reconfiguring && this.evidenceHealthy && this.sdrMetadataGate.shouldRecord(receiverId, message)) {
-      void this.evidence.recordMetadata(receiverId, message).catch(() => this.markStorageError());
+      void this.evidence.recordMetadata(receiverId, message).catch((error) => this.markStorageError(error));
       if (this.sdrMetadataGate.shouldCheckpointContext(message)) this.scheduleSessionContextCheckpoint();
     }
   }
@@ -3919,7 +3924,7 @@ export class MonitorService extends EventEmitter {
     if (this.sessionContextTimer) clearTimeout(this.sessionContextTimer);
     this.sessionContextTimer = setTimeout(() => {
       this.sessionContextTimer = undefined;
-      void this.checkpointSessionContext("receiver-state-update").catch(() => this.markStorageError());
+      void this.checkpointSessionContext("receiver-state-update").catch((error) => this.markStorageError(error));
     }, 500);
     this.sessionContextTimer.unref();
   }
@@ -3937,8 +3942,25 @@ export class MonitorService extends EventEmitter {
     this.sessionList = await this.evidence.listSessions();
   }
 
-  private markStorageError(): void {
+  private lastStorageErrorLogAt = 0;
+  private storageReprobeTimer: NodeJS.Timeout | undefined;
+
+  private markStorageError(error?: unknown): void {
+    const now = Date.now();
+    if (now - this.lastStorageErrorLogAt >= 10_000) {
+      this.lastStorageErrorLogAt = now;
+      console.error(`Evidence write failed; recording marked unhealthy: ${error instanceof Error ? error.message : String(error ?? "unknown error")}`);
+    }
     this.evidenceHealthy = false;
+    // Writes stay off until a maintenance pass re-checks storage. After a failure, do that soon
+    // instead of waiting for the next scheduled pass, so a transient fault costs seconds, not minutes.
+    if (!this.storageReprobeTimer && !this.reconfiguring) {
+      this.storageReprobeTimer = setTimeout(() => {
+        this.storageReprobeTimer = undefined;
+        void this.runStorageMaintenance().catch(() => undefined);
+      }, 5_000);
+      this.storageReprobeTimer.unref();
+    }
     this.broadcastSnapshot();
   }
 

@@ -23,6 +23,7 @@ import {
   rm,
   stat,
   statfs,
+  truncate,
   unlink,
   writeFile,
 } from "node:fs/promises";
@@ -90,6 +91,8 @@ interface RawChunkState {
   relativePath: string;
   absolutePath: string;
   bytes: number;
+  /** A failed rollback left the file longer than `bytes`; the next frame must start a new part. */
+  poisoned?: boolean;
 }
 
 interface IncidentSliceSummary {
@@ -248,6 +251,12 @@ export const MAX_PREHISTORY_FRAMES = 240;
 export const EXPORT_PART_MAX_BYTES = 256 * 1024 * 1024;
 const MAX_WRITER_ITEMS = 64;
 const MAX_WRITER_BYTES = 2 * 1024 * 1024;
+/** Slice of the hard 64-item/2 MiB bound held back for session close and rotation. */
+const WRITER_CRITICAL_RESERVE_ITEMS = 4;
+const WRITER_CRITICAL_RESERVE_BYTES = 64 * 1024;
+/** Ordinary writes are refused at these levels; only close/rotate may use the reserve. */
+export const WRITER_ORDINARY_MAX_ITEMS = MAX_WRITER_ITEMS - WRITER_CRITICAL_RESERVE_ITEMS;
+export const WRITER_ORDINARY_MAX_BYTES = MAX_WRITER_BYTES - WRITER_CRITICAL_RESERVE_BYTES;
 const PREHISTORY_CHUNK_FRAMES = 32;
 const STALE_EXPORT_STAGING_MS = 24 * 60 * 60_000;
 export const MAX_FINALIZER_ITEMS = 8;
@@ -761,6 +770,7 @@ export class EvidenceStore {
       byteCount: Buffer.byteLength(configContents) + Buffer.byteLength(sdrconnectContents),
     };
     this.rawChunksByHour.clear();
+    this.frameIndexNeedsRepair = false;
     this.lastSessionCheckpointAt = Date.now();
     await Promise.all([
       writeAtomic(path.join(sessionPath, "config.json"), configContents),
@@ -781,7 +791,7 @@ export class EvidenceStore {
       const finalization = this.scheduleFinalization({ ...previous });
       if (!finalization) await this.markFinalizationRejected(previous);
       return { next };
-    }, 16 * 1024, "high");
+    }, 16 * 1024, "high", true);
     return rotation.next;
   }
 
@@ -796,7 +806,7 @@ export class EvidenceStore {
         return { session: { ...session } };
       }
       return { session: { ...session }, finalization };
-    }, 16 * 1024, "high");
+    }, 16 * 1024, "high", true);
     return transition.finalization ?? transition.session;
   }
 
@@ -2071,6 +2081,7 @@ export class EvidenceStore {
   private async appendFrame(frame: PersistedSpectrumFrame, summary: object): Promise<void> {
     const session = this.requireActive();
     this.validatePersistedFrame(frame);
+    await this.ensureFrameIndexClean(session);
     const raw = Buffer.from(frame.bins.buffer, frame.bins.byteOffset, frame.bins.byteLength);
     if (raw.byteLength > this.rawChunkMaxBytes) throw new Error(`Evidence frame exceeds the ${this.rawChunkMaxBytes}-byte raw chunk bound`);
     const chunk = this.rawChunkForFrame(session, frame.timestamp, raw.byteLength);
@@ -2084,10 +2095,22 @@ export class EvidenceStore {
       rawLength: raw.byteLength,
       rawEncoding: "uint8",
     })}\n`;
-    await appendFile(chunk.absolutePath, raw);
+    try {
+      await appendFile(chunk.absolutePath, raw);
+    } catch (error) {
+      // A short write (ENOSPC) leaves the file longer than chunk.bytes; the next frame's offset would
+      // then point into the middle of this one.
+      await this.rollbackRawAppends([{ chunk, bytes: rawOffset }]);
+      throw error;
+    }
     chunk.bytes += raw.byteLength;
     this.injectProcessKillFault("frame-after-raw-append", session.id);
-    await appendFile(path.join(session.path, "spectrum", "frames.jsonl"), jsonLine);
+    try {
+      await appendFile(path.join(session.path, "spectrum", "frames.jsonl"), jsonLine);
+    } catch (error) {
+      await this.repairFrameIndexTail(session);
+      throw error;
+    }
     this.injectProcessKillFault("frame-after-index-append", session.id);
     session.frameCount += 1;
     session.byteCount += raw.byteLength + Buffer.byteLength(jsonLine);
@@ -2106,7 +2129,10 @@ export class EvidenceStore {
       throw new Error(`Prehistory writer chunk must contain 1-${PREHISTORY_CHUNK_FRAMES} frames`);
     }
     const session = this.requireActive();
+    await this.ensureFrameIndexClean(session);
     const rawWrites = new Map<string, { absolutePath: string; buffers: Buffer[] }>();
+    // Length of every touched chunk before this batch, so a failed write can be undone exactly.
+    const priorBytes = new Map<RawChunkState, number>();
     const indexLines: string[] = [];
     let addedBytes = 0;
 
@@ -2118,6 +2144,7 @@ export class EvidenceStore {
       }
       const chunk = this.rawChunkForFrame(session, frame.timestamp, raw.byteLength);
       const rawOffset = chunk.bytes;
+      if (!priorBytes.has(chunk)) priorBytes.set(chunk, chunk.bytes);
       chunk.bytes += raw.byteLength;
       const write = rawWrites.get(chunk.relativePath) ?? { absolutePath: chunk.absolutePath, buffers: [] };
       write.buffers.push(raw);
@@ -2135,15 +2162,66 @@ export class EvidenceStore {
       addedBytes += raw.byteLength + Buffer.byteLength(jsonLine);
     }
 
-    for (const write of rawWrites.values()) {
-      await appendFile(write.absolutePath, Buffer.concat(write.buffers));
+    try {
+      for (const write of rawWrites.values()) {
+        await appendFile(write.absolutePath, Buffer.concat(write.buffers));
+      }
+    } catch (error) {
+      // chunk.bytes was advanced before the write; without this the recorded offsets of every later
+      // frame would run ahead of the real file.
+      await this.rollbackRawAppends([...priorBytes].map(([chunk, bytes]) => ({ chunk, bytes })));
+      throw error;
     }
     this.injectProcessKillFault("frame-after-raw-append", session.id);
-    await appendFile(path.join(session.path, "spectrum", "frames.jsonl"), indexLines.join(""));
+    try {
+      await appendFile(path.join(session.path, "spectrum", "frames.jsonl"), indexLines.join(""));
+    } catch (error) {
+      await this.repairFrameIndexTail(session);
+      throw error;
+    }
     this.injectProcessKillFault("frame-after-index-append", session.id);
     session.frameCount += items.length;
     session.byteCount += addedBytes;
     await this.checkpointSession(session);
+  }
+
+  /**
+   * Undo raw appends whose index lines were never written: restore each chunk's logical length and
+   * cut the file back to it. If the file cannot be cut, retire the chunk so no offset is ever
+   * computed from a length that disagrees with the file.
+   */
+  private async rollbackRawAppends(items: ReadonlyArray<{ chunk: RawChunkState; bytes: number }>): Promise<void> {
+    for (const { chunk, bytes } of items) {
+      chunk.bytes = bytes;
+      try {
+        await truncate(chunk.absolutePath, bytes);
+      } catch (error) {
+        // A chunk that was never created has nothing to cut.
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") chunk.poisoned = true;
+      }
+    }
+  }
+
+  private frameIndexNeedsRepair = false;
+
+  /**
+   * A failed index append can leave a torn line; the next append would join onto it. Preserve and cut
+   * the torn bytes now, using the same reconciliation as crash recovery. If that fails too, refuse
+   * further frames until a later repair succeeds.
+   */
+  private async repairFrameIndexTail(session: EvidenceSession): Promise<void> {
+    try {
+      await this.reconcileInterruptedJsonlTail(session, "spectrum/frames.jsonl", new Date().toISOString());
+      this.frameIndexNeedsRepair = false;
+    } catch {
+      this.frameIndexNeedsRepair = true;
+    }
+  }
+
+  private async ensureFrameIndexClean(session: EvidenceSession): Promise<void> {
+    if (!this.frameIndexNeedsRepair) return;
+    await this.repairFrameIndexTail(session);
+    if (this.frameIndexNeedsRepair) throw new Error("Evidence frame index has an unrepaired torn tail; frames are refused until it is repaired");
   }
 
   private validatePersistedFrame(frame: SpectrumFrame): asserts frame is PersistedSpectrumFrame {
@@ -2207,7 +2285,7 @@ export class EvidenceStore {
     if (!Number.isFinite(at)) throw new Error("Evidence frame timestamp is invalid");
     const hour = new Date(at).toISOString().slice(0, 13);
     let chunk = this.rawChunksByHour.get(hour);
-    if (!chunk || chunk.bytes + rawLength > this.rawChunkMaxBytes) {
+    if (!chunk || chunk.poisoned || chunk.bytes + rawLength > this.rawChunkMaxBytes) {
       const part = (chunk?.part ?? 0) + 1;
       const rawName = `frames-${safeTimestamp(hour)}-part-${String(part).padStart(3, "0")}.bin`;
       const relativePath = path.posix.join("spectrum", "raw", rawName);
@@ -3316,12 +3394,18 @@ export class EvidenceStore {
     await appendFile(logPath, line);
   }
 
-  private enqueue<T>(operation: () => Promise<T>, estimatedBytes = 4 * 1024, priority: WriterPriority = "normal"): Promise<T> {
+  /**
+   * `critical` jobs (closing or rotating the session) may use the reserved slice of the bound, so a
+   * saturated queue cannot stop the service from closing its evidence. The overall bound is unchanged.
+   */
+  private enqueue<T>(operation: () => Promise<T>, estimatedBytes = 4 * 1024, priority: WriterPriority = "normal", critical = false): Promise<T> {
     if (!Number.isSafeInteger(estimatedBytes) || estimatedBytes <= 0 || estimatedBytes > MAX_WRITER_BYTES) {
       return Promise.reject(new Error(`Evidence writer job must be between 1 byte and ${MAX_WRITER_BYTES} bytes`));
     }
     const health = this.getWriterHealth();
-    if (health.queueItems >= MAX_WRITER_ITEMS || health.queueBytes + estimatedBytes > MAX_WRITER_BYTES) {
+    const itemLimit = critical ? MAX_WRITER_ITEMS : WRITER_ORDINARY_MAX_ITEMS;
+    const byteLimit = critical ? MAX_WRITER_BYTES : WRITER_ORDINARY_MAX_BYTES;
+    if (health.queueItems >= itemLimit || health.queueBytes + estimatedBytes > byteLimit) {
       return Promise.reject(new Error("Evidence writer queue reached its 64-item/2 MiB resource bound"));
     }
     return new Promise<T>((resolve, reject) => {

@@ -21,7 +21,7 @@ import { HostMemoryController } from "./hostMemory";
 import { RevisionConflictError, SettingsStore } from "./settingsStore";
 import { BaselineConflictError, BaselineNotReviewableError } from "./baselineStore";
 import { ExportJobQueue, ExportProtectedBytesError, ExportQueueFullError } from "./exportJobQueue";
-import { EvidenceExportSourceError } from "./evidenceStore";
+import { EvidenceExportSourceError, WRITER_ORDINARY_MAX_BYTES, WRITER_ORDINARY_MAX_ITEMS } from "./evidenceStore";
 import { EvidencePlaybackError, EvidencePlaybackReader } from "./evidencePlayback";
 import {
   MAX_SCREENSHOT_PNG_BYTES,
@@ -562,8 +562,8 @@ function authoritativeSnapshot(
   const recordingState = !source.evidenceHealthy
     || source.storagePolicy.pressure
     || writer.oldestAgeMs >= 2_000
-    || writer.queueItems >= 64
-    || writer.queueBytes >= 2 * 1024 * 1024
+    || writer.queueItems >= WRITER_ORDINARY_MAX_ITEMS
+    || writer.queueBytes >= WRITER_ORDINARY_MAX_BYTES
     ? "error" as const
     : activeRecording
       ? "recording" as const
