@@ -19,7 +19,7 @@ The installer checks and installs the rest for you. These are the **prerequisite
 | --- | --- |
 | Node.js 20 or newer (runs RF Monitor) | Installer, automatically |
 | SDRplay API (the receiver driver) | **You**, from sdrplay.com. The installer opens the page and waits. |
-| SDRconnect (SDRplay's receiver software) | **You**, from sdrplay.com. The installer opens the page and waits. |
+| SDRconnect (SDRplay's receiver software) | **You**, from [sdrplay.com/sdrconnect](https://sdrplay.com/sdrconnect/#). The installer opens the page and waits. |
 
 ## Step 1 - Download RF Monitor
 
@@ -52,7 +52,7 @@ Expected result: lines starting with **OK** (good), **NOTE** (fine, read it) or 
 | 2 | Turns on the clock service and turns off sleep | Nothing |
 | 3 | Installs **Node.js** if missing | Nothing. If the automatic install fails, a web page opens: download the **LTS** `.msi`, run it, accept defaults, press Enter in the installer window. |
 | 4 | **SDRplay API** | A web page opens. Under Windows, download the API installer, run it, accept defaults, then press Enter in the installer window. |
-| 5 | **SDRconnect** and the receiver | Same: download, run, accept defaults, press Enter. Then plug in the RSPdx (USB 3, no hub) when asked. |
+| 5 | **SDRconnect** and the receiver | Same: [download SDRconnect](https://sdrplay.com/sdrconnect/#) (Windows x64), run it, accept defaults, press Enter. Then plug in the RSPdx (USB 3, no hub) when asked. |
 | 6 | Copies and builds RF Monitor (2-5 min) | Wait. Many lines scroll past; this is normal. |
 | 7 | Settings and start-up | Choose a **Settings password** (12-128 characters) and type it twice. Write it down. |
 | 8 | Starts RF Monitor and checks it | Wait up to 60 seconds |
