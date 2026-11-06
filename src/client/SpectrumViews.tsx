@@ -1,6 +1,6 @@
-import { memo, useEffect, useRef } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useRef } from "react";
 import type { SignalMetricSample, SpectrumFrame } from "../shared/types";
-import { waterfallColor } from "./waterfallRaster";
+import { buildWaterfallPalette, composeWaterfall, rasterizeRow, waterfallColor } from "./waterfallRaster";
 import { detectorAnalysisForFrame, detectorAnomalyRanges, detectorBaselineAvailable } from "./detectorPresentation";
 
 export interface ViewRange { startHz: number; endHz: number }
@@ -108,15 +108,38 @@ function fitCanvas(canvas: HTMLCanvasElement): CanvasRenderingContext2D | undefi
   return context;
 }
 
+/**
+ * One ResizeObserver per canvas for its whole life; the latest draw closure is held in a ref,
+ * and any number of triggers in one animation frame cost a single draw.
+ */
 function useRedraw(canvasRef: React.RefObject<HTMLCanvasElement | null>, draw: () => void): void {
+  const drawRef = useRef(draw);
+  const pendingFrame = useRef(0);
+  useLayoutEffect(() => {
+    drawRef.current = draw;
+  });
+  const schedule = useCallback(() => {
+    if (pendingFrame.current) return;
+    pendingFrame.current = requestAnimationFrame(() => {
+      pendingFrame.current = 0;
+      drawRef.current();
+    });
+  }, []);
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const observer = new ResizeObserver(draw);
+    const observer = new ResizeObserver(schedule);
     observer.observe(canvas);
-    draw();
-    return () => observer.disconnect();
-  }, [canvasRef, draw]);
+    return () => {
+      observer.disconnect();
+      cancelAnimationFrame(pendingFrame.current);
+      pendingFrame.current = 0;
+    };
+  }, [canvasRef, schedule]);
+  // Every render means new props (the components are memoised): redraw once, coalesced.
+  useEffect(() => {
+    schedule();
+  });
 }
 
 export const SpectrumView = memo(function SpectrumView({
@@ -406,8 +429,18 @@ export function waterfallTimeMarkers(input: {
   return markers;
 }
 
+interface WaterfallTexture {
+  surface: HTMLCanvasElement;
+  width: number;
+  rows: number;
+  pixels: Uint32Array;
+  image: ImageData;
+}
+
 export const WaterfallView = memo(function WaterfallView({ frames, frequencyGuides = [], view }: { frames: SpectrumFrame[]; frequencyGuides?: ReadonlyArray<{ frequencyHz: number; label: string }>; view?: ViewRange }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const rowCache = useRef(new WeakMap<SpectrumFrame, { key: string; row: Uint32Array }>());
+  const textureRef = useRef<WaterfallTexture | undefined>(undefined);
   const timeMarkers = waterfallTimeMarkers({ frames, nowMs: Date.now() });
   const draw = () => {
     const canvas = canvasRef.current;
@@ -424,30 +457,54 @@ export const WaterfallView = memo(function WaterfallView({ frames, frequencyGuid
       context.fillText("No scan history", width / 2, height / 2);
       return;
     }
-    const newestFirst = [...frames].reverse();
-    const rowHeight = Math.max(1, height / Math.max(24, newestFirst.length));
-    newestFirst.forEach((frame, row) => {
-      const bins = frame.bins;
-      // History frames can carry a different tune than the current one, so each gets its own window.
-      const frameWindow = visibleBinWindow({ binCount: bins.length, startHz: frame.startHz, endHz: frame.endHz, view });
-      const visibleBins = Math.min(Math.ceil(width), frameWindow.endBin - frameWindow.startBin);
-      for (let column = 0; column < visibleBins; column += 1) {
-        const sourceIndex = frameWindow.startBin + Math.min(frameWindow.endBin - frameWindow.startBin - 1, Math.floor((column / visibleBins) * (frameWindow.endBin - frameWindow.startBin)));
-        const x = (column / visibleBins) * width;
-        context.fillStyle = waterfallColor(bins[sourceIndex]);
-        context.fillRect(x, row * rowHeight, width / visibleBins + 1, rowHeight + 0.5);
+    const rowCapacity = Math.max(24, frames.length);
+    const rowHeight = Math.max(1, height / rowCapacity);
+    // Rows are rasterised once per frame and geometry, then composed into one texture.
+    const textureWidth = Math.max(1, Math.min(canvas.width, 2048));
+    const palette = buildWaterfallPalette();
+    const rows: Uint32Array[] = [];
+    for (let index = frames.length - 1; index >= 0; index -= 1) {
+      const frame = frames[index];
+      const frameWindow = visibleBinWindow({ binCount: frame.bins.length, startHz: frame.startHz, endHz: frame.endHz, view });
+      const key = `${textureWidth}|${frameWindow.startBin}|${frameWindow.endBin}`;
+      let entry = rowCache.current.get(frame);
+      if (!entry || entry.key !== key) {
+        entry = {
+          key,
+          row: rasterizeRow({
+            bins: frame.bins,
+            startBin: frameWindow.startBin,
+            endBin: frameWindow.endBin,
+            widthPx: textureWidth,
+            anomalyRanges: detectorAnomalyRanges(frame),
+            palette,
+            hatch: true,
+          }),
+        };
+        rowCache.current.set(frame, entry);
       }
-      context.fillStyle = "rgba(227, 22, 22, 0.32)";
-      for (const range of detectorAnomalyRanges(frame)) {
-        if (range.endBin <= frameWindow.startBin || range.startBin >= frameWindow.endBin) continue;
-        const clippedStart = Math.max(range.startBin, frameWindow.startBin);
-        const clippedEnd = Math.min(range.endBin, frameWindow.endBin);
-        const startX = ((clippedStart - frameWindow.startBin) / Math.max(1, frameWindow.endBin - frameWindow.startBin)) * width;
-        const endX = ((clippedEnd - frameWindow.startBin) / Math.max(1, frameWindow.endBin - frameWindow.startBin)) * width;
-        context.fillRect(startX, row * rowHeight, Math.max(1, endX - startX), rowHeight + 0.5);
-      }
-    });
-    const guideFrame = newestFirst[0];
+      rows.push(entry.row);
+    }
+    let texture = textureRef.current;
+    if (!texture || texture.width !== textureWidth || texture.rows !== rowCapacity) {
+      const surface = document.createElement("canvas");
+      surface.width = textureWidth;
+      surface.height = rowCapacity;
+      const pixels = new Uint32Array(textureWidth * rowCapacity);
+      texture = {
+        surface,
+        width: textureWidth,
+        rows: rowCapacity,
+        pixels,
+        image: new ImageData(new Uint8ClampedArray(pixels.buffer), textureWidth, rowCapacity),
+      };
+      textureRef.current = texture;
+    }
+    composeWaterfall(rows, textureWidth, rowCapacity, palette, texture.pixels);
+    texture.surface.getContext("2d")?.putImageData(texture.image, 0, 0);
+    context.imageSmoothingEnabled = false;
+    context.drawImage(texture.surface, 0, 0, textureWidth, rowCapacity, 0, 0, width, height);
+    const guideFrame = frames[frames.length - 1];
     if (guideFrame?.bins.length) {
       const guideWindow = visibleBinWindow({ binCount: guideFrame.bins.length, startHz: guideFrame.startHz, endHz: guideFrame.endHz, view });
       const analysisStartRatio = Math.max(0, Math.min(1, ((guideFrame.analysisStartBin ?? 0) - guideWindow.startBin) / Math.max(1, guideWindow.endBin - guideWindow.startBin)));
