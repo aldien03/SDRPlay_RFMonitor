@@ -8,6 +8,10 @@ import { afterEach, describe, expect, it } from "vitest";
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const execFile = promisify(execFileCallback);
+// Ubuntu 24.04 can block unprivileged user namespaces by policy
+// (kernel.apparmor_restrict_unprivileged_userns=1). That is a host restriction,
+// not a support-bundle fault, so the isolation test reports itself as skipped.
+const userNamespacesAvailable = await execFile("/usr/bin/unshare", ["-Ur", "/bin/true"]).then(() => true, () => false);
 const modulePath = path.join(repositoryRoot, "deploy/ops-supervisor.mjs");
 const ops = await import(pathToFileURL(modulePath).href) as {
   MAX_RECORD_BYTES: number;
@@ -442,7 +446,7 @@ describe("shipped supervision policy", () => {
     expect(support).not.toMatch(/journalctl .*--no-pager\s*$/m);
   });
 
-  it("creates a bounded redacted bundle in an isolated user namespace", async () => {
+  it.skipIf(!userNamespacesAvailable)("creates a bounded redacted bundle in an isolated user namespace", async () => {
     const root = await temporaryRoot("support-bundle");
     const output = path.join(root, "output");
     const install = path.join(root, "install");

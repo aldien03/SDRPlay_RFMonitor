@@ -3130,8 +3130,13 @@ export class MonitorService extends EventEmitter {
       this.completeUnknownVisit(assignment!, outcome.reason);
       return;
     }
+    const referenceBaseline = this.persistentBaselineReference(outcome.observation.fingerprint, true);
+    // Learning accepts a pending, non-alerting candidate as local site
+    // conditions; a protected baseline stays frozen while one is pending.
+    const acceptCandidates = referenceBaseline?.descriptor.lifecycle !== undefined
+      && referenceBaseline.descriptor.lifecycle !== "protected";
     const freezeTraining = this.activeEventsByTarget.has(targetId)
-      || this.prehistoryCandidateTargets.has(targetId)
+      || (this.prehistoryCandidateTargets.has(targetId) && !acceptCandidates)
       || receiverMetric.overload
       || this.resourcePressureActive
       || this.applicationRecoveryActive
@@ -3140,7 +3145,8 @@ export class MonitorService extends EventEmitter {
       || !this.evidenceHealthy;
     const result = this.detector.analyzeObservation(outcome.observation, band, {
       freezeTraining,
-      referenceBaseline: this.persistentBaselineReference(outcome.observation.fingerprint, true),
+      acceptCandidates,
+      referenceBaseline,
       requireReferenceBaseline: true,
     });
     frame.detectorAnalysis = projectDetectorAnalysisToFrame({

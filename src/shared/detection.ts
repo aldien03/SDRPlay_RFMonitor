@@ -374,6 +374,12 @@ export class DetectionEngine {
     referenceBaseline?: DetectionBaselineReference;
     /** Production monitoring fails closed if the persistent exact reference is unavailable. */
     requireReferenceBaseline?: boolean;
+    /**
+     * While a local reference is still being learned, a non-alerting,
+     * non-overload candidate is treated as part of the site's conditions and
+     * may be trained on. Alerts, overload and protected baselines are unaffected.
+     */
+    acceptCandidates?: boolean;
   } = {}): DetectionResult {
     if (observation.dataDomain !== observation.fingerprint.dataDomain) {
       throw new Error("Observation and baseline fingerprint cross a data-domain boundary");
@@ -510,7 +516,8 @@ export class DetectionEngine {
         this.deriveRobustBaseline(state);
         const features = this.features(observation, state);
         metrics = this.metrics(observation, state, features);
-        trainingEligible = this.classify(features, observation.overload) === undefined;
+        const bootstrapKind = this.classify(features, observation.overload);
+        trainingEligible = bootstrapKind === undefined || (Boolean(options.acceptCandidates) && bootstrapKind !== "overload");
         if (!trainingEligible) this.invalidateHourBucket(state, observation);
       }
       if (trainingEligible) this.addReservoirObservation(state, observation.bins);
@@ -543,7 +550,6 @@ export class DetectionEngine {
       ? this.features(observation, externalState).medianZ
       : undefined;
     const kind = this.classify(features, observation.overload, protectedMedianZ);
-    if (kind) this.invalidateHourBucket(state, observation);
     if (state.votes.at(-1) && observedAtMs - state.votes.at(-1)!.observedAtMs > MAX_CANDIDATE_GAP_MS) state.votes = [];
     state.votes.push({ kind, exposureMs: observation.exposureMs, observedAtMs });
     state.votes = state.votes.slice(-this.thresholds.interferenceWindow);
@@ -567,7 +573,9 @@ export class DetectionEngine {
           ? matchingVotes.length >= this.thresholds.interferenceHits
           : matchingVotes.length >= this.thresholds.interferenceHits && exposureMs >= this.thresholds.interferenceExposureMs;
 
-    const trainingEligible = !kind && !observation.overload && !options.freezeTraining;
+    const acceptedCandidate = Boolean(options.acceptCandidates) && kind !== undefined && kind !== "overload" && !alertEligible;
+    if (kind && !acceptedCandidate) this.invalidateHourBucket(state, observation);
+    const trainingEligible = (!kind || acceptedCandidate) && !observation.overload && !options.freezeTraining;
     if (trainingEligible && (!externalExact || external!.descriptor.lifecycle === "protected")) {
       this.addReservoirObservation(state, observation.bins);
     }

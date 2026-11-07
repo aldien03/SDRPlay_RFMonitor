@@ -811,7 +811,7 @@ describe("bounded monitor runtime", () => {
     await monitor.stop();
   });
 
-  it("keeps quarantined learning observations out of the persisted baseline", async () => {
+  it("accepts non-alerting candidates into the learning baseline", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-20T12:00:00.000Z"));
     const config = enableSingleRadioTarget(await temporaryConfig("baseline-quarantine"));
@@ -835,26 +835,17 @@ describe("bounded monitor runtime", () => {
     for (let index = 0; index < 8; index += 1) await completeVisit(quiet);
     expect(monitor.getBaselineStates()[0]).toMatchObject({ lifecycle: "learning", observationCount: 8 });
 
+    // Unprotected learning treats a pending, non-alerting candidate as local
+    // site conditions, so these visits train instead of being quarantined.
     for (let index = 0; index < 12; index += 1) await completeVisit(elevated);
     expect(monitor.getBaselineStates()[0]).toMatchObject({
       lifecycle: "learning",
-      observationCount: 8,
-      learningExclusions: {
-        rejectedVisits: 12,
-        rejectedByReason: { "anomaly-candidate": 12 },
-        disqualifiedHours: 0,
-      },
+      observationCount: 20,
+      learningExclusions: { rejectedVisits: 0, disqualifiedHours: 0 },
     });
 
     await completeVisit(quiet);
-    // The first quiet visit releases the candidate freeze but is not allowed
-    // to train retroactively while that freeze was active.
-    expect(monitor.getBaselineStates()[0]).toMatchObject({
-      observationCount: 8,
-      learningExclusions: { rejectedVisits: 13, disqualifiedHours: 0 },
-    });
-    await completeVisit(quiet);
-    expect(monitor.getBaselineStates()[0].observationCount).toBe(9);
+    expect(monitor.getBaselineStates()[0].observationCount).toBeGreaterThan(20);
     await monitor.stop();
   });
 
