@@ -32,7 +32,7 @@ import os from "node:os";
 import { assertRfOnlyDetectionClaim } from "../shared/productContract";
 import { createInterface } from "node:readline";
 import { pipeline } from "node:stream/promises";
-import archiver from "archiver";
+import { ZipArchive } from "archiver";
 import type {
   DetectionEvent,
   EvidenceManifest,
@@ -1919,7 +1919,7 @@ export class EvidenceStore {
     try {
       await new Promise<void>((resolve, reject) => {
         const output = createWriteStream(partialPath, { flags: "wx", mode: 0o640 });
-        const archive = archiver("zip", { store: true });
+        const archive = new ZipArchive({ store: true });
         let settled = false;
         const fail = (error: Error) => {
           if (settled) return;
