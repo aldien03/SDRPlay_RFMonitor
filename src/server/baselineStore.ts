@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { copyFile, mkdir, open, readFile, rename, stat, unlink } from "node:fs/promises";
 import path from "node:path";
 import type { DataDomain } from "../shared/types";
@@ -341,7 +341,7 @@ async function writeAtomic(
   injectFault?: BaselineStoreOptions["injectAtomicWriteFault"],
 ): Promise<void> {
   await mkdir(path.dirname(filePath), { recursive: true });
-  const temporary = `${filePath}.partial-${process.pid}-${Date.now()}`;
+  const temporary = `${filePath}.partial-${process.pid}-${randomUUID()}`;
   const handle = await open(temporary, "wx", 0o640);
   try {
     await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");

@@ -1873,15 +1873,26 @@ function sendFrame(socket: WebSocket, state: LiveClientState, message: Extract<S
   }
 }
 
+const pendingFrameByteEstimates = new WeakMap<object, number>();
+
+/**
+ * Bytes a queued frame is charged against the per-client budget. The estimate
+ * is requested at enqueue, dequeue and drop for the same message object, so it
+ * is computed once per message rather than serialising the metadata each time.
+ */
 function estimatePendingFrameBytes(message: Extract<ServiceMessage, { type: "frame" }>): number {
+  const cached = pendingFrameByteEstimates.get(message);
+  if (cached !== undefined) return cached;
   const { bins, ...frame } = message.payload.frame;
-  return bins.byteLength + 6 + Buffer.byteLength(JSON.stringify({
+  const bytes = bins.byteLength + 6 + Buffer.byteLength(JSON.stringify({
     frame,
     metrics: message.payload.metrics,
     event: message.payload.event,
     targetState: message.payload.targetState,
     feedId: message.payload.feedId,
   }));
+  pendingFrameByteEstimates.set(message, bytes);
+  return bytes;
 }
 
 function schedulePendingFrame(socket: WebSocket, state: LiveClientState): void {

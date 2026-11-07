@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -355,11 +355,13 @@ describe("fail-closed persistence", () => {
     await files.store.flush();
     const persistedBefore = await readFile(files.filePath, "utf8");
 
-    const failedWriteAt = Date.UTC(2026, 7, 23, 12, 30, 0);
-    await mkdir(`${files.filePath}.partial-${process.pid}-${failedWriteAt}`);
-    vi.spyOn(Date, "now").mockReturnValue(failedWriteAt);
-
-    await expect(files.store.restartAndFlush(key, first.generation)).rejects.toMatchObject({ code: "EEXIST" });
+    // Make the temp-file create fail: the state directory is read-only.
+    await chmod(path.dirname(files.filePath), 0o500);
+    try {
+      await expect(files.store.restartAndFlush(key, first.generation)).rejects.toMatchObject({ code: "EACCES" });
+    } finally {
+      await chmod(path.dirname(files.filePath), 0o700);
+    }
 
     const selected = files.store.resolve(key);
     expect(selected).toMatchObject({ lifecycle: "learning", baseline: { generation: first.generation, reservoirCount: 1 } });

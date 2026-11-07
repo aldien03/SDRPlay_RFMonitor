@@ -68,7 +68,16 @@ function parseCookie(header: string | undefined): Record<string, string> {
   return Object.fromEntries(header.split(";").flatMap((part) => {
     const separator = part.indexOf("=");
     if (separator < 1) return [];
-    return [[part.slice(0, separator).trim(), decodeURIComponent(part.slice(separator + 1).trim())]];
+    const raw = part.slice(separator + 1).trim();
+    let value = raw;
+    try {
+      value = decodeURIComponent(raw);
+    } catch {
+      // A malformed escape from any client must read as "no usable cookie",
+      // not throw out of the request handler.
+      return [];
+    }
+    return [[part.slice(0, separator).trim(), value]];
   }));
 }
 
@@ -91,6 +100,11 @@ export class AdminAuth {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return new AdminAuth(undefined, sessionMs);
       throw new Error(`Settings administrator file is invalid: ${error instanceof Error ? error.message : String(error)}`);
     }
+  }
+
+  /** Drop expired sessions so abandoned unlocks cannot accumulate for the life of the process. */
+  private pruneSessions(now: number): void {
+    for (const [id, record] of this.sessions) if (record.expiresAt <= now) this.sessions.delete(id);
   }
 
   get available(): boolean {
@@ -134,6 +148,7 @@ export class AdminAuth {
       this.failures.delete(ip);
       const id = randomBytes(32).toString("base64url");
       const expiresAt = Date.now() + this.sessionMs;
+      this.pruneSessions(Date.now());
       this.sessions.set(id, { ip, expiresAt });
       return { cookie: this.signedToken(id), expiresAt: new Date(expiresAt).toISOString() };
     } finally {
