@@ -377,3 +377,25 @@ When **Settings > Recording > Incident images** is on (the default), RF Monitor 
 Each save writes `incident-figures/<incident>/<UTC time>-<start|progress|end|final>.svg`, `.png` and `-analysis.svg` inside the evidence folder of the active data domain (Field or Test; simulation incidents never produce images). In **Evidence History**, **Image** and **Analysis** links open the newest saved overview and analysis charts of an incident.
 
 Cleanup is automatic. Images older than **Delete images after** (1 to 365 days, default 30) are deleted by the regular storage maintenance, even when saving has been switched off. Independently of that setting, no more than 400 images are kept: the oldest go first. Only files this feature wrote are ever deleted. Images are skipped while the host is under memory or resource pressure, and a failure to draw one never affects monitoring or evidence health. Deleting an image does not touch the recorded evidence, and an incident package exported later still contains its own figure.
+
+### Reading incident images and reports from a folder
+
+The evidence store (`/var/lib/rf-monitor/...`) is private to the `rfmonitor` service account on purpose: the same account can read the protected Settings secret, so nobody should be added to that group. People who only need the incident images and reports use one of these:
+
+- **The dashboard.** Evidence History opens the newest **Image** and **Analysis** of an incident and downloads full evidence packages. No file permissions are involved.
+- **A separate share folder**, for people who work from a file manager. Set it up once:
+
+  ```
+  sudo rf-monitor share-evidence --dry-run                  # show the plan, change nothing
+  sudo rf-monitor share-evidence                            # prepare the default folder
+  sudo rf-monitor share-evidence --folder /ABSOLUTE/PATH    # or choose another place
+  sudo rf-monitor share-evidence --source /ABSOLUTE/BUILT/SOURCE   # also run the deploy that applies it
+  ```
+
+  - The default folder is `/srv/rf-monitor-evidence`. It must be an ordinary folder outside the evidence store, home folders and system directories (`/home`, `/root`, `/tmp`, `/etc`, `/opt`, ...). The service runs with `ProtectHome` and a strict file system, so it cannot write into a home folder, and this command does not weaken that.
+  - The command creates the group `rf-evidence-readers`, adds your user to it (never to `rfmonitor`), creates the folder with mode `2750`, and puts a link named `RF-Monitor-Evidence` in your `~/Documents`. You must log out and back in once for the group to apply.
+  - It records `RF_MONITOR_SHARE_DIR` in `/etc/rf-monitor.env`. A release deploy (`sudo rf-monitor deploy-release /ABSOLUTE/BUILT/SOURCE`) then adds the folder to the service's writable paths and restarts RF Monitor briefly.
+  - For Field incidents the share receives, next to the copy in the evidence store, `<UTC time>-<start|progress|end|final>.svg`, `.png`, `-analysis.svg` and `-report.html` in one folder per incident. Test and simulation data never reach the share. The folder is also cleaned by the **Delete images after** setting and the 400-file cap. Anything else you put in it is never deleted.
+  - A missing or unwritable share never affects monitoring or the evidence store; a warning is logged at most once every ten minutes.
+  - Full evidence packages are not copied automatically: they can only be built from a Complete session, and the open session closes on rotation. Download them from Evidence History when needed.
+  - `sudo rf-monitor share-evidence --stop` switches the copying off and keeps the files already there.

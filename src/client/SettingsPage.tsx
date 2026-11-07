@@ -961,7 +961,7 @@ function EvidenceSettings({ draft, setDraft, response, errors, disabled, dataDom
       </div>
       <p className="protected-action-hint">Each image is time stamped and saved when an incident starts, while it lasts, and when it ends. Older images are deleted automatically.</p>
       {Object.entries(errors).filter(([key]) => key.startsWith("retention.")).map(([key, text]) => <FieldError key={key} text={text} />)}
-      <div className="read-only-grid"><span>Archive path</span><strong>{response.infrastructure.storageRoot}</strong><span>Current policy</span><strong>{formatBytes(response.settings.retention.storageMaxBytes)} maximum</strong></div>
+      <div className="read-only-grid"><span>Archive path</span><strong>{response.infrastructure.storageRoot}</strong><span>Current policy</span><strong>{formatBytes(response.settings.retention.storageMaxBytes)} maximum</strong><span>Image share folder</span><strong>{response.infrastructure.shareDirectory ?? "Not set up (sudo rf-monitor share-evidence)"}</strong></div>
       <section className="protected-actions" aria-labelledby="recording-actions-title">
         <header><strong id="recording-actions-title">Protected data actions</strong><span>{disabled ? "Unlock to use" : dataDomain === "field" ? "Field monitoring" : "Simulation / Test"}</span></header>
         <div className="protected-action-row">

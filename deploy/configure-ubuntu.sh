@@ -280,6 +280,8 @@ temporary_config="$(mktemp "${CONFIG_FILE}.XXXXXX")"
   printf 'SDRCONNECT_SAMPLE_RATE_HZ=%s\n' "${SDR_SAMPLE_RATE}"
   printf 'SDRCONNECT_DEVICE_INDEX=%s\n' "${SDR_DEVICE_INDEX}"
   printf 'SDRCONNECT_TLS_REJECT_UNAUTHORIZED=true\n'
+  existing_share_dir="$(read_env_value RF_MONITOR_SHARE_DIR "")"
+  [[ -n "${existing_share_dir}" ]] && printf 'RF_MONITOR_SHARE_DIR=%s\n' "$(quote_value "${existing_share_dir}")"
   existing_ca="$(read_env_value NODE_EXTRA_CA_CERTS "")"
   [[ -n "${existing_ca}" ]] && printf 'NODE_EXTRA_CA_CERTS=%s\n' "$(quote_value "${existing_ca}")"
   existing_origins="$(read_env_value RF_MONITOR_ALLOWED_ORIGINS "")"
@@ -313,6 +315,12 @@ if [[ "${DEFER_APPLICATION_ACTIVATION}" != "true" ]]; then
     -e "s|@@STORAGE_DIR@@|$(sed_value "${STORAGE_DIR}")|g" \
     -e "s|@@RUNTIME_CONFIG_DIR@@|$(sed_value "${RUNTIME_CONFIG_DIR}")|g" \
     "${SERVICE_TEMPLATE}" > "${SERVICE_FILE}"
+  # The optional evidence share folder is writable too. The leading "-" keeps the service starting if
+  # the folder is missing. Same rule as deploy/release-manager.mjs.
+  existing_share="$(read_env_value RF_MONITOR_SHARE_DIR "")"
+  if [[ -n "${existing_share}" && "${existing_share}" =~ ^/[A-Za-z0-9._@/+-]+$ ]]; then
+    sed -i -e "s|^\(ReadWritePaths=.*\)\$|\1 -$(sed_value "${existing_share}")|" "${SERVICE_FILE}"
+  fi
   chmod 0644 "${SERVICE_FILE}"
 fi
 

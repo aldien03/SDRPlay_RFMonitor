@@ -481,6 +481,48 @@ describe("evidence store", { timeout: 60_000 }, () => {
     expect(await store.pruneIncidentFigures(0, now)).toEqual({ removedFiles: 0, keptFiles: 0 });
   });
 
+  it("copies each saved incident picture and a report to the share folder, and prunes the share by age", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "rf-monitor-share-store-"));
+    const share = await mkdtemp(path.join(os.tmpdir(), "rf-monitor-share-folder-"));
+    temporaryRoots.push(root, share);
+    const store = new EvidenceStore(root, { shareDirectory: share });
+    const session = await store.initialize({ config: {}, sdrconnect: {} });
+    await store.recordFrame(frame(), {});
+    const incident = event(session.id);
+    await store.recordEvent(incident);
+
+    await store.saveIncidentFigureSnapshot(incident, { reason: "end", now: Date.parse("2026-11-07T06:30:12.000Z") });
+    const copied = (await readdir(path.join(share, incident.id))).sort();
+    expect(copied).toEqual([
+      "20261107T063012Z-end-analysis.svg", "20261107T063012Z-end-report.html", "20261107T063012Z-end.png", "20261107T063012Z-end.svg",
+    ]);
+    const report = await readFile(path.join(share, incident.id, "20261107T063012Z-end-report.html"), "utf8");
+    expect(report).toContain("What the recorded frames show");
+    expect(report).toContain("RF data can show interference, not intent.");
+    expect((await readdir(path.join(root, "incident-figures", incident.id))).length).toBe(3);
+
+    // The retention choice applies to the share as well, and to nothing else in it.
+    await writeFile(path.join(share, "readme-from-a-person.txt"), "mine");
+    expect(await store.pruneIncidentFigures(60_000, Date.parse("2026-11-08T06:30:12.000Z"))).toEqual({ removedFiles: 7, keptFiles: 0 });
+    expect(await readdir(share)).toEqual(["readme-from-a-person.txt"]);
+  });
+
+  it("never lets a missing or unusable share folder affect the saved picture", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "rf-monitor-share-missing-"));
+    temporaryRoots.push(root);
+    const store = new EvidenceStore(root, { shareDirectory: path.join(root, "does-not-exist") });
+    const session = await store.initialize({ config: {}, sdrconnect: {} });
+    await store.recordFrame(frame(), {});
+    const incident = event(session.id);
+    await store.recordEvent(incident);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const saved = await store.saveIncidentFigureSnapshot(incident, { reason: "start", now: Date.parse("2026-11-07T06:30:12.000Z") });
+    expect(saved?.svgPath).toBeTruthy();
+    expect(await readFile(saved!.svgPath, "utf8")).toContain("<svg");
+    expect(await stat(path.join(root, "does-not-exist")).catch(() => "absent")).toBe("absent");
+    warn.mockRestore();
+  });
+
   it("saves no picture for a simulation incident or when there are no frames", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "rf-monitor-figure-none-"));
     temporaryRoots.push(root);

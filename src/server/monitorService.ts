@@ -391,7 +391,11 @@ export class MonitorService extends EventEmitter {
     this.receiverStartupGraceUntil = performance.now() + Math.max(0, receiverStartupGraceMs);
     this.operatorMonitoringStateSince = config.runtimeIdentity.serviceStartedAt;
     this.detector = new DetectionEngine(config.detectionThresholds);
-    this.evidence = new EvidenceStore(config.storageRoot, { dataDomain: config.dataDomain });
+    this.evidence = new EvidenceStore(config.storageRoot, {
+      dataDomain: config.dataDomain,
+      // Field evidence only: simulation and test data never reach the user-readable share.
+      shareDirectory: config.dataDomain === "field" ? config.shareDirectory : undefined,
+    });
     this.storageMaintenance = {
       ...config.retentionPolicy,
       deletedSessions: 0,

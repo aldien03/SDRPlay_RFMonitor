@@ -6,6 +6,7 @@ import { compileEffectiveBands, createDefaultOperationalSettings, validateBandCa
 import type { BandCatalog, BandPreset, DataDomain, EvidenceRetentionPolicy, OperationalSettings, RuntimeIdentity } from "../shared/types";
 import { createDataDomainPaths, type DataDomainPaths } from "./dataDomains";
 import { createRuntimeIdentity, loadReleaseIdentity, withIdentityConfiguration } from "./releaseIdentity";
+import { sharePathProblem } from "./sharePath";
 
 export type SimulationMode = "auto" | "on" | "off";
 
@@ -27,6 +28,8 @@ export interface AppConfig {
   iqCaptureMs: number;
   iqMaxBytes: number;
   storageRoot: string;
+  /** Folder that also receives a copy of incident images and reports, readable by a group of users. Field data only. */
+  shareDirectory?: string;
   /** Active domain selected before any storage component is constructed. */
   dataDomain: DataDomain;
   dataRoots: DataDomainPaths;
@@ -149,6 +152,20 @@ function canonicalValue(value: unknown): unknown {
   return Object.fromEntries(Object.entries(value as Record<string, unknown>)
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([key, entry]) => [key, canonicalValue(entry)]));
+}
+
+/**
+ * The share is a convenience, never a reason to stop monitoring: a bad value is ignored with a warning.
+ */
+function validShareDirectory(value: string | undefined, protectedRoots: string[]): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  const problem = sharePathProblem(trimmed, protectedRoots);
+  if (problem) {
+    console.warn(`RF_MONITOR_SHARE_DIR was ignored: ${problem}`);
+    return undefined;
+  }
+  return trimmed.replace(/\/+$/, "");
 }
 
 export function operationalConfigurationHash(settings: OperationalSettings, catalogVersion: string): string {
@@ -388,6 +405,7 @@ export async function loadConfig(environment: NodeJS.ProcessEnv = process.env): 
     iqCaptureMs: nonNegativeInteger(environment.RF_MONITOR_IQ_CAPTURE_MS, 0, "RF_MONITOR_IQ_CAPTURE_MS"),
     iqMaxBytes: positiveInteger(environment.RF_MONITOR_IQ_MAX_BYTES, 64 * 1024 * 1024, "RF_MONITOR_IQ_MAX_BYTES"),
     storageRoot,
+    shareDirectory: validShareDirectory(environment.RF_MONITOR_SHARE_DIR, [dataRoots.baseRoot, storageRoot]),
     dataDomain,
     dataRoots,
     retentionPolicy: { ...operational.retention },

@@ -892,5 +892,30 @@ describe("immutable deployment release manager", () => {
     expect(rendered).not.toContain("@@");
     expect(rendered).toContain("User=rfmonitor\nGroup=rfmonitor");
     expect(rendered).toContain("MemoryHigh=512M\nMemoryMax=768M");
+    // Without a share folder the unit is exactly what it was before this option existed.
+    expect(rendered).toContain(`ReadWritePaths=${path.join(root, "evidence")} ${path.join(root, "runtime")} /run/rf-monitor\n`);
+  });
+
+  it("adds the evidence share folder to the writable paths without changing the template", async () => {
+    const realTemplate = await readFile(path.join(REPOSITORY_ROOT, "deploy/rf-monitor.service.template"), "utf8");
+    expect(realTemplate).not.toContain("SHARE");
+    const root = await fixtureRoot();
+    const base = {
+      installRoot: path.join(root, "install"),
+      unitPath: path.join(root, "rf-monitor.service"),
+      configFile: path.join(root, "rf-monitor.env"),
+      storageDirectory: path.join(root, "evidence"),
+      runtimeConfigDirectory: path.join(root, "runtime"),
+    };
+    const layout = normalizeDeploymentLayout({ ...base, shareDirectory: "/srv/rf-monitor-evidence" });
+    const rendered = renderApplicationUnit(realTemplate, layout);
+    expect(rendered).toContain(`ReadWritePaths=${path.join(root, "evidence")} ${path.join(root, "runtime")} /run/rf-monitor -/srv/rf-monitor-evidence\n`);
+    expect(rendered).toContain("ProtectHome=true");
+    expect(rendered).toContain("ProtectSystem=strict");
+    expect(rendered.match(/^ReadWritePaths=/gm)).toHaveLength(1);
+    expect(() => renderApplicationUnit(realTemplate.replace(/^ReadWritePaths=.*$/m, ""), layout)).toThrow("exactly one ReadWritePaths");
+    for (const bad of ["/home/sanco/Documents", "relative", "/srv/with space", "/srv/../etc", "/opt/rf-monitor/x", "/tmp/x", base.storageDirectory, path.join(base.storageDirectory, "share"), path.dirname(base.storageDirectory)]) {
+      expect(() => normalizeDeploymentLayout({ ...base, shareDirectory: bad })).toThrow(/share folder|absolute|specific absolute path/i);
+    }
   });
 });

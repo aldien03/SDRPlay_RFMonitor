@@ -37,6 +37,7 @@ function environmentLayout(environment = process.env) {
     configFile: environment.RFMON_CONFIG_FILE || "/etc/rf-monitor.env",
     storageDirectory: environment.RFMON_STORAGE_DIR || "/var/lib/rf-monitor/evidence",
     runtimeConfigDirectory: environment.RFMON_RUNTIME_CONFIG_DIR || "/var/lib/rf-monitor/config",
+    shareDirectory: environment.RFMON_SHARE_DIR || undefined,
     nodeBinary: environment.RFMON_NODE_BIN || "/usr/bin/node",
     serviceUser: environment.RFMON_SERVICE_USER || "rfmonitor",
     serviceGroup: environment.RFMON_SERVICE_GROUP || "rfmonitor",

@@ -247,6 +247,7 @@ function settingsResponse(request: express.Request): SettingsRevision {
       receiverUrls: config.receiverUrls,
       sampleRateHz: config.sampleRateHz,
       storageRoot: config.storageRoot,
+      ...(config.shareDirectory && config.dataDomain === "field" ? { shareDirectory: config.shareDirectory } : {}),
       bindAddress: `${config.host}:${config.port}`,
     },
   };

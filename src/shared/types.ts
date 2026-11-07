@@ -331,6 +331,8 @@ export interface SettingsRevision {
     receiverUrls: string[];
     sampleRateHz: number;
     storageRoot: string;
+    /** Folder that also receives incident images and reports for a group of users; absent when not set up. */
+    shareDirectory?: string;
     bindAddress: string;
   };
 }

@@ -17,6 +17,9 @@ Commands:
   configure --advanced
                       Change infrastructure ports, storage, and SDR endpoints
   configure-web       Configure HTTPS, Nginx, and the Ubuntu firewall
+  share-evidence [--folder /ABSOLUTE/PATH] [--user NAME] [--source /ABSOLUTE/SOURCE] [--dry-run] [--stop]
+                      Give a normal user read access to incident images and reports
+                      through a separate folder (default /srv/rf-monitor-evidence)
   deploy-release /ABSOLUTE/SOURCE
                       Stage, verify, atomically activate, and health-gate a built release
   rollback-release BUILD_ID
@@ -124,6 +127,7 @@ run_release_command() {
     RFMON_TLS_CERTIFICATE="${TLS_CERTIFICATE}" \
     RFMON_TLS_PRIVATE_KEY="${TLS_PRIVATE_KEY}" \
     RFMON_BACKEND_PORT="${backend_port}" \
+    RFMON_SHARE_DIR="$(config_value RF_MONITOR_SHARE_DIR "")" \
     RFMON_SDRCONNECT_PORTS="${sdr_ports}" \
     RFMON_LOCAL_HEALTH_URL="http://127.0.0.1:${backend_port}/api/health" \
     "${NODE_BIN}" "${INSTALL_DIR}/deploy/release-cli.mjs" "$@"
@@ -173,6 +177,10 @@ case "${command_name}" in
   configure-web)
     require_root configure-web
     exec env RFMON_STATE_FILE="${STATE_FILE}" bash "${INSTALL_DIR}/deploy/configure-web.sh" "$@"
+    ;;
+  share-evidence)
+    # The script checks for root itself, so --dry-run and --help can be tried without sudo.
+    exec env RFMON_STATE_FILE="${STATE_FILE}" bash "${INSTALL_DIR}/deploy/share-evidence.sh" "$@"
     ;;
   deploy-release)
     require_root deploy-release

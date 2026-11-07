@@ -175,6 +175,8 @@ export interface EvidenceStoreOptions {
   incidentPostClearMs?: number;
   /** Production is fixed at 256 MiB; smaller values support bounded tests. */
   exportPartMaxBytes?: number;
+  /** A second folder, readable by a group of users, that also receives each incident's images and report. */
+  shareDirectory?: string;
   /** Test-only fault boundary. Production leaves this unset. */
   finalizationFaultInjector?: (
     point: EvidenceFinalizationFaultPoint,
@@ -343,7 +345,7 @@ interface IncidentFigureFiles {
 const INCIDENT_FIGURE_DIRECTORY = "incident-figures";
 const INCIDENT_FIGURE_MAX_FILES = 400;
 const INCIDENT_FIGURE_MAX_FILE_BYTES = 8 * 1024 * 1024;
-const INCIDENT_FIGURE_NAME = /^(\d{8}T\d{6}Z)-(start|progress|end|final)(-analysis)?\.(svg|png)$/;
+const INCIDENT_FIGURE_NAME = /^(\d{8}T\d{6}Z)-(start|progress|end|final)(-analysis|-report)?\.(svg|png|html)$/;
 export type IncidentFigureReason = "start" | "progress" | "end" | "final";
 
 function figureStamp(ms: number): string {
@@ -652,6 +654,8 @@ export class EvidenceStore {
   private readonly incidentPrehistoryMs: number;
   private readonly incidentPostClearMs: number;
   private readonly exportPartMaxBytes: number;
+  private readonly shareDirectory?: string;
+  private shareFailureLoggedAt = 0;
   private readonly exportSourceSessionLeases = new Map<string, number>();
   private readonly exportPathLeases = new Map<string, number>();
   private readonly activeExportPrefixes = new Map<string, number>();
@@ -682,6 +686,7 @@ export class EvidenceStore {
     this.incidentPrehistoryMs = options.incidentPrehistoryMs ?? INCIDENT_PREHISTORY_MS;
     this.incidentPostClearMs = options.incidentPostClearMs ?? INCIDENT_POST_CLEAR_MS;
     this.exportPartMaxBytes = options.exportPartMaxBytes ?? EXPORT_PART_MAX_BYTES;
+    this.shareDirectory = options.shareDirectory;
     this.finalizerMaxItems = options.finalizerMaxItems ?? MAX_FINALIZER_ITEMS;
     this.finalizationFaultInjector = options.finalizationFaultInjector;
     this.recordingDeletionFaultInjector = options.recordingDeletionFaultInjector;
@@ -2677,10 +2682,36 @@ export class EvidenceStore {
       await writeAtomic(analysisPath, figure.analysis.sheetSvg);
       // The overview goes last, so a reader that finds it can rely on its companions being there.
       await writeAtomic(svgPath, figure.svg);
+      await this.copyToShare(incidentId, stamp, options.reason, figure, incidentReport(event, figure, Math.floor(INCIDENT_FIGURE_MAX_FILE_BYTES / 2)));
       return { stamp, svgPath, pngPath, analysisPath };
     } finally {
       this.updateLease(this.exportPathLeases, stagingPath, -1);
       await rm(stagingPath, { recursive: true, force: true });
+    }
+  }
+
+  /**
+   * Best effort copy for people who open files from a folder instead of the dashboard. A share that is
+   * missing or not writable never affects the picture saved in the evidence store.
+   */
+  private async copyToShare(incidentId: string, stamp: string, reason: IncidentFigureReason, figure: IncidentFigureFiles, report: string): Promise<void> {
+    if (!this.shareDirectory || !figure.svg || !figure.png || !figure.analysis) return;
+    try {
+      const details = await lstat(this.shareDirectory);
+      if (!details.isDirectory() || details.isSymbolicLink()) return;
+      const directory = path.join(this.shareDirectory, incidentId);
+      await mkdir(directory, { recursive: true, mode: 0o750 });
+      const base = path.join(directory, `${stamp}-${reason}`);
+      await writeAtomicUnflushed(`${base}.png`, figure.png);
+      await writeAtomicUnflushed(`${base}-analysis.svg`, figure.analysis.sheetSvg);
+      await writeAtomicUnflushed(`${base}.svg`, figure.svg);
+      await writeAtomicUnflushed(`${base}-report.html`, report);
+    } catch (error) {
+      const now = Date.now();
+      if (now - this.shareFailureLoggedAt > 10 * 60_000) {
+        this.shareFailureLoggedAt = now;
+        console.warn(`Incident images could not be copied to the share folder: ${error instanceof Error ? error.message : String(error)}`);
+      }
     }
   }
 
@@ -2724,7 +2755,18 @@ export class EvidenceStore {
    */
   async pruneIncidentFigures(retentionMs: number, now = Date.now(), maxFiles = INCIDENT_FIGURE_MAX_FILES): Promise<{ removedFiles: number; keptFiles: number }> {
     if (!Number.isSafeInteger(retentionMs) || retentionMs <= 0) return { removedFiles: 0, keptFiles: 0 };
-    const base = path.join(this.root, INCIDENT_FIGURE_DIRECTORY);
+    const roots = [path.join(this.root, INCIDENT_FIGURE_DIRECTORY), ...(this.shareDirectory ? [this.shareDirectory] : [])];
+    let removedFiles = 0;
+    let keptFiles = 0;
+    for (const base of roots) {
+      const result = await this.pruneFigureRoot(base, retentionMs, now, maxFiles);
+      removedFiles += result.removedFiles;
+      keptFiles += result.keptFiles;
+    }
+    return { removedFiles, keptFiles };
+  }
+
+  private async pruneFigureRoot(base: string, retentionMs: number, now: number, maxFiles: number): Promise<{ removedFiles: number; keptFiles: number }> {
     let incidents;
     try {
       incidents = await readdir(base, { withFileTypes: true });
@@ -2753,7 +2795,7 @@ export class EvidenceStore {
     }
     for (const incident of incidents) {
       // rmdir only removes an empty directory, so an incident that still has pictures is untouched.
-      if (incident.isDirectory()) await rmdir(path.join(base, incident.name)).catch(() => undefined);
+      if (incident.isDirectory() && /^[A-Za-z0-9._-]+$/.test(incident.name)) await rmdir(path.join(base, incident.name)).catch(() => undefined);
     }
     return { removedFiles: removed, keptFiles: files.length - removed };
   }
