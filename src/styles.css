@@ -13,7 +13,8 @@
   --green: #15963d;
   --amber: #d39a00;
   --text: #162231;
-  --muted: #667482;
+  --muted: #5a6876;
+  --focus-ring: #0b57b0;
   --border: #cbd2d9;
   --soft-border: #dfe4e9;
   --surface: #ffffff;
@@ -42,9 +43,13 @@ button, input, textarea, select {
   letter-spacing: 0;
 }
 
-button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible {
-  outline: 3px solid rgba(0, 109, 204, 0.28);
-  outline-offset: 1px;
+/* Two-tone focus ring: a solid blue line plus a white halo, so it keeps 3:1
+   against both the light surfaces and the navy command bar. */
+button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible,
+a:focus-visible, summary:focus-visible, [tabindex]:not([tabindex="-1"]):focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px #fff;
 }
 
 .app-shell { min-height: 100vh; }
@@ -690,6 +695,7 @@ td.description-cell { max-width: 220px; white-space: normal; }
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  min-height: 24px;
   padding: 4px 0;
   border: 0;
   color: #0063be;
@@ -992,7 +998,7 @@ td.description-cell { max-width: 220px; white-space: normal; }
 
 .mission-choice-grid button:hover:not(:disabled) { border-color: #3b82ad; background: #f4fafd; }
 .mission-choice-grid button.selected { border-color: #0870b8; border-left-color: #0870b8; background: #eaf6fc; }
-.mission-choice-grid button:focus-visible { outline: 3px solid rgba(0, 109, 204, 0.24); outline-offset: 1px; }
+.mission-choice-grid button:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
 .mission-choice-grid button:disabled { cursor: default; }
 .mission-choice-grid strong, .mission-choice-grid span { display: block; }
 .mission-choice-grid strong { font-size: 13px; }
@@ -1025,7 +1031,7 @@ td.description-cell { max-width: 220px; white-space: normal; }
 .frequency-window-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; margin-bottom: 10px; }
 .frequency-window-list label { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px; min-height: 53px; padding: 8px 10px; border: 1px solid #cbd5dc; border-left: 3px solid #8997a1; border-radius: 3px; background: #fff; cursor: pointer; }
 .frequency-window-list label.selected { border-color: #65a7ce; border-left-color: var(--blue); background: #edf7fc; }
-.frequency-window-list label:has(input:focus-visible) { outline: 3px solid rgba(0, 109, 204, .22); outline-offset: 1px; }
+.frequency-window-list label:has(input:focus-visible) { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
 .frequency-window-list label:has(input:disabled) { cursor: default; }
 .frequency-window-list input { width: 16px; height: 16px; margin: 0; accent-color: var(--blue); }
 .frequency-window-list span, .frequency-window-list strong, .frequency-window-list small { display: block; min-width: 0; }
@@ -1037,7 +1043,7 @@ td.description-cell { max-width: 220px; white-space: normal; }
 .correction-beam-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
 .correction-beam-list label { display: grid; grid-template-columns: auto minmax(90px, .7fr) minmax(160px, 1fr); align-items: center; gap: 9px; min-height: 54px; padding: 8px 10px; border: 1px solid #cbd5dc; border-left: 3px solid #8997a1; border-radius: 3px; background: #fff; cursor: pointer; }
 .correction-beam-list label.selected { border-color: #65a7ce; border-left-color: var(--blue); background: #edf7fc; }
-.correction-beam-list label:has(input:focus-visible) { outline: 3px solid rgba(0, 109, 204, .22); outline-offset: 1px; }
+.correction-beam-list label:has(input:focus-visible) { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
 .correction-beam-list input { width: 16px; height: 16px; margin: 0; accent-color: var(--blue); }
 .correction-beam-list span, .correction-beam-list strong, .correction-beam-list b, .correction-beam-list small { display: block; min-width: 0; }
 .correction-beam-list strong, .correction-beam-list b { color: #213746; font-size: 11px; }
@@ -1128,7 +1134,7 @@ td.description-cell { max-width: 220px; white-space: normal; }
 .switch-control > span::after { content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: #ffffff; transition: transform 120ms ease; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.28); }
 .switch-control input:checked + span { background: var(--green); }
 .switch-control input:checked + span::after { transform: translateX(16px); }
-.switch-control input:focus-visible + span { outline: 3px solid rgba(0, 109, 204, 0.28); }
+.switch-control input:focus-visible + span { outline: 2px solid var(--focus-ring); outline-offset: 2px; }
 .switch-control:has(input:disabled) { cursor: not-allowed; }
 .switch-control:has(input:disabled) > span { opacity: 0.72; }
 .switch-control b { font-size: 10px; }
@@ -1503,7 +1509,7 @@ td.description-cell { max-width: 220px; white-space: normal; }
   background: #0a1d38;
   font-size: 13px;
 }
-.mission-layout select { min-width: 45px; margin-left: auto; border: 0; color: #fff; background: transparent; appearance: none; font-size: 13px; cursor: pointer; }
+.mission-layout select { align-self: stretch; min-width: 45px; margin-left: auto; border: 0; color: #fff; background: transparent; appearance: none; font-size: 13px; cursor: pointer; }
 .mission-layout select option { color: #101d39; background: #fff; }
 .mission-actions { border-left: 1px solid rgba(170, 191, 219, .32); }
 .mission-actions button {
@@ -1977,8 +1983,16 @@ td.description-cell { max-width: 220px; white-space: normal; }
 .trace-mode-control button:last-child { border-radius: 0 3px 3px 0; }
 .trace-mode-control button.selected { color: #fff; background: #1766ae; border-color: #1766ae; }
 
+/* Keep Engineer, Help and Settings reachable at the 1366 px control-room size:
+   the fixed header columns plus six 82 px action buttons exceed the viewport
+   there, so let the receiver column shrink and the others tighten. */
+@media (max-width: 1520px) and (min-width: 1181px) {
+  .mission-header { grid-template-columns: 160px minmax(110px, 170px) 124px minmax(0, 1fr) 96px 150px auto; }
+  .mission-header > * { padding-inline: 12px; }
+}
+
 @media (max-width: 1180px) and (min-width: 761px) {
-  .mission-header { grid-template-columns: 155px 155px 120px minmax(205px, 1fr) 108px 142px auto; }
+  .mission-header { grid-template-columns: 155px 155px 120px minmax(0, 1fr) 108px 142px auto; }
   .mission-header > * { padding-inline: 12px; }
   .mission-actions button { min-width: 66px; padding-inline: 8px; }
   .mission-actions button span { display: none; }
@@ -2646,7 +2660,7 @@ td.description-cell { max-width: 220px; white-space: normal; }
   --border: #c8d1da;
   --soft-border: #e2e7ec;
   --text: #122333;
-  --muted: #627181;
+  --muted: #5a6876;
   --red: #d82020;
   --green: #178343;
 }
