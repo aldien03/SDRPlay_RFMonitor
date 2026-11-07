@@ -1155,7 +1155,11 @@ async function updateBaseline(
       response.json({ configurationRevision: settingsStore.settings.revision, baseline: descriptor });
       return;
     }
-    const result = await monitor.restartBaseline({ ...common, restartedBy: "settings-admin" });
+    const result = await monitor.restartBaseline({
+      ...common,
+      restartedBy: "settings-admin",
+      endActiveObservation: request.body?.endActiveObservation === true,
+    });
     response.status(result.state === "complete" ? 200 : 202).json({
       configurationRevision: settingsStore.settings.revision,
       baseline: result.baseline,

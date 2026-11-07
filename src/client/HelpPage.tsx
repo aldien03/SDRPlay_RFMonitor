@@ -102,7 +102,7 @@ export function HelpPage({ snapshot, onClose, onOpenHealth, onOpenRecording, onO
             <li>Select Unlock to edit and enter the settings password.</li>
             <li>Select Restart learning on one frequency, or Restart signal learning for every active frequency.</li>
           </ol>
-          <p>Restarting starts a new learning period. Recordings, incidents and saved learning records are kept.</p>
+          <p>Restarting starts a new learning period. Recordings, incidents and saved learning records are kept. If an alert is active on a frequency, the dialog says so and restarting ends that alert; its incident stays in Evidence History. Until learning is approved, alerts are Low evidence.</p>
         </section>
 
         <section id="test" className="help-task">

@@ -55,7 +55,7 @@ interface SettingsPageProps {
   lockSettings: () => Promise<unknown>;
   applySettings: (settings: OperationalSettings, expectedRevision: number) => Promise<SettingsRevision>;
   approveBaseline: (baseline: BaselineDescriptor, expectedRevision: number) => Promise<BaselineApprovalResponse>;
-  restartBaseline: (baseline: BaselineDescriptor, expectedRevision: number) => Promise<BaselineRestartResponse>;
+  restartBaseline: (baseline: BaselineDescriptor, expectedRevision: number, options?: { endActiveObservation?: boolean }) => Promise<BaselineRestartResponse>;
   clearTestData: (expectedRevision: number) => Promise<ClearTestDataResponse>;
   deleteRecordings: (expectedRevision: number, dataDomain: MonitorSnapshot["dataDomain"]) => Promise<DeleteRecordingsResponse>;
   restartSoftware: (expectedRevision: number) => Promise<SoftwareRestartResponse>;
@@ -73,7 +73,12 @@ export const MAINTENANCE_CONFIRMATION: Record<MaintenanceAction, string> = {
   "restart-software": "RESTART SOFTWARE",
 };
 
-export function maintenancePresentation(action: MaintenanceAction, dataDomain: MonitorSnapshot["dataDomain"]): { title: string; changes: string; retained: string; button: string } {
+export function maintenancePresentation(
+  action: MaintenanceAction,
+  dataDomain: MonitorSnapshot["dataDomain"],
+  /** Labels of frequencies with an alert or running check that the restart will end. */
+  activeWindows: readonly string[] = [],
+): { title: string; changes: string; retained: string; button: string } {
   if (action === "clear-test-data") return {
     title: "Clear test data?",
     changes: "Deletes test recordings, test incidents and test signal learning.",
@@ -82,8 +87,8 @@ export function maintenancePresentation(action: MaintenanceAction, dataDomain: M
   };
   if (action === "restart-learning") return {
     title: "Restart signal learning?",
-    changes: `Starts a new learning period for every active ${dataDomain === "field" ? "Field" : "Test"} frequency that has learned data. Frequencies with a check still running are skipped.`,
-    retained: "Recordings, incidents, saved learning records and settings are kept.",
+    changes: `Starts a new learning period for every active ${dataDomain === "field" ? "Field" : "Test"} frequency that has learned data. Alerts are Low evidence until learning is approved.${activeWindows.length ? ` Active alerts on ${activeWindows.join(", ")} will be ended.` : ""}`,
+    retained: `Recordings, saved learning records and settings are kept.${activeWindows.length ? " Ended incidents stay in Evidence History." : " Incidents are kept."}`,
     button: "Restart learning",
   };
   if (action === "delete-recordings") return {
@@ -313,7 +318,9 @@ export function SettingsPage(props: SettingsPageProps) {
     setError(undefined);
     try {
       const restartResult = action === "restart"
-        ? await props.restartBaseline(baseline, response.settings.revision)
+        ? await props.restartBaseline(baseline, response.settings.revision, {
+          endActiveObservation: Boolean(restartBlockedReason(props.snapshot.targetStates.find((state) => state.targetId === baseline.targetId))),
+        })
         : undefined;
       if (action === "approve") await props.approveBaseline(baseline, response.settings.revision);
       const recoveryRequired = restartResult ? baselineRestartRequiresRecovery(restartResult) : false;
@@ -353,22 +360,21 @@ export function SettingsPage(props: SettingsPageProps) {
         props.onToast(result.result.previousDataPresent ? "Test data cleared." : "No test data to clear.");
       } else if (pendingMaintenance === "restart-learning") {
         if (!restartableBaselines.length) throw new Error("No learned data to restart yet.");
-        // Split up front so a frequency that is mid-observation never even
-        // gets attempted, and later, ready frequencies are not skipped for it.
-        const ready = restartableBaselines.filter((baseline) => !restartBlockedReason(props.snapshot.targetStates.find((state) => state.targetId === baseline.targetId)));
-        const blocked = restartableBaselines.filter((baseline) => !ready.includes(baseline));
         const total = restartableBaselines.length;
-        if (!ready.length) throw new Error("No frequency is ready to restart. Wait for the current checks to clear.");
         const windowLabel = (targetId: string) => learningTargets.find((target) => target.targetId === targetId)?.label ?? friendlyTargetId(targetId);
         // The server allows one journalled restart at a time, so walk the
         // targets in order and report exactly how far the batch got.
         let current = response;
         let restarted = 0;
         const failures: string[] = [];
-        for (const baseline of ready) {
+        for (const baseline of restartableBaselines) {
           let result: BaselineRestartResponse;
           try {
-            result = await props.restartBaseline(baseline, current.settings.revision);
+            // The dialog listed every frequency with an active alert; confirming it
+            // authorises ending exactly those observations.
+            result = await props.restartBaseline(baseline, current.settings.revision, {
+              endActiveObservation: Boolean(restartBlockedReason(props.snapshot.targetStates.find((state) => state.targetId === baseline.targetId))),
+            });
           } catch (reason) {
             // Any other individual failure is recorded, and the loop carries on.
             failures.push(`${windowLabel(baseline.targetId)} — ${reason instanceof Error ? reason.message : String(reason)}`);
@@ -387,11 +393,10 @@ export function SettingsPage(props: SettingsPageProps) {
         }
         setResponse(current);
         if (!dirty) setDraft(cloneSettings(current.settings));
-        if (restarted === total && !blocked.length && !failures.length) {
+        if (restarted === total && !failures.length) {
           props.onToast(`Signal learning restarted for ${restarted} ${restarted === 1 ? "frequency" : "frequencies"}.`);
         } else {
           const parts = [`Restarted ${restarted} of ${total}.`];
-          if (blocked.length) parts.push(`Not ready: ${blocked.map((baseline) => windowLabel(baseline.targetId)).join(", ")}.`);
           if (failures.length) parts.push(`Failed: ${failures.join("; ")}.`);
           throw new Error(parts.join(" "));
         }
@@ -459,7 +464,12 @@ export function SettingsPage(props: SettingsPageProps) {
     window.requestAnimationFrame(() => document.getElementById(`settings-tab-${nextTab}`)?.focus());
   };
 
-  const maintenanceCopy = pendingMaintenance ? maintenancePresentation(pendingMaintenance, props.snapshot.dataDomain) : undefined;
+  const windowLabelFor = (targetId: string) => learningTargets.find((target) => target.targetId === targetId)?.label
+    ?? response?.catalog.captureTargets.find((target) => target.id === targetId)?.label
+    ?? friendlyTargetId(targetId);
+  const isRestartBlocked = (targetId: string) => Boolean(restartBlockedReason(props.snapshot.targetStates.find((state) => state.targetId === targetId)));
+  const activeRestartWindows = restartableBaselines.filter((baseline) => isRestartBlocked(baseline.targetId)).map((baseline) => windowLabelFor(baseline.targetId));
+  const maintenanceCopy = pendingMaintenance ? maintenancePresentation(pendingMaintenance, props.snapshot.dataDomain, activeRestartWindows) : undefined;
 
   return (
     <div
@@ -576,7 +586,7 @@ export function SettingsPage(props: SettingsPageProps) {
       {pendingBaselineRestart && response ? (
         <DialogShell backdropClassName="settings-admin-backdrop" dialogClassName="settings-admin-dialog settings-confirm-dialog" labelledBy="restart-baseline-title" describedBy="restart-baseline-description" onClose={() => setPendingBaselineRestart(undefined)}>
           <header><div><RotateCcw size={20} aria-hidden="true" /><strong id="restart-baseline-title">Start learning again?</strong></div><button className="icon-button" type="button" onClick={() => setPendingBaselineRestart(undefined)} aria-label="Cancel signal learning restart"><X size={20} aria-hidden="true" /></button></header>
-          <div className="settings-dialog-body"><p id="restart-baseline-description">Start a new learning period for {learningTargets.find((target) => target.targetId === pendingBaselineRestart.targetId)?.label ?? response.catalog.captureTargets.find((target) => target.id === pendingBaselineRestart.targetId)?.label ?? friendlyTargetId(pendingBaselineRestart.targetId)}. The approved normal level and recorded evidence are kept.</p><div className="settings-admin-actions"><button className="button secondary" type="button" autoFocus onClick={() => setPendingBaselineRestart(undefined)}>Cancel</button><button className="button danger" type="button" onClick={() => { const baseline = pendingBaselineRestart; setPendingBaselineRestart(undefined); void updateBaseline("restart", baseline); }}>Start learning</button></div></div>
+          <div className="settings-dialog-body"><p id="restart-baseline-description">Start a new learning period for {learningTargets.find((target) => target.targetId === pendingBaselineRestart.targetId)?.label ?? response.catalog.captureTargets.find((target) => target.id === pendingBaselineRestart.targetId)?.label ?? friendlyTargetId(pendingBaselineRestart.targetId)}. The approved normal level and recorded evidence are kept. Alerts are Low evidence until learning is approved.</p>{isRestartBlocked(pendingBaselineRestart.targetId) ? <p role="note"><strong>Alert active.</strong> Starting again ends it. The incident stays in Evidence History.</p> : null}<div className="settings-admin-actions"><button className="button secondary" type="button" autoFocus onClick={() => setPendingBaselineRestart(undefined)}>Cancel</button><button className="button danger" type="button" onClick={() => { const baseline = pendingBaselineRestart; setPendingBaselineRestart(undefined); void updateBaseline("restart", baseline); }}>Start learning</button></div></div>
         </DialogShell>
       ) : null}
 
@@ -1091,7 +1101,7 @@ function SignalLearningSettings({ response, unlocked, targetStates, onBaselineAc
               {unlocked && target.baseline?.lifecycle === "reviewable" ? <button className="button secondary compact" type="button" disabled={!approval?.eligible} aria-describedby={!approval?.eligible && blockedApproval ? "baseline-approval-status" : undefined} onClick={() => void onBaselineAction("approve", target.baseline!)}>Approve</button> : null}
               {/* The control stays visible with its blocking reason so a
                   missing baseline never looks like a missing feature. */}
-              {unlocked ? <button className="button secondary compact" type="button" disabled={!target.baseline || Boolean(blocked)} title={target.baseline ? blocked : "No learned data to restart yet."} onClick={() => { if (target.baseline) void onBaselineAction("restart", target.baseline); }}>Restart learning</button> : null}
+              {unlocked ? <button className="button secondary compact" type="button" disabled={!target.baseline} title={target.baseline ? (blocked ? "An alert is active. Restarting ends it." : undefined) : "No learned data to restart yet."} onClick={() => { if (target.baseline) void onBaselineAction("restart", target.baseline); }}>Restart learning</button> : null}
             </div>
           );
         }) : <div className="selection-summary">No active frequencies.</div>}

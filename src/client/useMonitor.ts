@@ -1222,7 +1222,7 @@ export function useMonitor() {
     body: JSON.stringify({ settings, expectedRevision }),
   }), []);
 
-  const baselineRequest = useCallback(<T,>(action: "approve" | "restart", baseline: BaselineDescriptor, expectedConfigurationRevision: number) => (
+  const baselineRequest = useCallback(<T,>(action: "approve" | "restart", baseline: BaselineDescriptor, expectedConfigurationRevision: number, options?: { endActiveObservation?: boolean }) => (
     request<T>(`/api/baselines/${encodeURIComponent(baseline.targetId)}/${action}`, {
       method: "POST",
       headers: { "x-rf-monitor-csrf": "settings-v1" },
@@ -1230,6 +1230,7 @@ export function useMonitor() {
         expectedConfigurationRevision,
         expectedFingerprintId: baseline.fingerprintId,
         expectedGeneration: Number(baseline.learningGenerationId),
+        ...(action === "restart" && options?.endActiveObservation ? { endActiveObservation: true } : {}),
       }),
     })
   ), []);
@@ -1304,7 +1305,7 @@ export function useMonitor() {
     lockSettings,
     applySettings,
     approveBaseline: (baseline: BaselineDescriptor, revision: number) => baselineRequest<BaselineApprovalResponse>("approve", baseline, revision),
-    restartBaseline: (baseline: BaselineDescriptor, revision: number) => baselineRequest<BaselineRestartResponse>("restart", baseline, revision),
+    restartBaseline: (baseline: BaselineDescriptor, revision: number, options?: { endActiveObservation?: boolean }) => baselineRequest<BaselineRestartResponse>("restart", baseline, revision, options),
     clearTestData,
     deleteRecordings,
     restartSoftware,

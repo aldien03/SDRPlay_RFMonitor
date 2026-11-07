@@ -956,6 +956,61 @@ describe("bounded monitor runtime", () => {
     await monitor.stop();
   });
 
+  it("blocks a learning restart during an active alert unless the operator confirms ending it", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-20T12:00:00.000Z"));
+    const config = enableSingleRadioTarget(await temporaryConfig("restart-during-alert"));
+    const monitor = new MonitorService(config);
+    await monitor.start();
+    const internal = monitor as unknown as {
+      stopSimulation(): void;
+      handleSpectrum(receiverId: number, bins: Uint8Array, source: "simulation"): void;
+      targetStates: Map<string, Record<string, unknown>>;
+      activeEventsByTarget: Map<string, Record<string, unknown>>;
+      events: Array<Record<string, unknown>>;
+      clearTargetState(targetId: string): Record<string, unknown>;
+      refreshActiveEvent(): void;
+    };
+    internal.stopSimulation();
+    const quiet = new Uint8Array(640).fill(30);
+    internal.handleSpectrum(0, quiet, "simulation");
+    internal.handleSpectrum(0, quiet, "simulation");
+    internal.handleSpectrum(0, quiet, "simulation");
+    const before = monitor.getBaselineStates()[0];
+
+    // Put the target into the same state a persistent false alarm leaves it in.
+    const event: Record<string, unknown> = {
+      id: "event-under-restart", dataDomain: "test", sessionId: "s", kind: "gnss-energy-anomaly", status: "interference-likely",
+      severity: "medium", evidenceStrength: "Medium", evidenceBasis: "test", baselineFingerprintId: before.fingerprintId, ruleSetId: "r",
+      observationId: "o", service: "gnss", bandId: "b", targetId: before.targetId, bandLabel: "b", affectedRangeHz: [1, 2],
+      observed: "x", recommendedAction: "y", startedAt: "2026-08-20T11:59:00.000Z", lastSeenAt: "2026-08-20T11:59:30.000Z",
+      lifecycle: "active", notes: [], metrics: {},
+    };
+    internal.events = [event, ...internal.events];
+    internal.activeEventsByTarget.set(before.targetId, event);
+    internal.targetStates.set(before.targetId, { ...internal.clearTargetState(before.targetId), lifecycle: "active", candidateCount: 3, eventId: event.id });
+    internal.refreshActiveEvent();
+
+    const request = { targetId: before.targetId, expectedFingerprintId: before.fingerprintId, expectedGeneration: 1, restartedBy: "settings-admin" };
+    await expect(monitor.restartBaseline(request)).rejects.toThrow("Wait for the active or recovering observation to clear");
+    await expect(monitor.restartBaseline({ ...request, endActiveObservation: false })).rejects.toThrow("Wait for the active or recovering");
+    expect(event.lifecycle).toBe("active");
+
+    const restarted = await monitor.restartBaseline({ ...request, endActiveObservation: true });
+    expect(restarted).toMatchObject({ committed: true, state: "complete", auditDurable: true });
+    expect(restarted.baseline).toMatchObject({ lifecycle: "learning", learningGenerationId: "2", observationCount: 0 });
+    expect(event).toMatchObject({ lifecycle: "ended-unknown", endReason: expect.stringContaining("restarted by the operator") });
+    expect(typeof event.endedAt).toBe("string");
+    expect(internal.activeEventsByTarget.has(before.targetId)).toBe(false);
+    expect(monitor.getSnapshot().targetStates.find((state) => state.targetId === before.targetId)).toMatchObject({ lifecycle: "clear", candidateCount: 0 });
+    expect(monitor.getSnapshot().activeEvent).toBeUndefined();
+
+    const audit = await readFile(path.join(config.dataRoots.baseRoot, "domain-maintenance-audit.jsonl"), "utf8");
+    const entries = audit.trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(entries.find((entry) => entry.type === "baseline-learning-restarted")).toMatchObject({ endedEventIds: ["event-under-restart"] });
+    await monitor.stop();
+  });
+
   it("restarts signal learning for the Fugro L-band capture target", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-20T12:00:00.000Z"));

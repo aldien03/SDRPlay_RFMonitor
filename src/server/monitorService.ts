@@ -1124,11 +1124,16 @@ export class MonitorService extends EventEmitter {
     expectedFingerprintId: string;
     expectedGeneration: number;
     restartedBy: string;
+    /**
+     * The operator has explicitly confirmed that an alert or pending check on this target may be
+     * ended. Without it an active, recovering or candidate state still blocks the restart.
+     */
+    endActiveObservation?: boolean;
   }): Promise<BaselineRestartResult> {
     if (!this.baselineStore) throw new Error("Baseline store is unavailable");
     if (this.syntheticExercise) throw new Error("Finish the simulation test before restarting signal learning");
     const currentState = this.targetStates.get(input.targetId);
-    if (currentState && (["active", "recovering"].includes(currentState.lifecycle) || currentState.candidateCount > 0)) {
+    if (currentState && (["active", "recovering"].includes(currentState.lifecycle) || currentState.candidateCount > 0) && input.endActiveObservation !== true) {
       throw new Error("Wait for the active or recovering observation to clear before restarting signal learning");
     }
     const fingerprint = this.activeBaselineFingerprints.get(`${input.targetId}:${input.expectedFingerprintId}`);
@@ -1163,6 +1168,8 @@ export class MonitorService extends EventEmitter {
       preparedAt: new Date().toISOString(),
       phase: "prepared",
     };
+    // Captured now: the runtime reset below ends these incidents, and the audit must name them.
+    const endedEventIds = this.activeEventsByTarget.has(input.targetId) ? [this.activeEventsByTarget.get(input.targetId)!.id] : [];
     this.baselineRestartTargets.add(input.targetId);
     let descriptor: StoredBaselineDescriptor | undefined;
     try {
@@ -1226,6 +1233,7 @@ export class MonitorService extends EventEmitter {
           generation: operation.nextGeneration,
           restartedBy: operation.actor,
           committed: true,
+          ...(endedEventIds.length ? { endedEventIds } : {}),
         });
         operation.phase = "audited";
         await writeBaselineRestartOperation(this.config.dataRoots, operation);
@@ -1252,6 +1260,7 @@ export class MonitorService extends EventEmitter {
         generation: descriptor.generation,
         restartedBy: input.restartedBy,
         operationId: operation.operationId,
+        ...(endedEventIds.length ? { endedEventIds } : {}),
       }).catch(() => undefined);
       this.baselineRestartTargets.delete(input.targetId);
       this.baselineHealthy = this.baselineRestartTargets.size === 0;
@@ -1280,6 +1289,15 @@ export class MonitorService extends EventEmitter {
     this.lastBaselineTrainingAtByTarget.delete(operation.targetId);
     this.prehistoryCandidateTargets.delete(operation.targetId);
     this.postClearUntilByTarget.delete(operation.targetId);
+    const openEvent = this.activeEventsByTarget.get(operation.targetId);
+    if (openEvent) {
+      // The comparison baseline is gone, so this incident cannot be confirmed or cleared any more.
+      // End it explicitly instead of leaving it open forever.
+      openEvent.lifecycle = "ended-unknown";
+      openEvent.endedAt = new Date().toISOString();
+      openEvent.endReason = "Signal learning was restarted by the operator while this observation was active";
+      if (this.evidenceHealthy) void this.persistEvent({ ...openEvent }).catch((error) => this.markStorageError(error));
+    }
     this.activeEventsByTarget.delete(operation.targetId);
     this.targetStates.set(operation.targetId, this.clearTargetState(operation.targetId));
     this.refreshActiveEvent();

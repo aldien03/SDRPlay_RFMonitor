@@ -261,7 +261,7 @@ Open **Engineer details** only when the first action asks for it or a support pr
 Unlock Settings before using any maintenance action. Each action has its own confirmation and audit entry:
 
 - **Recording > Clear test data** removes only test recordings, test incidents, and test signal learning. Field data and settings remain.
-- **Advanced > Signal learning > Learning details > Restart learning** starts a new generation for one named signal. The approved normal level and recordings remain.
+- **Advanced > Signal learning > Learning details > Restart learning** starts a new generation for one named signal. The approved normal level and recordings remain. If an alert is active on that signal, the confirmation names it and restarting ends it; the incident stays in Evidence History marked as ended by the operator, and the audit log lists the ended incident IDs. Until learning is approved, alerts from that signal are Low evidence, and until the first 64 observations of that signal are collected (a few minutes) it flags nothing.
 - **Recording > Delete recordings** removes finalized recordings only from the named active Field or Test domain. Active, finalizing, export-leased recordings, exports, learning, and settings remain.
 - **Advanced > Software recovery > Restart software** requests the bounded external application-recovery helper. It does not expose `systemctl`. Recordings, learning, and settings remain.
 

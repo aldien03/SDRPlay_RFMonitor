@@ -18,7 +18,7 @@ describe("protected Settings actions", () => {
 
   it.each<[MaintenanceAction, RegExp, RegExp]>([
     ["clear-test-data", /test recordings.*test incidents.*test signal learning/i, /Field data and settings are kept/i],
-    ["restart-learning", /new learning period for every active Field frequency.*Frequencies with a check still running are skipped/i, /Recordings, incidents, saved learning records and settings are kept/i],
+    ["restart-learning", /new learning period for every active Field frequency.*Low evidence until learning is approved/i, /Recordings, saved learning records and settings are kept/i],
     ["delete-recordings", /finalized Field recordings/i, /Active, finalizing and in-use recordings, exports, signal learning and settings are kept/i],
     ["restart-software", /Monitoring and this dashboard will disconnect briefly/i, /Recordings, signal learning and settings are kept/i],
   ])("states what %s changes and retains", (action, changes, retained) => {
@@ -35,5 +35,14 @@ describe("protected Settings actions", () => {
   it("names the active trust domain before restarting signal learning", () => {
     expect(maintenancePresentation("restart-learning", "field").changes).toContain("active Field frequency");
     expect(maintenancePresentation("restart-learning", "test").changes).toContain("active Test frequency");
+  });
+
+  it("names the frequencies whose active alerts a learning restart will end", () => {
+    const quiet = maintenancePresentation("restart-learning", "field", []);
+    expect(quiet.changes).not.toMatch(/will be ended/);
+    expect(quiet.retained).toContain("Incidents are kept.");
+    const active = maintenancePresentation("restart-learning", "field", ["GPS L1", "GPS L2"]);
+    expect(active.changes).toContain("Active alerts on GPS L1, GPS L2 will be ended.");
+    expect(active.retained).toContain("Ended incidents stay in Evidence History.");
   });
 });
