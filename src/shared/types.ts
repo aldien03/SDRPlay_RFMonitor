@@ -805,6 +805,8 @@ export interface DetectionEvent {
   clearedAt?: string;
   endedAt?: string;
   endReason?: string;
+  /** Set when history is read: a saved incident image exists. Never stored with the incident. */
+  figureAvailable?: boolean;
   acknowledgedAt?: string;
   notes: Array<{ id: string; timestamp: string; text: string }>;
   metrics: SignalMetricSample;
@@ -952,6 +954,10 @@ export interface EvidenceRetentionPolicy {
   storageMaxBytes: number;
   minimumFreeBytes: number;
   maintenanceIntervalMs: number;
+  /** Save a time-stamped picture of each incident automatically. Absent means on. */
+  incidentFiguresEnabled?: boolean;
+  /** How long saved incident pictures are kept before they are deleted. Absent means 30 days. */
+  incidentFigureRetentionMs?: number;
 }
 
 export interface StorageMaintenanceStatus extends EvidenceRetentionPolicy {

@@ -21,6 +21,7 @@ import {
   readdir,
   rename,
   rm,
+  rmdir,
   stat,
   statfs,
   truncate,
@@ -50,6 +51,7 @@ import type {
   RecordingDeletionResult,
 } from "../shared/types";
 import { ensureDomainRoot } from "./dataDomains";
+import { IncidentFigureBuilder, type IncidentFigureSummary } from "./incidentFigure";
 import {
   createEvidenceFinalizationRecord,
   inspectEvidenceCommitMetadata,
@@ -329,6 +331,22 @@ function safeTimestamp(timestamp: string): string {
   return timestamp.replaceAll(":", "-").replaceAll(".", "-");
 }
 
+/** Automatic incident images: bounded in count and size no matter what retention is configured. */
+const INCIDENT_FIGURE_DIRECTORY = "incident-figures";
+const INCIDENT_FIGURE_MAX_FILES = 400;
+const INCIDENT_FIGURE_MAX_FILE_BYTES = 8 * 1024 * 1024;
+const INCIDENT_FIGURE_NAME = /^(\d{8}T\d{6}Z)-(start|progress|end|final)\.(svg|png)$/;
+export type IncidentFigureReason = "start" | "progress" | "end" | "final";
+
+function figureStamp(ms: number): string {
+  return new Date(ms).toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+}
+
+function figureStampMs(stamp: string): number {
+  const match = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/.exec(stamp);
+  return match ? Date.UTC(+match[1], +match[2] - 1, +match[3], +match[4], +match[5], +match[6]) : Number.NaN;
+}
+
 function safeIdentifier(value: string, label: string): string {
   if (!/^[A-Za-z0-9._-]+$/.test(value)) throw new Error(`Invalid ${label}`);
   return value;
@@ -536,11 +554,11 @@ function sanitizeEvidence(value: unknown, key = ""): unknown {
   return undefined;
 }
 
-function incidentReport(event: DetectionEvent): string {
+function incidentReport(event: DetectionEvent, hasFigure = false): string {
   const evidence = event.evidenceStrength === "Medium" ? "Medium" : "Low";
   const affected = event.affectedLabel ?? event.bandLabel;
   const range = `${(event.affectedRangeHz[0] / 1_000_000).toFixed(3)}-${(event.affectedRangeHz[1] / 1_000_000).toFixed(3)} MHz`;
-  return `<!doctype html><html lang="en"><meta charset="utf-8"><title>RF incident ${escapeHtml(event.id)}</title><style>body{max-width:820px;margin:40px auto;padding:0 24px;font:16px/1.55 Arial,sans-serif;color:#142536}h1{font-size:28px}dl{display:grid;grid-template-columns:170px 1fr;border-top:1px solid #ccd5dc}dt,dd{margin:0;padding:10px;border-bottom:1px solid #e1e6ea}dt{font-weight:700;background:#f4f7f9}.limit{margin-top:24px;padding:12px;border-left:4px solid #bd7a00;background:#fff8e7}</style><body><h1>Suspected RF interference</h1><dl><dt>Affected signal</dt><dd>${escapeHtml(safeEvidenceString(affected))}</dd><dt>Frequency</dt><dd>${escapeHtml(range)}</dd><dt>Started</dt><dd>${escapeHtml(event.startedAt)}</dd><dt>Last observed</dt><dd>${escapeHtml(event.lastSeenAt)}</dd><dt>Observation</dt><dd>${escapeHtml(safeEvidenceString(event.observed))}</dd><dt>Action</dt><dd>${escapeHtml(safeEvidenceString(event.recommendedAction))}</dd><dt>Evidence strength</dt><dd>${evidence}</dd><dt>Lifecycle</dt><dd>${escapeHtml(event.lifecycle ?? "active")}</dd></dl><p class="limit">RF data can show interference, not intent. This tamper-evident engineering archive is not a certified legal chain of custody.</p></body></html>`;
+  return `<!doctype html><html lang="en"><meta charset="utf-8"><title>RF incident ${escapeHtml(event.id)}</title><style>body{max-width:1200px;margin:40px auto;padding:0 24px;font:16px/1.55 Arial,sans-serif;color:#142536}h1{font-size:28px}dl{display:grid;grid-template-columns:170px 1fr;border-top:1px solid #ccd5dc}dt,dd{margin:0;padding:10px;border-bottom:1px solid #e1e6ea}dt{font-weight:700;background:#f4f7f9}figure{margin:24px 0}figure svg{width:100%;height:auto}.limit{margin-top:24px;padding:12px;border-left:4px solid #bd7a00;background:#fff8e7}</style><body><h1>Suspected RF interference</h1><dl><dt>Affected signal</dt><dd>${escapeHtml(safeEvidenceString(affected))}</dd><dt>Frequency</dt><dd>${escapeHtml(range)}</dd><dt>Started</dt><dd>${escapeHtml(event.startedAt)}</dd><dt>Last observed</dt><dd>${escapeHtml(event.lastSeenAt)}</dd><dt>Observation</dt><dd>${escapeHtml(safeEvidenceString(event.observed))}</dd><dt>Action</dt><dd>${escapeHtml(safeEvidenceString(event.recommendedAction))}</dd><dt>Evidence strength</dt><dd>${evidence}</dd><dt>Lifecycle</dt><dd>${escapeHtml(event.lifecycle ?? "active")}</dd></dl>${hasFigure ? `<figure><img src="figures/incident-overview.svg" alt="Incident figure: spectrum, waterfall and timeline">` + `<figcaption>Open <a href="figures/incident-overview.svg">figures/incident-overview.svg</a> or <a href="figures/waterfall.png">figures/waterfall.png</a>. Derived from the recorded frames; the frames are the evidence.</figcaption></figure>` : `<p>No incident figure is available in this package; see figures/figure.json.</p>`}<p class="limit">RF data can show interference, not intent. This tamper-evident engineering archive is not a certified legal chain of custody.</p></body></html>`;
 }
 
 async function writeAtomic(filePath: string, contents: string | Uint8Array): Promise<void> {
@@ -1092,6 +1110,13 @@ export class EvidenceStore {
       await mkdir(path.join(stagingPath, "spectrum", "raw"), { recursive: true });
       const slice = await this.writeIncidentFrameSlice(sessions, exportEvent, stagingPath);
       if (slice.legacyFrameCount > 0) missingParts.push(`legacy-frame-provenance:${slice.legacyFrameCount}`);
+      // A derived picture of the slice above. It can never make the evidence incomplete or fail the export.
+      const overheadReserve = Math.min(1024 * 1024, Math.floor(this.exportPartMaxBytes * 0.35));
+      const figure = await this.renderIncidentFigure(stagingPath, exportEvent, slice, baselineReference, {
+        generatedAtMs: Date.now(),
+        // One figure file may never crowd out the evidence in a size-bounded part.
+        maxFileBytes: Math.floor((this.exportPartMaxBytes - overheadReserve) / 4),
+      });
       const completeness = {
         dataDomain: this.dataDomain,
         complete: missingParts.length === 0,
@@ -1105,7 +1130,8 @@ export class EvidenceStore {
       };
       await Promise.all([
         writeAtomic(path.join(stagingPath, "incident.json"), JSON.stringify(sanitizeEvidence({ ...exportEvent, exportCompleteness: completeness }), null, 2)),
-        writeAtomic(path.join(stagingPath, "report.html"), incidentReport(exportEvent)),
+        writeAtomic(path.join(stagingPath, "report.html"), incidentReport(exportEvent, Boolean(figure.svg))),
+        this.writeIncidentFigureFiles(stagingPath, figure),
         writeAtomic(path.join(stagingPath, "completeness.json"), JSON.stringify(completeness, null, 2)),
         writeAtomic(path.join(stagingPath, "slice.json"), JSON.stringify({
           schemaVersion: 2,
@@ -2564,6 +2590,224 @@ export class EvidenceStore {
       startedAt: new Date(startedAtMs).toISOString(),
       endedAt: new Date(endedAtMs).toISOString(),
     };
+  }
+
+  /**
+   * Saves a time-stamped picture of one incident under `incident-figures/<incident>/`. It reads only
+   * the recorded frames (staged first, exactly like an export) and never changes evidence. Returns
+   * undefined when there is nothing to draw from.
+   */
+  async saveIncidentFigureSnapshot(
+    event: DetectionEvent,
+    options: { reason: IncidentFigureReason; baselineReference?: object; now?: number },
+  ): Promise<{ stamp: string; svgPath: string; pngPath: string } | undefined> {
+    if (event.syntheticExercise) return undefined;
+    if (this.recordingDeletionActive) return undefined;
+    const incidentId = safeIdentifier(event.id, "event id");
+    const now = options.now ?? Date.now();
+    const sessions: EvidenceSession[] = [];
+    for (const sessionId of new Set([event.sessionId, ...(event.sessionIds ?? [])])) {
+      try {
+        const candidate = await this.sessionForId(sessionId);
+        if (candidate.lifecycle !== "Corrupt" && candidate.status !== "storage-error") sessions.push(candidate);
+      } catch {
+        // A session that was removed or cannot be read simply contributes no frames.
+      }
+    }
+    if (!sessions.length) return undefined;
+    const exportsPath = path.join(this.root, "exports");
+    const stagingPath = path.join(exportsPath, `.figure-${incidentId}.partial-${randomUUID().slice(0, 8)}`);
+    this.assertContained(stagingPath);
+    this.updateLease(this.exportPathLeases, stagingPath, 1);
+    try {
+      await mkdir(path.join(stagingPath, "spectrum", "raw"), { recursive: true });
+      const slice = await this.writeIncidentFrameSlice(sessions, event, stagingPath);
+      if (slice.frameCount === 0) return undefined;
+      const figure = await this.renderIncidentFigure(stagingPath, event, slice, options.baselineReference, {
+        generatedAtMs: now,
+        maxFileBytes: INCIDENT_FIGURE_MAX_FILE_BYTES,
+      });
+      if (!figure.svg || !figure.png) return undefined;
+      const directory = path.join(this.root, INCIDENT_FIGURE_DIRECTORY, incidentId);
+      this.assertContained(directory);
+      const stamp = figureStamp(now);
+      const svgPath = path.join(directory, `${stamp}-${options.reason}.svg`);
+      const pngPath = path.join(directory, `${stamp}-${options.reason}.png`);
+      await writeAtomic(pngPath, figure.png);
+      await writeAtomic(svgPath, figure.svg);
+      return { stamp, svgPath, pngPath };
+    } finally {
+      this.updateLease(this.exportPathLeases, stagingPath, -1);
+      await rm(stagingPath, { recursive: true, force: true });
+    }
+  }
+
+  /** Newest saved picture for an incident, or undefined. Only names this store wrote are served. */
+  async readIncidentFigure(incidentId: string, kind: "svg" | "png"): Promise<{ bytes: Buffer; stamp: string; reason: IncidentFigureReason } | undefined> {
+    const directory = path.join(this.root, INCIDENT_FIGURE_DIRECTORY, safeIdentifier(incidentId, "event id"));
+    this.assertContained(directory);
+    let names: string[];
+    try {
+      names = await readdir(directory);
+    } catch {
+      return undefined;
+    }
+    const candidates = names
+      .map((name) => ({ name, match: INCIDENT_FIGURE_NAME.exec(name) }))
+      .filter((entry): entry is { name: string; match: RegExpExecArray } => entry.match !== null && entry.match[3] === kind)
+      .sort((left, right) => right.name.localeCompare(left.name));
+    const newest = candidates[0];
+    if (!newest) return undefined;
+    const file = path.join(directory, newest.name);
+    const details = await lstat(file);
+    if (!details.isFile() || details.size > INCIDENT_FIGURE_MAX_FILE_BYTES) return undefined;
+    return { bytes: await readFile(file), stamp: newest.match[1], reason: newest.match[2] as IncidentFigureReason };
+  }
+
+  /** Incident ids that currently have a saved picture, for the history list. */
+  async listIncidentFigureIds(): Promise<Set<string>> {
+    try {
+      const entries = await readdir(path.join(this.root, INCIDENT_FIGURE_DIRECTORY), { withFileTypes: true });
+      return new Set(entries.filter((entry) => entry.isDirectory() && /^[A-Za-z0-9._-]+$/.test(entry.name)).map((entry) => entry.name));
+    } catch {
+      return new Set();
+    }
+  }
+
+  /**
+   * Deletes saved pictures older than the retention period, then the oldest ones beyond the hard file
+   * cap. Only files this store names are touched, and symbolic links are never followed.
+   */
+  async pruneIncidentFigures(retentionMs: number, now = Date.now(), maxFiles = INCIDENT_FIGURE_MAX_FILES): Promise<{ removedFiles: number; keptFiles: number }> {
+    if (!Number.isSafeInteger(retentionMs) || retentionMs <= 0) return { removedFiles: 0, keptFiles: 0 };
+    const base = path.join(this.root, INCIDENT_FIGURE_DIRECTORY);
+    let incidents;
+    try {
+      incidents = await readdir(base, { withFileTypes: true });
+    } catch {
+      return { removedFiles: 0, keptFiles: 0 };
+    }
+    const files: Array<{ file: string; at: number; directory: string }> = [];
+    for (const incident of incidents) {
+      if (!incident.isDirectory() || !/^[A-Za-z0-9._-]+$/.test(incident.name)) continue;
+      const directory = path.join(base, incident.name);
+      for (const entry of await readdir(directory, { withFileTypes: true }).catch(() => [])) {
+        const match = entry.isFile() ? INCIDENT_FIGURE_NAME.exec(entry.name) : null;
+        if (!match) continue;
+        const at = figureStampMs(match[1]);
+        files.push({ file: path.join(directory, entry.name), at: Number.isFinite(at) ? at : 0, directory });
+      }
+    }
+    files.sort((left, right) => left.at - right.at);
+    const expired = new Set(files.filter((entry) => now - entry.at > retentionMs).map((entry) => entry.file));
+    const remaining = files.filter((entry) => !expired.has(entry.file));
+    for (const entry of remaining.slice(0, Math.max(0, remaining.length - maxFiles))) expired.add(entry.file);
+    let removed = 0;
+    for (const entry of files) {
+      if (!expired.has(entry.file)) continue;
+      await unlink(entry.file).then(() => { removed += 1; }, () => undefined);
+    }
+    for (const incident of incidents) {
+      // rmdir only removes an empty directory, so an incident that still has pictures is untouched.
+      if (incident.isDirectory()) await rmdir(path.join(base, incident.name)).catch(() => undefined);
+    }
+    return { removedFiles: removed, keptFiles: files.length - removed };
+  }
+
+  private async writeIncidentFigureFiles(
+    destination: string,
+    figure: { svg?: string; png?: Uint8Array; summary: IncidentFigureSummary | { state: "unavailable"; reason: string } },
+  ): Promise<void> {
+    const directory = path.join(destination, "figures");
+    await mkdir(directory, { recursive: true });
+    const writes = [writeAtomic(path.join(directory, "figure.json"), `${JSON.stringify(figure.summary, null, 2)}\n`)];
+    if (figure.svg && figure.png) {
+      writes.push(writeAtomic(path.join(directory, "incident-overview.svg"), figure.svg));
+      writes.push(writeAtomic(path.join(directory, "waterfall.png"), figure.png));
+    }
+    await Promise.all(writes);
+  }
+
+  /**
+   * Draws the incident overview from the already-staged frame slice (never from live sources), so the
+   * picture is reproducible from exactly the bytes that are hashed into the package.
+   */
+  private async renderIncidentFigure(
+    stagingPath: string,
+    event: DetectionEvent,
+    slice: IncidentSliceSummary,
+    baselineReference: object | undefined,
+    options: { generatedAtMs: number; maxFileBytes: number },
+  ): Promise<{ svg?: string; png?: Uint8Array; summary: IncidentFigureSummary | { state: "unavailable"; reason: string } }> {
+    const handles = new Map<string, Awaited<ReturnType<typeof open>>>();
+    try {
+      const indexPath = path.join(stagingPath, "spectrum", "frames.jsonl");
+      const timestamps: number[] = [];
+      for await (const indexed of boundedJsonlRecords<Record<string, unknown>>(indexPath, "Incident figure index", false)) {
+        const frame = isRecord(indexed.frame) ? indexed.frame : undefined;
+        const at = typeof frame?.timestamp === "string" ? Date.parse(frame.timestamp) : Number.NaN;
+        if (Number.isFinite(at)) timestamps.push(at);
+      }
+      timestamps.sort((left, right) => left - right);
+      const incidentStartMs = Date.parse(event.startedAt);
+      const incidentEndMs = Date.parse(event.clearedAt ?? event.endedAt ?? event.lastSeenAt);
+      let baseline: { median: Uint8Array; mad: Uint8Array } | undefined;
+      const arrays = isRecord(baselineReference) && isRecord((baselineReference as Record<string, unknown>).arrays)
+        ? (baselineReference as { arrays: Record<string, unknown> }).arrays
+        : undefined;
+      if (arrays && typeof arrays.medianBase64 === "string" && typeof arrays.madBase64 === "string") {
+        const median = Uint8Array.from(Buffer.from(arrays.medianBase64, "base64"));
+        const mad = Uint8Array.from(Buffer.from(arrays.madBase64, "base64"));
+        if (median.length > 0 && median.length === mad.length) baseline = { median, mad };
+      }
+      const builder = new IncidentFigureBuilder({
+        incidentId: event.id,
+        label: event.affectedLabel ?? event.bandLabel,
+        rangeHz: event.affectedRangeHz,
+        evidenceStrength: event.evidenceStrength === "Medium" ? "Medium" : "Low",
+        lifecycle: event.lifecycle ?? "active",
+        observed: event.observed,
+        windowStartMs: Date.parse(slice.startedAt),
+        windowEndMs: Date.parse(slice.endedAt),
+        incidentStartMs,
+        incidentEndMs,
+        baseline,
+        sourceFramesSha256: await sha256File(indexPath),
+        frameTimestampsMs: timestamps,
+        generatedAtMs: options.generatedAtMs,
+      });
+      for await (const indexed of boundedJsonlRecords<Record<string, unknown>>(indexPath, "Incident figure frames", false)) {
+        const decoded = this.decodeIndexedFrameRecord(indexed, "Incident figure frames");
+        const frame = decoded.frame;
+        let handle = handles.get(decoded.rawFile);
+        if (!handle) {
+          handle = await open(this.resolveWithin(stagingPath, decoded.rawFile), "r");
+          handles.set(decoded.rawFile, handle);
+        }
+        const bins = Buffer.alloc(decoded.rawLength);
+        const { bytesRead } = await handle.read(bins, 0, decoded.rawLength, decoded.rawOffset);
+        if (bytesRead !== decoded.rawLength) throw new Error("Incident figure frame is shorter than its index");
+        const analysisStartBin = Number.isSafeInteger(frame.analysisStartBin) ? (frame.analysisStartBin as number) : 0;
+        const analysisEndBin = Number.isSafeInteger(frame.analysisEndBin) ? (frame.analysisEndBin as number) : decoded.rawLength;
+        builder.add({
+          timestampMs: Date.parse(frame.timestamp as string),
+          bins: new Uint8Array(bins.buffer, bins.byteOffset, bins.byteLength),
+          startHz: frame.startHz as number,
+          endHz: frame.endHz as number,
+          analysisStartBin,
+          analysisEndBin,
+        });
+      }
+      const result = builder.finish();
+      if (Buffer.byteLength(result.svg) > options.maxFileBytes || result.waterfallPng.byteLength > options.maxFileBytes) {
+        return { summary: { state: "unavailable", reason: "figure is larger than this archive part size allows" } };
+      }
+      return { svg: result.svg, png: result.waterfallPng, summary: result.summary };
+    } catch (error) {
+      return { summary: { state: "unavailable", reason: error instanceof Error ? error.message.slice(0, 200) : "figure could not be drawn" } };
+    } finally {
+      await Promise.all([...handles.values()].map((handle) => handle.close().catch(() => undefined)));
+    }
   }
 
   private async writeIncidentEventHistory(sessions: readonly EvidenceSession[], eventId: string, destination: string): Promise<void> {

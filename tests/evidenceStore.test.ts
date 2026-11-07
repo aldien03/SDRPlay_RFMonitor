@@ -400,8 +400,84 @@ describe("evidence store", { timeout: 60_000 }, () => {
     expect(entries.get(`${packageRoot}/spectrum/raw/frames-2026-01-01T12-part-001.bin`)?.contents).toEqual(Buffer.from([10, 20, 30, 40]));
     expect(JSON.parse(entries.get(`${packageRoot}/manifest.json`)?.contents.toString("utf8") ?? "{}").schemaVersion).toBe(2);
     expect(`${report}\n${incidentPayload}\n${frameLines.join("\n")}`).not.toMatch(/confidence|dbm|spoof/i);
+    // The derived figure sheet is in the package, hashed with everything else, and carries the wording limits.
+    const figureSvg = entries.get(`${packageRoot}/figures/incident-overview.svg`)?.contents.toString("utf8") ?? "";
+    const figurePng = entries.get(`${packageRoot}/figures/waterfall.png`)?.contents;
+    const figureSummary = JSON.parse(entries.get(`${packageRoot}/figures/figure.json`)?.contents.toString("utf8") ?? "{}");
+    expect(figureSvg).toContain("<svg");
+    expect(figureSvg).toContain("RF data can show interference, not intent.");
+    expect(figureSvg).not.toMatch(/confidence|dbm|spoof/i);
+    expect(figurePng?.subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+    expect(figureSummary).toMatchObject({ derived: true, framesUsed: 1, levelScale: "relative-uncalibrated-uint8" });
+    expect(figureSummary.sourceFramesSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(report).toContain('src="figures/incident-overview.svg"');
+    expect(figureSummary.generatedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(figureSvg).toContain("Figure generated (UTC)");
+    const exportedManifest = JSON.parse(entries.get(`${packageRoot}/manifest.json`)?.contents.toString("utf8") ?? "{}");
+    for (const name of ["figures/incident-overview.svg", "figures/waterfall.png", "figures/figure.json"]) {
+      expect(exportedManifest.files.some((entry: { path: string }) => entry.path === name)).toBe(true);
+    }
     await expect(stat(path.join(session.path, "events", "incident-event-1.html"))).rejects.toThrow();
     expect((await readdir(path.join(root, "exports"))).every((name) => !name.includes(".partial-"))).toBe(true);
+  });
+
+  it("saves a time-stamped incident picture automatically, serves the newest, and prunes by age and count", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "rf-monitor-figure-snapshots-"));
+    temporaryRoots.push(root);
+    const store = new EvidenceStore(root);
+    const session = await store.initialize({ config: {}, sdrconnect: {} });
+    await store.recordFrame(frame(), {});
+    const incident = event(session.id);
+    await store.recordEvent(incident);
+
+    // The session is still recording: a snapshot must work from the live files.
+    const first = await store.saveIncidentFigureSnapshot(incident, { reason: "start", now: Date.parse("2026-11-07T06:00:00.000Z") });
+    const second = await store.saveIncidentFigureSnapshot(incident, { reason: "end", now: Date.parse("2026-11-07T06:30:12.000Z") });
+    expect(first?.stamp).toBe("20261107T060000Z");
+    expect(second?.svgPath).toContain(`incident-figures/${incident.id}/20261107T063012Z-end.svg`);
+    const svg = await readFile(second!.svgPath, "utf8");
+    expect(svg).toContain("Figure generated (UTC) 2026-11-07 06:30:12");
+    expect((await readFile(second!.pngPath)).subarray(0, 4)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+
+    const newest = await store.readIncidentFigure(incident.id, "svg");
+    expect(newest).toMatchObject({ stamp: "20261107T063012Z", reason: "end" });
+    expect(newest?.bytes.toString("utf8")).toContain("<svg");
+    expect(await store.readIncidentFigure("no-such-incident", "svg")).toBeUndefined();
+    expect([...(await store.listIncidentFigureIds())]).toEqual([incident.id]);
+    await expect(store.readIncidentFigure("../escape", "svg")).rejects.toThrow("Invalid event id");
+
+    // Files this store did not write are never deleted, even inside the figure folder.
+    const stray = path.join(path.dirname(second!.svgPath), "notes.txt");
+    await writeFile(stray, "keep me");
+    const now = Date.parse("2026-11-07T07:00:00.000Z");
+    expect(await store.pruneIncidentFigures(45 * 60_000, now)).toEqual({ removedFiles: 2, keptFiles: 2 });
+    expect((await readdir(path.dirname(second!.svgPath))).sort()).toEqual(["20261107T063012Z-end.png", "20261107T063012Z-end.svg", "notes.txt"]);
+    // Past the retention, everything of ours goes and the stray file keeps its folder.
+    expect(await store.pruneIncidentFigures(60_000, now)).toEqual({ removedFiles: 2, keptFiles: 0 });
+    expect(await readFile(stray, "utf8")).toBe("keep me");
+
+    // The hard cap holds even when retention is long.
+    await rm(stray);
+    for (const minute of [1, 2, 3, 4]) await store.saveIncidentFigureSnapshot(incident, { reason: "progress", now: Date.parse(`2026-11-07T06:0${minute}:00.000Z`) });
+    expect(await store.pruneIncidentFigures(30 * 86_400_000, now, 4)).toEqual({ removedFiles: 4, keptFiles: 4 });
+    expect((await readdir(path.dirname(second!.svgPath))).sort()).toEqual([
+      "20261107T060300Z-progress.png", "20261107T060300Z-progress.svg", "20261107T060400Z-progress.png", "20261107T060400Z-progress.svg",
+    ]);
+    expect(await store.pruneIncidentFigures(0, now)).toEqual({ removedFiles: 0, keptFiles: 0 });
+  });
+
+  it("saves no picture for a simulation incident or when there are no frames", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "rf-monitor-figure-none-"));
+    temporaryRoots.push(root);
+    const store = new EvidenceStore(root);
+    const session = await store.initialize({ config: {}, sdrconnect: {} });
+    const incident = event(session.id);
+    await store.recordEvent(incident);
+    expect(await store.saveIncidentFigureSnapshot(incident, { reason: "start" })).toBeUndefined();
+    await store.recordFrame(frame(), {});
+    const synthetic = { ...incident, id: "synthetic-1", syntheticExercise: { runId: "run-1" } } as unknown as DetectionEvent;
+    expect(await store.saveIncidentFigureSnapshot(synthetic, { reason: "start" })).toBeUndefined();
+    expect((await store.listIncidentFigureIds()).size).toBe(0);
   });
 
   it("rejects unsupported RF-only claims from new evidence writes", async () => {

@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useRef } from "react";
 import type { SignalMetricSample, SpectrumFrame } from "../shared/types";
-import { buildWaterfallPalette, composeWaterfall, rasterizeRow, waterfallColor } from "./waterfallRaster";
+import { buildWaterfallPalette, composeWaterfall, rasterizeRow, waterfallColor } from "../shared/waterfallRaster";
 import { detectorAnalysisForFrame, detectorAnomalyRanges, detectorBaselineAvailable } from "./detectorPresentation";
 
 export interface ViewRange { startHz: number; endHz: number }

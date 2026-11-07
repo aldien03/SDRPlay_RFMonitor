@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { CLIENT_DATA_LATE_AFTER_MS, decodeSpectrumEnvelope } from "../shared/liveProtocol";
 import { detectorAnomalyRanges } from "./detectorPresentation";
-import { buildWaterfallPalette, composeWaterfall, rasterizeRow } from "./waterfallRaster";
+import { buildWaterfallPalette, composeWaterfall, rasterizeRow } from "../shared/waterfallRaster";
 import { liveSubscriptionSignature, MAX_VISIBLE_TARGETS, normalizeLiveSubscription, sameStringSet } from "../shared/liveSubscription";
 import {
   MAX_OPERATOR_AFFECTED_TARGETS,

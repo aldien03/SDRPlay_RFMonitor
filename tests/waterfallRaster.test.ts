@@ -7,7 +7,7 @@ import {
   rasterizeRow,
   waterfallColor,
   waterfallRgb,
-} from "../src/client/waterfallRaster";
+} from "../src/shared/waterfallRaster";
 import { visibleBinWindow } from "../src/client/SpectrumViews";
 
 const palette = buildWaterfallPalette();

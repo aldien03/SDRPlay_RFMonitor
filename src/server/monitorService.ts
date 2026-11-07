@@ -5,7 +5,7 @@ import path from "node:path";
 import type { AppConfig } from "./config";
 import { aggregateVisitFrames, centralAnalysisBinBounds, createBaselineFingerprint, detectionRuleFingerprint, DetectionEngine, projectDetectorAnalysisToFrame, type DetectionBaselineReference, type DetectionResult } from "../shared/detection";
 import { compileScanTargets, createScanJobs, describeMonitorTarget, estimateRevisitMs, monitorTargetId, type CompiledScanTarget } from "../shared/bands";
-import { captureTargetTierForProfile, createServiceSummaries, validFocusFrequencies } from "../shared/settings";
+import { captureTargetTierForProfile, createServiceSummaries, incidentFigurePolicy, validFocusFrequencies } from "../shared/settings";
 import { getMonitoringReadiness } from "../shared/monitoring";
 import { createMonitorFeeds, createMonitorGroups } from "../shared/monitorGroups";
 import { assertRfOnlyDetectionClaim, normalizeReceiverSerial } from "../shared/productContract";
@@ -51,7 +51,8 @@ import type {
   SweepCycle,
   SweepSegment,
 } from "../shared/types";
-import { EvidenceStore, WRITER_ORDINARY_MAX_BYTES, WRITER_ORDINARY_MAX_ITEMS, type EvidenceInterruptionContext } from "./evidenceStore";
+import { EvidenceStore, WRITER_ORDINARY_MAX_BYTES, WRITER_ORDINARY_MAX_ITEMS, type EvidenceInterruptionContext, type IncidentFigureReason } from "./evidenceStore";
+import { IncidentFigureScheduler } from "./incidentFigureScheduler";
 import {
   type ScreenshotAdmissionLease,
   validateScreenshotPng,
@@ -289,6 +290,14 @@ export class MonitorService extends EventEmitter {
   private readonly frameCounters = new Map<string, number>();
   private simulator?: NodeJS.Timeout;
   private maintenanceTimer?: NodeJS.Timeout;
+  /** Pictures are drawn one at a time, after the evidence they read has been recorded. */
+  private figureQueue: Promise<void> = Promise.resolve();
+  private figureQueueDepth = 0;
+  private lastFigurePruneAt = 0;
+  private figureFailureLoggedAt = 0;
+  private readonly figureScheduler = new IncidentFigureScheduler({
+    request: (event, reason) => this.requestIncidentFigure(event, reason),
+  });
   private snapshotTimer?: NodeJS.Timeout;
   private receiverHealthTimer?: NodeJS.Timeout;
   private lastSnapshotBroadcastAt = 0;
@@ -459,6 +468,9 @@ export class MonitorService extends EventEmitter {
   }
 
   async stop(): Promise<void> {
+    this.figureScheduler.stop();
+    // Let a picture that is already being drawn finish, but never hold up shutdown for long.
+    await Promise.race([this.figureQueue, new Promise<void>((resolve) => setTimeout(resolve, 5_000).unref())]);
     this.clearSyntheticExercise(false);
     for (const assignment of this.assignments) if (assignment.timer) clearTimeout(assignment.timer);
     if (this.simulator) clearInterval(this.simulator);
@@ -1296,6 +1308,7 @@ export class MonitorService extends EventEmitter {
       openEvent.lifecycle = "ended-unknown";
       openEvent.endedAt = new Date().toISOString();
       openEvent.endReason = "Signal learning was restarted by the operator while this observation was active";
+      this.figureScheduler.eventEnded(openEvent);
       if (this.evidenceHealthy) void this.persistEvent({ ...openEvent }).catch((error) => this.markStorageError(error));
     }
     this.activeEventsByTarget.delete(operation.targetId);
@@ -1900,6 +1913,7 @@ export class MonitorService extends EventEmitter {
         event.lifecycle = "ended-unknown";
         event.endedAt = interruptedAt;
         event.endReason = "RF configuration changed before ten clean observations";
+        this.figureScheduler.eventEnded(event);
         if (this.evidenceHealthy) await this.persistEvent({ ...event }).catch((error) => this.markStorageError(error));
       }
       if (this.evidenceHealthy && (interruptedEvents.length || this.postClearUntilByTarget.size)) {
@@ -1969,6 +1983,7 @@ export class MonitorService extends EventEmitter {
       if (this.maintenanceTimer) clearInterval(this.maintenanceTimer);
       this.maintenanceTimer = setInterval(() => void this.runStorageMaintenance(), nextConfig.retentionPolicy.maintenanceIntervalMs);
       this.maintenanceTimer.unref();
+      this.lastFigurePruneAt = 0;
     } catch (error) {
       this.config = previous;
       this.detector = new DetectionEngine(previous.detectionThresholds);
@@ -2131,10 +2146,12 @@ export class MonitorService extends EventEmitter {
     for (const event of this.events) {
       if ((event.sessionIds ?? [event.sessionId]).includes(sessionId)) latestById.set(event.id, event);
     }
+    const figureIds = await this.evidence.listIncidentFigureIds();
     return [...latestById.values()]
       .sort((left, right) => right.startedAt.localeCompare(left.startedAt))
       .map((event) => ({
         ...event,
+        figureAvailable: figureIds.has(event.id),
         notes: event.notes.slice(-8).map((note) => ({ ...note, text: note.text.slice(0, 512) })),
       }));
   }
@@ -2255,6 +2272,49 @@ export class MonitorService extends EventEmitter {
     }
   }
 
+  /**
+   * Draws one time-stamped picture of an incident, if the operator has left that on. Best effort: it
+   * is skipped under resource pressure and a failure never affects monitoring or evidence health.
+   */
+  private requestIncidentFigure(event: DetectionEvent, reason: IncidentFigureReason): void {
+    if (event.syntheticExercise || !this.evidenceHealthy) return;
+    if (!incidentFigurePolicy(this.config.retentionPolicy).enabled) return;
+    if (this.resourcePressureActive || this.hostMemoryPressureActive || this.reconfiguring) return;
+    // Bounded: a flood of requests cannot build an unbounded queue behind a slow disk.
+    if (this.figureQueueDepth >= 8) return;
+    this.figureQueueDepth += 1;
+    this.figureQueue = this.figureQueue.then(async () => {
+      try {
+        if (!incidentFigurePolicy(this.config.retentionPolicy).enabled || this.resourcePressureActive || this.hostMemoryPressureActive) return;
+        await this.evidence.saveIncidentFigureSnapshot({ ...event }, { reason, baselineReference: this.baselineReferenceFor(event) });
+      } catch (error) {
+        const now = Date.now();
+        if (now - this.figureFailureLoggedAt > 10 * 60_000) {
+          this.figureFailureLoggedAt = now;
+          console.warn(`Incident image was not saved: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      } finally {
+        this.figureQueueDepth = Math.max(0, this.figureQueueDepth - 1);
+      }
+    });
+  }
+
+  /** Deletes saved incident pictures past the chosen number of days. Runs even if saving is switched off. */
+  private async pruneIncidentFigures(): Promise<void> {
+    const now = Date.now();
+    if (now - this.lastFigurePruneAt < 30 * 60_000) return;
+    this.lastFigurePruneAt = now;
+    try {
+      await this.evidence.pruneIncidentFigures(incidentFigurePolicy(this.config.retentionPolicy).retentionMs, now);
+    } catch (error) {
+      console.warn(`Incident images could not be cleaned up: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  async getIncidentFigure(eventId: string, kind: "svg" | "png") {
+    return this.evidence.readIncidentFigure(eventId, kind);
+  }
+
   async runStorageMaintenance(): Promise<StorageMaintenanceStatus> {
     if (this.reconfiguring) return this.storageMaintenance;
     if (this.maintenanceRunning) return this.storageMaintenance;
@@ -2290,6 +2350,7 @@ export class MonitorService extends EventEmitter {
         .flatMap((event) => [event.sessionId, ...(event.sessionIds ?? [])]));
       const report = await this.evidence.maintain(this.config.retentionPolicy, Date.now(), protectedSessionIds);
       this.storageMaintenance = report;
+      await this.pruneIncidentFigures();
       if (report.deletedSessionIds.length) {
         const deleted = new Set(report.deletedSessionIds);
         this.events = this.events.filter((event) => (event.sessionIds ?? [event.sessionId]).some((sessionId) => !deleted.has(sessionId)));
@@ -3575,6 +3636,7 @@ export class MonitorService extends EventEmitter {
         if (event) {
           event.lifecycle = "cleared";
           event.clearedAt = timestamp;
+          this.figureScheduler.eventEnded(event);
           this.activeEventsByTarget.delete(targetId);
           if (!event.syntheticExercise) {
             this.postClearUntilByTarget.set(targetId, Date.parse(timestamp) + 10 * 60_000);
@@ -3617,6 +3679,7 @@ export class MonitorService extends EventEmitter {
       existing.lifecycle = "cleared";
       existing.clearedAt = candidate.startedAt;
       if (this.evidenceHealthy) void this.persistEvent({ ...existing }).catch((error) => this.markStorageError(error));
+      this.figureScheduler.eventEnded(existing);
     }
     const event: DetectionEvent = {
       ...candidate,
@@ -3632,6 +3695,7 @@ export class MonitorService extends EventEmitter {
     this.events = [event, ...this.events].slice(0, 100);
     this.refreshActiveEvent();
     if (this.evidenceHealthy) void this.persistEvent(event).catch((error) => this.markStorageError(error));
+    this.figureScheduler.eventStarted(event);
     return event;
   }
 

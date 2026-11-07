@@ -15,6 +15,8 @@ import {
   validateBandCatalog,
   SettingsValidationError,
   validateOperationalSettings,
+  incidentFigurePolicy,
+  DEFAULT_INCIDENT_FIGURE_RETENTION_MS,
 } from "../src/shared/settings";
 import type { OperationalSettings } from "../src/shared/types";
 import { FOUR_DX_BAND, TEST_CATALOG } from "./catalogFixture";
@@ -244,6 +246,28 @@ describe("operational monitoring settings", () => {
       retention: { retentionMs: 7 * 86_400_000 },
     });
     expect(monitoringMissionForSettings(migrated, TEST_CATALOG)).toBe("gnss-survey");
+  });
+
+  it("treats settings saved before incident images existed as on for 30 days, and validates the user's choice", () => {
+    const current = defaults();
+    expect(incidentFigurePolicy(current.retention)).toEqual({ enabled: true, retentionMs: DEFAULT_INCIDENT_FIGURE_RETENTION_MS });
+    expect(DEFAULT_INCIDENT_FIGURE_RETENTION_MS).toBe(30 * 86_400_000);
+    expect(validateOperationalSettings(structuredClone(current), TEST_CATALOG).retention.incidentFigureRetentionMs).toBeUndefined();
+
+    const chosen = structuredClone(current);
+    chosen.retention.incidentFiguresEnabled = false;
+    chosen.retention.incidentFigureRetentionMs = 7 * 86_400_000;
+    expect(incidentFigurePolicy(chosen.retention)).toEqual({ enabled: false, retentionMs: 7 * 86_400_000 });
+    expect(validateOperationalSettings(chosen, TEST_CATALOG).retention).toMatchObject({ incidentFiguresEnabled: false, incidentFigureRetentionMs: 7 * 86_400_000 });
+
+    for (const bad of [0, 3_600_000, 366 * 86_400_000, 86_400_000.5]) {
+      const invalid = structuredClone(current);
+      invalid.retention.incidentFigureRetentionMs = bad;
+      expect(() => validateOperationalSettings(invalid, TEST_CATALOG)).toThrow(/Keep incident images for 1 to 365 days|Settings are invalid|invalid/i);
+    }
+    const notBoolean = structuredClone(current) as any;
+    notBoolean.retention.incidentFiguresEnabled = "yes";
+    expect(() => validateOperationalSettings(notBoolean, TEST_CATALOG)).toThrow();
   });
 
   it("catalogs the published Fugro carriers with one shared capture target", () => {

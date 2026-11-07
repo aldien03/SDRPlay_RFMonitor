@@ -1625,6 +1625,29 @@ app.get("/api/exports/:jobId/download", async (request, response) => {
   }
 });
 
+app.get("/api/events/:eventId/figure.:format", async (request, response) => {
+  const format = request.params.format;
+  if (format !== "svg" && format !== "png") {
+    response.status(404).json({ error: "Unknown image format" });
+    return;
+  }
+  try {
+    const figure = await monitor.getIncidentFigure(boundedIdentifier(request.params.eventId), format);
+    if (!figure) {
+      response.status(404).json({ error: "No saved image exists for this incident yet" });
+      return;
+    }
+    response.setHeader("Cache-Control", "no-store");
+    response.setHeader("X-Content-Type-Options", "nosniff");
+    // The image is data only. Nothing in it may run script or load anything else.
+    response.setHeader("Content-Security-Policy", "default-src 'none'; img-src data:; style-src 'unsafe-inline'; sandbox");
+    response.setHeader("Content-Disposition", `inline; filename="incident-${boundedIdentifier(request.params.eventId)}-${figure.stamp}.${format}"`);
+    response.type(format === "svg" ? "image/svg+xml" : "image/png").send(figure.bytes);
+  } catch {
+    response.status(400).json({ error: "The incident image could not be read" });
+  }
+});
+
 app.get("/api/events/:eventId/export", (request, response) => {
   if (exportBuildPressure()) {
     response.status(503).setHeader("Retry-After", "10").json({ error: "Exports are paused while RF monitoring resources recover" });

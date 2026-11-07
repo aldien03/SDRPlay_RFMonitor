@@ -17,7 +17,7 @@ import { useEffect, useMemo, useState } from "react";
 import { estimateRevisitMs } from "../shared/bands";
 import { captureWindowNaming } from "../shared/monitorGroups";
 import { presentOperatorSummary } from "../shared/operatorSummary";
-import { applyMonitoringMission, compileEffectiveBands, continuousWatchTargetId, evaluateSettingsFeasibility, monitoringMissionForSettings, ROBUST_DETECTION_DEFAULTS, selectedMonitoringTargetIds } from "../shared/settings";
+import { applyMonitoringMission, compileEffectiveBands, continuousWatchTargetId, evaluateSettingsFeasibility, incidentFigurePolicy, monitoringMissionForSettings, ROBUST_DETECTION_DEFAULTS, selectedMonitoringTargetIds } from "../shared/settings";
 import { scheduleCapacityCopy, windowSchedule, windowScheduleCopy } from "./schedulePresentation";
 import type { BandCatalog, BandPreset, BaselineApprovalEligibility, BaselineDescriptor, ChannelMonitorState, MonitorSnapshot, MonitoringMission, OperationalSettings, PhysicalCaptureTarget, SettingsRevision } from "../shared/types";
 import { formatBytes, formatFrequency, formatRange } from "./format";
@@ -954,6 +954,12 @@ function EvidenceSettings({ draft, setDraft, response, errors, disabled, dataDom
         <NumberField disabled={disabled} label="Close each session after" suffix="hours" min={1} max={24} value={hours(draft.retention.sessionMaxMs)} onChange={(value) => update("sessionMaxMs", value * 3_600_000)} />
         <NumberField disabled={disabled} label="Maximum session size" suffix="GB" min={0.1} max={2} step={0.1} value={gib(draft.retention.sessionMaxBytes)} onChange={(value) => update("sessionMaxBytes", Math.round(value * 1_073_741_824))} />
       </div>
+      <h3 className="settings-subheading">Incident images</h3>
+      <div className="settings-form-grid">
+<div className="form-field"><span>Save an image of each incident</span>        <label className="switch-control"><input type="checkbox" role="switch" aria-label="Save an image of each incident" disabled={disabled} checked={incidentFigurePolicy(draft.retention).enabled} onChange={(event) => setDraft({ ...draft, retention: { ...draft.retention, incidentFiguresEnabled: event.target.checked } })} /><span aria-hidden="true" /><b className="service-state">{incidentFigurePolicy(draft.retention).enabled ? "Save images" : "Off"}</b></label></div>
+        <NumberField disabled={disabled || !incidentFigurePolicy(draft.retention).enabled} label="Delete images after" suffix="days" min={1} max={365} value={days(incidentFigurePolicy(draft.retention).retentionMs)} onChange={(value) => update("incidentFigureRetentionMs", value * 86_400_000)} />
+      </div>
+      <p className="protected-action-hint">Each image is time stamped and saved when an incident starts, while it lasts, and when it ends. Older images are deleted automatically.</p>
       {Object.entries(errors).filter(([key]) => key.startsWith("retention.")).map(([key, text]) => <FieldError key={key} text={text} />)}
       <div className="read-only-grid"><span>Archive path</span><strong>{response.infrastructure.storageRoot}</strong><span>Current policy</span><strong>{formatBytes(response.settings.retention.storageMaxBytes)} maximum</strong></div>
       <section className="protected-actions" aria-labelledby="recording-actions-title">

@@ -105,6 +105,14 @@ Select **Acknowledge** after the incident has been seen and assigned. Acknowledg
 
 Select **Download evidence package**. The queued export contains the incident slice, not the entire session. The browser downloads it directly after the application streams its SHA-256; large incidents are numbered multipart archives without truncation.
 
+Each incident package also contains a one-page figure of that incident only, in `figures/`:
+
+- `incident-overview.svg` shows the strongest and typical signal level across the analysed window against the learned normal level, a waterfall (newest at the top, UTC on the left) with the incident start and end marked, and the strongest level per row. The same sheet is embedded in `report.html`.
+- `waterfall.png` is the waterfall image on its own, and `figure.json` lists what was drawn: frame counts, row length, and the SHA-256 of `spectrum/frames.jsonl`.
+- The figure is drawn from the exported frames only. Time gaps are shown as gaps, never filled in, and frames from a different RF setup are left out and counted. Levels are relative and uncalibrated.
+- Every figure is time stamped: the sheet states when it was generated and the UTC window it covers, and the same text is burned into the pixels of `waterfall.png`, so the image keeps its time stamp when it is copied out of the package.
+- The figure is a derived view for people who do not read raw bins. The recorded frames and the manifest hashes remain the evidence, and the figure says so on its face. If the figure cannot be drawn, `figures/figure.json` says why and the rest of the package is unaffected.
+
 Store the ZIP in the approved incident repository. Do not rename or modify its contents before verification. Record who transferred it and where it was stored according to local procedure.
 
 ### 6. Correlate Independently
@@ -355,3 +363,15 @@ The service finalizes evidence on controlled shutdown when possible. An abrupt p
 5. Leave monitoring running unless an authorized shutdown is planned.
 
 Select **Exit admin mode** before leaving an operator computer unattended.
+
+## Automatic incident images
+
+When **Settings > Recording > Incident images** is on (the default), RF Monitor saves a time-stamped image of each incident on its own, without anyone starting an export:
+
+- about one minute after the incident starts, so there is something to look at even if it never clears;
+- every 30 minutes while it stays open (at most 12 times);
+- when it ends, and once more about ten minutes later, when the post-clear recording is complete.
+
+Each save writes `incident-figures/<incident>/<UTC time>-<start|progress|end|final>.svg` and `.png` inside the evidence folder of the active data domain (Field or Test; simulation incidents never produce images). In **Evidence History** an **Image** link opens the newest saved image of an incident.
+
+Cleanup is automatic. Images older than **Delete images after** (1 to 365 days, default 30) are deleted by the regular storage maintenance, even when saving has been switched off. Independently of that setting, no more than 400 images are kept: the oldest go first. Only files this feature wrote are ever deleted. Images are skipped while the host is under memory or resource pressure, and a failure to draw one never affects monitoring or evidence health. Deleting an image does not touch the recorded evidence, and an incident package exported later still contains its own figure.

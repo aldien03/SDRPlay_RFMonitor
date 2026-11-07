@@ -297,6 +297,17 @@ export class SettingsValidationError extends Error {
   }
 }
 
+export const DEFAULT_INCIDENT_FIGURE_RETENTION_MS = 30 * 86_400_000;
+export const MAX_INCIDENT_FIGURE_RETENTION_MS = 365 * 86_400_000;
+
+/** Effective automatic incident-picture policy. Settings saved before this option existed mean "on, 30 days". */
+export function incidentFigurePolicy(retention: Pick<EvidenceRetentionPolicy, "incidentFiguresEnabled" | "incidentFigureRetentionMs">): { enabled: boolean; retentionMs: number } {
+  return {
+    enabled: retention.incidentFiguresEnabled !== false,
+    retentionMs: retention.incidentFigureRetentionMs ?? DEFAULT_INCIDENT_FIGURE_RETENTION_MS,
+  };
+}
+
 export interface OperationalSettingsSeed {
   siteName: string;
   deploymentId?: string;
@@ -725,6 +736,11 @@ export function validateOperationalSettings(input: OperationalSettings, catalog:
     if (!Number.isInteger(retention[key]) || retention[key] <= 0) fields[`retention.${key}`] = "Value must be a positive integer";
   }
   if (!Number.isInteger(retention.minimumFreeBytes) || retention.minimumFreeBytes < 0) fields["retention.minimumFreeBytes"] = "Free-space reserve cannot be negative";
+  if (retention.incidentFiguresEnabled !== undefined && typeof retention.incidentFiguresEnabled !== "boolean") fields["retention.incidentFiguresEnabled"] = "Choose on or off";
+  if (retention.incidentFigureRetentionMs !== undefined
+    && (!Number.isInteger(retention.incidentFigureRetentionMs) || retention.incidentFigureRetentionMs < 86_400_000 || retention.incidentFigureRetentionMs > MAX_INCIDENT_FIGURE_RETENTION_MS)) {
+    fields["retention.incidentFigureRetentionMs"] = "Keep incident images for 1 to 365 days";
+  }
   if (retention.sessionMaxBytes > 2 * 1024 * 1024 * 1024) fields["retention.sessionMaxBytes"] = "Session size cannot exceed the 2 GiB evidence bound";
   if (retention.sessionMaxMs > 24 * 60 * 60 * 1000) fields["retention.sessionMaxMs"] = "Session duration cannot exceed the 24-hour evidence bound";
   if (retention.storageMaxBytes < retention.sessionMaxBytes) fields["retention.storageMaxBytes"] = "Storage limit must be at least as large as one session";

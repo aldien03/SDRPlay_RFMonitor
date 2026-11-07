@@ -1011,6 +1011,63 @@ describe("bounded monitor runtime", () => {
     await monitor.stop();
   });
 
+  it("saves a time-stamped incident image when an incident ends, only while the option is on, and prunes old ones", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-20T12:00:00.000Z"));
+    const config = enableSingleRadioTarget(await temporaryConfig("incident-figure"));
+    const monitor = new MonitorService(config);
+    await monitor.start();
+    const internal = monitor as unknown as {
+      stopSimulation(): void;
+      handleSpectrum(receiverId: number, bins: Uint8Array, source: "simulation"): void;
+      figureScheduler: { eventEnded(event: Record<string, unknown>): void };
+      figureQueue: Promise<void>;
+      evidence: { currentSession?: { id: string }; flush(): Promise<void> };
+      config: { retentionPolicy: Record<string, unknown> };
+      runStorageMaintenance(): Promise<unknown>;
+    };
+    internal.stopSimulation();
+    const quiet = new Uint8Array(640).fill(30);
+    for (let index = 0; index < 4; index += 1) {
+      vi.setSystemTime(new Date(Date.parse("2026-08-20T12:00:00.000Z") + index * 2_500));
+      internal.handleSpectrum(0, quiet, "simulation");
+    }
+    await internal.evidence.flush();
+    const sessionId = internal.evidence.currentSession!.id;
+    const target = monitor.getBaselineStates()[0];
+    const incident = {
+      id: "incident-image-1", dataDomain: "test", sessionId, sessionIds: [sessionId], kind: "gnss-energy-anomaly", status: "interference-likely",
+      severity: "medium", evidenceStrength: "Medium", evidenceBasis: "test", baselineFingerprintId: target.fingerprintId, ruleSetId: "r",
+      observationId: "o", service: "gnss", bandId: "b", targetId: target.targetId, bandLabel: "Test window", affectedRangeHz: [1, 2],
+      observed: "Narrowband energy stayed above its usual level.", recommendedAction: "Keep recording.",
+      startedAt: "2026-08-20T11:59:00.000Z", lastSeenAt: "2026-08-20T12:00:10.000Z", clearedAt: "2026-08-20T12:00:10.000Z",
+      lifecycle: "cleared", notes: [], metrics: {},
+    };
+    const imageDirectory = path.join(config.dataRoots.test.evidenceRoot, "incident-figures", incident.id);
+    const savedNames = async () => (await readdir(imageDirectory).catch(() => [])).sort();
+
+    internal.config.retentionPolicy.incidentFiguresEnabled = false;
+    internal.figureScheduler.eventEnded(incident);
+    await internal.figureQueue;
+    expect(await savedNames()).toEqual([]);
+
+    internal.config.retentionPolicy.incidentFiguresEnabled = true;
+    internal.figureScheduler.eventEnded(incident);
+    await internal.figureQueue;
+    const names = await savedNames();
+    expect(names).toHaveLength(2);
+    expect(names.every((name) => /^20260820T\d{6}Z-end\.(svg|png)$/.test(name))).toBe(true);
+    expect(await readFile(path.join(imageDirectory, names.find((name) => name.endsWith(".svg"))!), "utf8")).toContain("Figure generated (UTC) 2026-08-20");
+    expect((await monitor.getIncidentFigure(incident.id, "svg"))?.reason).toBe("end");
+
+    // The user's retention choice deletes it: 1 day kept, 2 days later.
+    internal.config.retentionPolicy.incidentFigureRetentionMs = 86_400_000;
+    vi.setSystemTime(new Date("2026-08-22T12:00:00.000Z"));
+    await internal.runStorageMaintenance();
+    expect(await savedNames()).toEqual([]);
+    await monitor.stop();
+  });
+
   it("restarts signal learning for the Fugro L-band capture target", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-20T12:00:00.000Z"));
