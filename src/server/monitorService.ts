@@ -290,6 +290,8 @@ export class MonitorService extends EventEmitter {
   private readonly frameCounters = new Map<string, number>();
   private simulator?: NodeJS.Timeout;
   private maintenanceTimer?: NodeJS.Timeout;
+  /** Set as shutdown begins: no new frames are taken in once the evidence session is about to close. */
+  private stopping = false;
   /** Pictures are drawn one at a time, after the evidence they read has been recorded. */
   private figureQueue: Promise<void> = Promise.resolve();
   private figureQueueDepth = 0;
@@ -415,6 +417,7 @@ export class MonitorService extends EventEmitter {
   }
 
   async start(): Promise<void> {
+    this.stopping = false;
     // Clear test data is a global protected action even while field monitoring
     // is active, so every startup repairs its one bounded control journal.
     await repairInterruptedTestClear(this.config.dataRoots);
@@ -468,6 +471,9 @@ export class MonitorService extends EventEmitter {
   }
 
   async stop(): Promise<void> {
+    // First, before any await: frames that arrive while the session is being closed would be written
+    // to a closed session and mark recording unhealthy on every clean shutdown.
+    this.stopping = true;
     this.figureScheduler.stop();
     // Let a picture that is already being drawn finish, but never hold up shutdown for long.
     await Promise.race([this.figureQueue, new Promise<void>((resolve) => setTimeout(resolve, 5_000).unref())]);
@@ -2931,7 +2937,7 @@ export class MonitorService extends EventEmitter {
     transport?: SdrconnectSpectrumPayload,
     synthetic?: SyntheticFrameContext,
   ): void {
-    if (this.paused || this.reconfiguring) return;
+    if (this.stopping || this.paused || this.reconfiguring) return;
     if ((source === "simulation" || synthetic) && this.config.dataDomain !== "test") {
       this.emitServiceError("Simulation input was rejected at the field data-domain boundary");
       return;
@@ -4028,6 +4034,9 @@ export class MonitorService extends EventEmitter {
   private storageReprobeTimer: NodeJS.Timeout | undefined;
 
   private markStorageError(error?: unknown): void {
+    // A write that fails because the service is shutting down is expected, not a storage fault, and
+    // must not log an error or arm a re-probe timer in a process that is about to exit.
+    if (this.stopping) return;
     const now = Date.now();
     if (now - this.lastStorageErrorLogAt >= 10_000) {
       this.lastStorageErrorLogAt = now;

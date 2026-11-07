@@ -1068,6 +1068,44 @@ describe("bounded monitor runtime", () => {
     await monitor.stop();
   });
 
+  it("ignores frames and does not report a storage fault once a clean shutdown has begun", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-20T12:00:00.000Z"));
+    const config = enableSingleRadioTarget(await temporaryConfig("clean-shutdown"));
+    const monitor = new MonitorService(config);
+    await monitor.start();
+    const internal = monitor as unknown as {
+      stopSimulation(): void;
+      handleSpectrum(receiverId: number, bins: Uint8Array, source: "simulation"): void;
+      markStorageError(error?: unknown): void;
+      detector: { analyzeObservation(...arguments_: unknown[]): unknown };
+      evidence: { closeActive(): Promise<unknown> };
+      evidenceHealthy: boolean;
+      storageReprobeTimer?: unknown;
+    };
+    internal.stopSimulation();
+    const quiet = new Uint8Array(640).fill(30);
+    for (let index = 0; index < 3; index += 1) internal.handleSpectrum(0, quiet, "simulation");
+    const analyze = vi.spyOn(internal.detector, "analyzeObservation");
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    // While the session is being closed, a late receiver frame and a late write failure both arrive.
+    const closeActive = internal.evidence.closeActive.bind(internal.evidence);
+    internal.evidence.closeActive = async () => {
+      const result = await closeActive();
+      vi.setSystemTime(new Date("2026-08-20T12:00:10.000Z"));
+      internal.handleSpectrum(0, quiet, "simulation");
+      internal.markStorageError(new Error("Evidence session is not initialized"));
+      return result;
+    };
+    await monitor.stop();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(analyze).not.toHaveBeenCalled();
+    expect(errors.mock.calls.filter((call) => String(call[0]).includes("Evidence write failed"))).toEqual([]);
+    expect(internal.evidenceHealthy).toBe(true);
+    expect(internal.storageReprobeTimer).toBeUndefined();
+    errors.mockRestore();
+  });
+
   it("restarts signal learning for the Fugro L-band capture target", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-20T12:00:00.000Z"));
