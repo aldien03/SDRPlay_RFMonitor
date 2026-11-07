@@ -327,6 +327,12 @@ export class SdrconnectClient extends EventEmitter {
       });
       socket.on("close", () => {
         clearTimeout(timeout);
+        // A close before the API handshake finished must settle connect():
+        // the timer is cleared above, so nothing else would ever reject it.
+        if (!settled) {
+          settled = true;
+          reject(new Error(`SDRconnect WebSocket closed before the API handshake completed: ${this.options.url}`));
+        }
         if (this.socket !== socket) return;
         this.apiReady = false;
         this.physicalDeviceAvailable = false;
@@ -443,14 +449,21 @@ export class SdrconnectClient extends EventEmitter {
   }
 
   private parseText(text: string): SdrconnectPropertyMessage | undefined {
+    let message: SdrconnectPropertyMessage;
     try {
-      const message = JSON.parse(text) as SdrconnectPropertyMessage;
-      this.emit("property", message);
-      return message;
+      message = JSON.parse(text) as SdrconnectPropertyMessage;
     } catch {
       this.emit("client-error", new Error("SDRconnect sent invalid JSON"));
       return undefined;
     }
+    // A throwing listener is a local fault, not bad input from SDRconnect, and
+    // must not discard the message: tune confirmation still needs it.
+    try {
+      this.emit("property", message);
+    } catch (error) {
+      this.emit("client-error", new Error(`SDRconnect property handler failed: ${error instanceof Error ? error.message : String(error)}`));
+    }
+    return message;
   }
 
   private retrySelectionAfterDiscovery(message: SdrconnectPropertyMessage): void {
