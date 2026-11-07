@@ -410,7 +410,18 @@ describe("evidence store", { timeout: 60_000 }, () => {
     expect(figurePng?.subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
     expect(figureSummary).toMatchObject({ derived: true, framesUsed: 1, levelScale: "relative-uncalibrated-uint8" });
     expect(figureSummary.sourceFramesSha256).toMatch(/^[a-f0-9]{64}$/);
-    expect(report).toContain('src="figures/incident-overview.svg"');
+    // The report is self-contained: findings, key numbers and every chart are in it.
+    expect(report).toContain("What the recorded frames show");
+    expect(report).toContain("<svg");
+    expect(report).toContain("Signal level over time");
+    for (const name of ["incident-analysis.svg", "chart-level-over-time.svg", "chart-excess-over-time.svg", "chart-strongest-frequency.svg", "chart-above-normal-by-frequency.svg"]) {
+      const chart = entries.get(`${packageRoot}/figures/${name}`)?.contents.toString("utf8") ?? "";
+      expect(chart).toContain("<svg");
+      expect(chart).toContain("Figure generated 20");
+      expect(chart).not.toMatch(/confidence|dbm|spoof/i);
+    }
+    expect(figureSummary.findings.length).toBeGreaterThan(0);
+    expect(figureSummary.analysis).toMatchObject({ framesDuring: 1 });
     expect(figureSummary.generatedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     expect(figureSvg).toContain("Figure generated (UTC)");
     const exportedManifest = JSON.parse(entries.get(`${packageRoot}/manifest.json`)?.contents.toString("utf8") ?? "{}");
@@ -442,6 +453,9 @@ describe("evidence store", { timeout: 60_000 }, () => {
     const newest = await store.readIncidentFigure(incident.id, "svg");
     expect(newest).toMatchObject({ stamp: "20261107T063012Z", reason: "end" });
     expect(newest?.bytes.toString("utf8")).toContain("<svg");
+    const analysis = await store.readIncidentFigure(incident.id, "analysis");
+    expect(analysis?.bytes.toString("utf8")).toContain("Incident analysis");
+    expect(analysis).toMatchObject({ stamp: "20261107T063012Z", reason: "end" });
     expect(await store.readIncidentFigure("no-such-incident", "svg")).toBeUndefined();
     expect([...(await store.listIncidentFigureIds())]).toEqual([incident.id]);
     await expect(store.readIncidentFigure("../escape", "svg")).rejects.toThrow("Invalid event id");
@@ -450,18 +464,19 @@ describe("evidence store", { timeout: 60_000 }, () => {
     const stray = path.join(path.dirname(second!.svgPath), "notes.txt");
     await writeFile(stray, "keep me");
     const now = Date.parse("2026-11-07T07:00:00.000Z");
-    expect(await store.pruneIncidentFigures(45 * 60_000, now)).toEqual({ removedFiles: 2, keptFiles: 2 });
-    expect((await readdir(path.dirname(second!.svgPath))).sort()).toEqual(["20261107T063012Z-end.png", "20261107T063012Z-end.svg", "notes.txt"]);
+    expect(await store.pruneIncidentFigures(45 * 60_000, now)).toEqual({ removedFiles: 3, keptFiles: 3 });
+    expect((await readdir(path.dirname(second!.svgPath))).sort()).toEqual(["20261107T063012Z-end-analysis.svg", "20261107T063012Z-end.png", "20261107T063012Z-end.svg", "notes.txt"]);
     // Past the retention, everything of ours goes and the stray file keeps its folder.
-    expect(await store.pruneIncidentFigures(60_000, now)).toEqual({ removedFiles: 2, keptFiles: 0 });
+    expect(await store.pruneIncidentFigures(60_000, now)).toEqual({ removedFiles: 3, keptFiles: 0 });
     expect(await readFile(stray, "utf8")).toBe("keep me");
 
     // The hard cap holds even when retention is long.
     await rm(stray);
     for (const minute of [1, 2, 3, 4]) await store.saveIncidentFigureSnapshot(incident, { reason: "progress", now: Date.parse(`2026-11-07T06:0${minute}:00.000Z`) });
-    expect(await store.pruneIncidentFigures(30 * 86_400_000, now, 4)).toEqual({ removedFiles: 4, keptFiles: 4 });
+    expect(await store.pruneIncidentFigures(30 * 86_400_000, now, 6)).toEqual({ removedFiles: 6, keptFiles: 6 });
     expect((await readdir(path.dirname(second!.svgPath))).sort()).toEqual([
-      "20261107T060300Z-progress.png", "20261107T060300Z-progress.svg", "20261107T060400Z-progress.png", "20261107T060400Z-progress.svg",
+      "20261107T060300Z-progress-analysis.svg", "20261107T060300Z-progress.png", "20261107T060300Z-progress.svg",
+      "20261107T060400Z-progress-analysis.svg", "20261107T060400Z-progress.png", "20261107T060400Z-progress.svg",
     ]);
     expect(await store.pruneIncidentFigures(0, now)).toEqual({ removedFiles: 0, keptFiles: 0 });
   });

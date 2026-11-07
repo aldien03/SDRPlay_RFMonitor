@@ -107,6 +107,8 @@ Select **Download evidence package**. The queued export contains the incident sl
 
 Each incident package also contains a one-page figure of that incident only, in `figures/`:
 
+- `report.html` is a self-contained incident report: key numbers, plain-language findings (peak level and frequency, how far above the learned normal level, how many frames and how much of the band were above usual, whether the strongest signal stayed on one frequency or moved, and whether that frequency is the centre of the capture window), then every chart. It opens on its own and prints cleanly to PDF from the browser.
+- `chart-level-over-time.svg`, `chart-excess-over-time.svg`, `chart-strongest-frequency.svg` and `chart-above-normal-by-frequency.svg` are the analysis charts as separate, time-stamped files, and `incident-analysis.svg` has them all on one sheet. "Above usual" means more than three usual spreads (1.4826 x the learned MAD, at least 1) above the learned typical level of that frequency.
 - `incident-overview.svg` shows the strongest and typical signal level across the analysed window against the learned normal level, a waterfall (newest at the top, UTC on the left) with the incident start and end marked, and the strongest level per row. The same sheet is embedded in `report.html`.
 - `waterfall.png` is the waterfall image on its own, and `figure.json` lists what was drawn: frame counts, row length, and the SHA-256 of `spectrum/frames.jsonl`.
 - The figure is drawn from the exported frames only. Time gaps are shown as gaps, never filled in, and frames from a different RF setup are left out and counted. Levels are relative and uncalibrated.
@@ -372,6 +374,6 @@ When **Settings > Recording > Incident images** is on (the default), RF Monitor 
 - every 30 minutes while it stays open (at most 12 times);
 - when it ends, and once more about ten minutes later, when the post-clear recording is complete.
 
-Each save writes `incident-figures/<incident>/<UTC time>-<start|progress|end|final>.svg` and `.png` inside the evidence folder of the active data domain (Field or Test; simulation incidents never produce images). In **Evidence History** an **Image** link opens the newest saved image of an incident.
+Each save writes `incident-figures/<incident>/<UTC time>-<start|progress|end|final>.svg`, `.png` and `-analysis.svg` inside the evidence folder of the active data domain (Field or Test; simulation incidents never produce images). In **Evidence History**, **Image** and **Analysis** links open the newest saved overview and analysis charts of an incident.
 
 Cleanup is automatic. Images older than **Delete images after** (1 to 365 days, default 30) are deleted by the regular storage maintenance, even when saving has been switched off. Independently of that setting, no more than 400 images are kept: the oldest go first. Only files this feature wrote are ever deleted. Images are skipped while the host is under memory or resource pressure, and a failure to draw one never affects monitoring or evidence health. Deleting an image does not touch the recorded evidence, and an incident package exported later still contains its own figure.

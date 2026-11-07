@@ -2317,7 +2317,7 @@ export class MonitorService extends EventEmitter {
     }
   }
 
-  async getIncidentFigure(eventId: string, kind: "svg" | "png") {
+  async getIncidentFigure(eventId: string, kind: "svg" | "png" | "analysis") {
     return this.evidence.readIncidentFigure(eventId, kind);
   }
 

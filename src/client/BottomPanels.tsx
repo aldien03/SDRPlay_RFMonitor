@@ -389,6 +389,7 @@ export function EvidenceArchive({
                           <button type="button" onClick={() => onOpenIncident(event)}><Eye size={15} />View incident</button>
                           <button type="button" disabled={!snapshot.evidenceHealthy || Boolean(downloadingId)} onClick={() => void download(event.id, () => onExportEvent(event))}><Download size={15} />{downloadingId === event.id ? "Preparing…" : "Download"}</button>
                           {event.figureAvailable ? <a className="text-button" href={`/api/events/${encodeURIComponent(event.id)}/figure.svg`} target="_blank" rel="noopener noreferrer" aria-label="Open the saved incident image in a new tab"><Eye size={15} />Image</a> : null}
+                          {event.figureAvailable ? <a className="text-button" href={`/api/events/${encodeURIComponent(event.id)}/analysis.svg`} target="_blank" rel="noopener noreferrer" aria-label="Open the saved incident analysis charts in a new tab"><Eye size={15} />Analysis</a> : null}
                         </footer>
                       </article>
                     ))}

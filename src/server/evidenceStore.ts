@@ -52,6 +52,7 @@ import type {
 } from "../shared/types";
 import { ensureDomainRoot } from "./dataDomains";
 import { IncidentFigureBuilder, type IncidentFigureSummary } from "./incidentFigure";
+import type { AnalysisChartSet } from "./incidentAnalysis";
 import {
   createEvidenceFinalizationRecord,
   inspectEvidenceCommitMetadata,
@@ -331,11 +332,18 @@ function safeTimestamp(timestamp: string): string {
   return timestamp.replaceAll(":", "-").replaceAll(".", "-");
 }
 
+interface IncidentFigureFiles {
+  svg?: string;
+  png?: Uint8Array;
+  analysis?: AnalysisChartSet;
+  summary: IncidentFigureSummary | { state: "unavailable"; reason: string };
+}
+
 /** Automatic incident images: bounded in count and size no matter what retention is configured. */
 const INCIDENT_FIGURE_DIRECTORY = "incident-figures";
 const INCIDENT_FIGURE_MAX_FILES = 400;
 const INCIDENT_FIGURE_MAX_FILE_BYTES = 8 * 1024 * 1024;
-const INCIDENT_FIGURE_NAME = /^(\d{8}T\d{6}Z)-(start|progress|end|final)\.(svg|png)$/;
+const INCIDENT_FIGURE_NAME = /^(\d{8}T\d{6}Z)-(start|progress|end|final)(-analysis)?\.(svg|png)$/;
 export type IncidentFigureReason = "start" | "progress" | "end" | "final";
 
 function figureStamp(ms: number): string {
@@ -554,11 +562,39 @@ function sanitizeEvidence(value: unknown, key = ""): unknown {
   return undefined;
 }
 
-function incidentReport(event: DetectionEvent, hasFigure = false): string {
+function incidentReport(event: DetectionEvent, figure: IncidentFigureFiles, maxInlineBytes: number): string {
   const evidence = event.evidenceStrength === "Medium" ? "Medium" : "Low";
   const affected = event.affectedLabel ?? event.bandLabel;
   const range = `${(event.affectedRangeHz[0] / 1_000_000).toFixed(3)}-${(event.affectedRangeHz[1] / 1_000_000).toFixed(3)} MHz`;
-  return `<!doctype html><html lang="en"><meta charset="utf-8"><title>RF incident ${escapeHtml(event.id)}</title><style>body{max-width:1200px;margin:40px auto;padding:0 24px;font:16px/1.55 Arial,sans-serif;color:#142536}h1{font-size:28px}dl{display:grid;grid-template-columns:170px 1fr;border-top:1px solid #ccd5dc}dt,dd{margin:0;padding:10px;border-bottom:1px solid #e1e6ea}dt{font-weight:700;background:#f4f7f9}figure{margin:24px 0}figure svg{width:100%;height:auto}.limit{margin-top:24px;padding:12px;border-left:4px solid #bd7a00;background:#fff8e7}</style><body><h1>Suspected RF interference</h1><dl><dt>Affected signal</dt><dd>${escapeHtml(safeEvidenceString(affected))}</dd><dt>Frequency</dt><dd>${escapeHtml(range)}</dd><dt>Started</dt><dd>${escapeHtml(event.startedAt)}</dd><dt>Last observed</dt><dd>${escapeHtml(event.lastSeenAt)}</dd><dt>Observation</dt><dd>${escapeHtml(safeEvidenceString(event.observed))}</dd><dt>Action</dt><dd>${escapeHtml(safeEvidenceString(event.recommendedAction))}</dd><dt>Evidence strength</dt><dd>${evidence}</dd><dt>Lifecycle</dt><dd>${escapeHtml(event.lifecycle ?? "active")}</dd></dl>${hasFigure ? `<figure><img src="figures/incident-overview.svg" alt="Incident figure: spectrum, waterfall and timeline">` + `<figcaption>Open <a href="figures/incident-overview.svg">figures/incident-overview.svg</a> or <a href="figures/waterfall.png">figures/waterfall.png</a>. Derived from the recorded frames; the frames are the evidence.</figcaption></figure>` : `<p>No incident figure is available in this package; see figures/figure.json.</p>`}<p class="limit">RF data can show interference, not intent. This tamper-evident engineering archive is not a certified legal chain of custody.</p></body></html>`;
+  return `<!doctype html><html lang="en"><meta charset="utf-8"><title>RF incident ${escapeHtml(event.id)}</title><style>body{max-width:1200px;margin:40px auto;padding:0 24px;font:16px/1.55 Arial,sans-serif;color:#142536}h1{font-size:28px}dl{display:grid;grid-template-columns:170px 1fr;border-top:1px solid #ccd5dc}dt,dd{margin:0;padding:10px;border-bottom:1px solid #e1e6ea}dt{font-weight:700;background:#f4f7f9}figure{margin:24px 0;break-inside:avoid}figure svg,figure img{width:100%;height:auto}h2{font-size:20px;margin-top:32px}li{margin:6px 0}table.numbers{border-collapse:collapse;width:100%}table.numbers td{padding:6px 10px;border-bottom:1px solid #e1e6ea}table.numbers td:first-child{background:#f4f7f9;width:46%}@media print{body{margin:12px auto}}.limit{margin-top:24px;padding:12px;border-left:4px solid #bd7a00;background:#fff8e7}</style><body><h1>Suspected RF interference</h1><dl><dt>Affected signal</dt><dd>${escapeHtml(safeEvidenceString(affected))}</dd><dt>Frequency</dt><dd>${escapeHtml(range)}</dd><dt>Started</dt><dd>${escapeHtml(event.startedAt)}</dd><dt>Last observed</dt><dd>${escapeHtml(event.lastSeenAt)}</dd><dt>Observation</dt><dd>${escapeHtml(safeEvidenceString(event.observed))}</dd><dt>Action</dt><dd>${escapeHtml(safeEvidenceString(event.recommendedAction))}</dd><dt>Evidence strength</dt><dd>${evidence}</dd><dt>Lifecycle</dt><dd>${escapeHtml(event.lifecycle ?? "active")}</dd></dl>${incidentReportFigures(figure, maxInlineBytes)}<p class="limit">RF data can show interference, not intent. This tamper-evident engineering archive is not a certified legal chain of custody.</p></body></html>`;
+}
+
+/** Findings, key numbers and figures. Charts are embedded while they fit, so the report opens on its own. */
+function incidentReportFigures(figure: IncidentFigureFiles, maxInlineBytes: number): string {
+  if (!figure.svg || !figure.analysis) {
+    return "<p>No incident figures are available in this package; see figures/figure.json.</p>";
+  }
+  const summary = figure.summary as IncidentFigureSummary;
+  const items: Array<{ file: string; title: string; svg: string }> = [
+    { file: "figures/incident-overview.svg", title: "Overview: spectrum, waterfall and strongest level per row", svg: figure.svg },
+    ...figure.analysis.charts.map((chart) => ({ file: chart.file, title: chart.title, svg: chart.svg })),
+  ];
+  const inline = items.reduce((total, item) => total + Buffer.byteLength(item.svg), 0) <= maxInlineBytes;
+  const rows: Array<[string, string | undefined]> = [
+    ["Incident duration", `${summary.analysis.incidentSeconds} s`],
+    ["Frames recorded (before / during / after)", `${summary.analysis.framesBefore} / ${summary.analysis.framesDuring} / ${summary.analysis.framesAfter}`],
+    ["Strongest level (relative, 0 to 255)", summary.analysis.strongestLevel === undefined ? undefined : `${summary.analysis.strongestLevel} at ${summary.analysis.strongestMHz} MHz, ${summary.analysis.strongestAt}`],
+    ["Typical level before / during / learned normal", [summary.analysis.typicalBefore, summary.analysis.typicalDuring, summary.analysis.learnedTypical].map((value) => value ?? "n/a").join(" / ")],
+    ["Largest excess over learned normal", summary.analysis.maxExcessSpreads === undefined ? undefined : `${summary.analysis.maxExcessSpreads} usual spreads`],
+    ["Frames with some part of the band above usual", summary.analysis.duringFramesAboveUsualPct === undefined ? undefined : `${summary.analysis.duringFramesAboveUsualPct}%`],
+    ["Share of the band above usual (typical / largest)", summary.analysis.typicalBandAboveUsualPct === undefined ? undefined : `${summary.analysis.typicalBandAboveUsualPct}% / ${summary.analysis.maxBandAboveUsualPct}%`],
+    ["Most frequent position of the strongest signal", summary.analysis.mostFrequentPeakMHz === undefined ? undefined : `${summary.analysis.mostFrequentPeakMHz} MHz (${summary.analysis.peakStablePct}% of frames within ±${summary.analysis.peakStaysWithinKHz} kHz)`],
+    ["Capture window centre", `${summary.analysis.windowCentreMHz} MHz`],
+  ];
+  return `<h2>What the recorded frames show</h2><ul>${summary.findings.map((line) => `<li>${escapeHtml(safeEvidenceString(line))}</li>`).join("")}</ul>`
+    + `<table class="numbers"><tbody>${rows.filter((row): row is [string, string] => row[1] !== undefined).map(([name, value]) => `<tr><td>${escapeHtml(name)}</td><td>${escapeHtml(value)}</td></tr>`).join("")}</tbody></table>`
+    + `<h2>Figures</h2><p>Generated ${escapeHtml(summary.generatedAt)} (UTC). Each figure is also a separate file in <code>figures/</code>, together with <code>incident-analysis.svg</code> (all charts on one sheet) and <code>waterfall.png</code>. Levels are relative and uncalibrated. The charts are drawn from the recorded frames and the learned baseline in this package; the frames are the evidence.</p>`
+    + items.map((item) => `<figure><h3>${escapeHtml(item.title)}</h3>${inline ? item.svg : `<img src="${item.file}" alt="${escapeHtml(item.title)}">`}<figcaption><a href="${item.file}">${item.file}</a></figcaption></figure>`).join("");
 }
 
 async function writeAtomic(filePath: string, contents: string | Uint8Array): Promise<void> {
@@ -1112,11 +1148,14 @@ export class EvidenceStore {
       if (slice.legacyFrameCount > 0) missingParts.push(`legacy-frame-provenance:${slice.legacyFrameCount}`);
       // A derived picture of the slice above. It can never make the evidence incomplete or fail the export.
       const overheadReserve = Math.min(1024 * 1024, Math.floor(this.exportPartMaxBytes * 0.35));
+      const maxFigureFileBytes = Math.floor((this.exportPartMaxBytes - overheadReserve) / 4);
       const figure = await this.renderIncidentFigure(stagingPath, exportEvent, slice, baselineReference, {
         generatedAtMs: Date.now(),
         // One figure file may never crowd out the evidence in a size-bounded part.
-        maxFileBytes: Math.floor((this.exportPartMaxBytes - overheadReserve) / 4),
+        maxFileBytes: maxFigureFileBytes,
       });
+      // The report embeds the charts so it opens on its own, but only while it stays well inside one part.
+      const maxInlineBytes = Math.floor(maxFigureFileBytes / 2);
       const completeness = {
         dataDomain: this.dataDomain,
         complete: missingParts.length === 0,
@@ -1130,7 +1169,7 @@ export class EvidenceStore {
       };
       await Promise.all([
         writeAtomic(path.join(stagingPath, "incident.json"), JSON.stringify(sanitizeEvidence({ ...exportEvent, exportCompleteness: completeness }), null, 2)),
-        writeAtomic(path.join(stagingPath, "report.html"), incidentReport(exportEvent, Boolean(figure.svg))),
+        writeAtomic(path.join(stagingPath, "report.html"), incidentReport(exportEvent, figure, maxInlineBytes)),
         this.writeIncidentFigureFiles(stagingPath, figure),
         writeAtomic(path.join(stagingPath, "completeness.json"), JSON.stringify(completeness, null, 2)),
         writeAtomic(path.join(stagingPath, "slice.json"), JSON.stringify({
@@ -2600,7 +2639,7 @@ export class EvidenceStore {
   async saveIncidentFigureSnapshot(
     event: DetectionEvent,
     options: { reason: IncidentFigureReason; baselineReference?: object; now?: number },
-  ): Promise<{ stamp: string; svgPath: string; pngPath: string } | undefined> {
+  ): Promise<{ stamp: string; svgPath: string; pngPath: string; analysisPath: string } | undefined> {
     if (event.syntheticExercise) return undefined;
     if (this.recordingDeletionActive) return undefined;
     const incidentId = safeIdentifier(event.id, "event id");
@@ -2627,15 +2666,18 @@ export class EvidenceStore {
         generatedAtMs: now,
         maxFileBytes: INCIDENT_FIGURE_MAX_FILE_BYTES,
       });
-      if (!figure.svg || !figure.png) return undefined;
+      if (!figure.svg || !figure.png || !figure.analysis) return undefined;
       const directory = path.join(this.root, INCIDENT_FIGURE_DIRECTORY, incidentId);
       this.assertContained(directory);
       const stamp = figureStamp(now);
       const svgPath = path.join(directory, `${stamp}-${options.reason}.svg`);
       const pngPath = path.join(directory, `${stamp}-${options.reason}.png`);
+      const analysisPath = path.join(directory, `${stamp}-${options.reason}-analysis.svg`);
       await writeAtomic(pngPath, figure.png);
+      await writeAtomic(analysisPath, figure.analysis.sheetSvg);
+      // The overview goes last, so a reader that finds it can rely on its companions being there.
       await writeAtomic(svgPath, figure.svg);
-      return { stamp, svgPath, pngPath };
+      return { stamp, svgPath, pngPath, analysisPath };
     } finally {
       this.updateLease(this.exportPathLeases, stagingPath, -1);
       await rm(stagingPath, { recursive: true, force: true });
@@ -2643,7 +2685,7 @@ export class EvidenceStore {
   }
 
   /** Newest saved picture for an incident, or undefined. Only names this store wrote are served. */
-  async readIncidentFigure(incidentId: string, kind: "svg" | "png"): Promise<{ bytes: Buffer; stamp: string; reason: IncidentFigureReason } | undefined> {
+  async readIncidentFigure(incidentId: string, kind: "svg" | "png" | "analysis"): Promise<{ bytes: Buffer; stamp: string; reason: IncidentFigureReason } | undefined> {
     const directory = path.join(this.root, INCIDENT_FIGURE_DIRECTORY, safeIdentifier(incidentId, "event id"));
     this.assertContained(directory);
     let names: string[];
@@ -2654,7 +2696,9 @@ export class EvidenceStore {
     }
     const candidates = names
       .map((name) => ({ name, match: INCIDENT_FIGURE_NAME.exec(name) }))
-      .filter((entry): entry is { name: string; match: RegExpExecArray } => entry.match !== null && entry.match[3] === kind)
+      .filter((entry): entry is { name: string; match: RegExpExecArray } => entry.match !== null && (kind === "analysis"
+        ? entry.match[3] === "-analysis" && entry.match[4] === "svg"
+        : entry.match[3] === undefined && entry.match[4] === kind))
       .sort((left, right) => right.name.localeCompare(left.name));
     const newest = candidates[0];
     if (!newest) return undefined;
@@ -2714,16 +2758,17 @@ export class EvidenceStore {
     return { removedFiles: removed, keptFiles: files.length - removed };
   }
 
-  private async writeIncidentFigureFiles(
-    destination: string,
-    figure: { svg?: string; png?: Uint8Array; summary: IncidentFigureSummary | { state: "unavailable"; reason: string } },
-  ): Promise<void> {
+  private async writeIncidentFigureFiles(destination: string, figure: IncidentFigureFiles): Promise<void> {
     const directory = path.join(destination, "figures");
     await mkdir(directory, { recursive: true });
     const writes = [writeAtomic(path.join(directory, "figure.json"), `${JSON.stringify(figure.summary, null, 2)}\n`)];
     if (figure.svg && figure.png) {
       writes.push(writeAtomic(path.join(directory, "incident-overview.svg"), figure.svg));
       writes.push(writeAtomic(path.join(directory, "waterfall.png"), figure.png));
+    }
+    if (figure.analysis) {
+      writes.push(writeAtomic(path.join(directory, "incident-analysis.svg"), figure.analysis.sheetSvg));
+      for (const chart of figure.analysis.charts) writes.push(writeAtomic(path.join(destination, ...chart.file.split("/")), chart.svg));
     }
     await Promise.all(writes);
   }
@@ -2738,7 +2783,7 @@ export class EvidenceStore {
     slice: IncidentSliceSummary,
     baselineReference: object | undefined,
     options: { generatedAtMs: number; maxFileBytes: number },
-  ): Promise<{ svg?: string; png?: Uint8Array; summary: IncidentFigureSummary | { state: "unavailable"; reason: string } }> {
+  ): Promise<IncidentFigureFiles> {
     const handles = new Map<string, Awaited<ReturnType<typeof open>>>();
     try {
       const indexPath = path.join(stagingPath, "spectrum", "frames.jsonl");
@@ -2799,10 +2844,16 @@ export class EvidenceStore {
         });
       }
       const result = builder.finish();
-      if (Buffer.byteLength(result.svg) > options.maxFileBytes || result.waterfallPng.byteLength > options.maxFileBytes) {
+      const largest = Math.max(
+        Buffer.byteLength(result.svg),
+        result.waterfallPng.byteLength,
+        Buffer.byteLength(result.analysis.sheetSvg),
+        ...result.analysis.charts.map((chart) => Buffer.byteLength(chart.svg)),
+      );
+      if (largest > options.maxFileBytes) {
         return { summary: { state: "unavailable", reason: "figure is larger than this archive part size allows" } };
       }
-      return { svg: result.svg, png: result.waterfallPng, summary: result.summary };
+      return { svg: result.svg, png: result.waterfallPng, analysis: result.analysis, summary: result.summary };
     } catch (error) {
       return { summary: { state: "unavailable", reason: error instanceof Error ? error.message.slice(0, 200) : "figure could not be drawn" } };
     } finally {

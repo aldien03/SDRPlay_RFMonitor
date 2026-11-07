@@ -1625,14 +1625,10 @@ app.get("/api/exports/:jobId/download", async (request, response) => {
   }
 });
 
-app.get("/api/events/:eventId/figure.:format", async (request, response) => {
-  const format = request.params.format;
-  if (format !== "svg" && format !== "png") {
-    response.status(404).json({ error: "Unknown image format" });
-    return;
-  }
+async function sendIncidentFigure(request: express.Request, response: express.Response, kind: "svg" | "png" | "analysis"): Promise<void> {
+  const format = kind === "png" ? "png" : "svg";
   try {
-    const figure = await monitor.getIncidentFigure(boundedIdentifier(request.params.eventId), format);
+    const figure = await monitor.getIncidentFigure(boundedIdentifier(request.params.eventId), kind);
     if (!figure) {
       response.status(404).json({ error: "No saved image exists for this incident yet" });
       return;
@@ -1641,12 +1637,23 @@ app.get("/api/events/:eventId/figure.:format", async (request, response) => {
     response.setHeader("X-Content-Type-Options", "nosniff");
     // The image is data only. Nothing in it may run script or load anything else.
     response.setHeader("Content-Security-Policy", "default-src 'none'; img-src data:; style-src 'unsafe-inline'; sandbox");
-    response.setHeader("Content-Disposition", `inline; filename="incident-${boundedIdentifier(request.params.eventId)}-${figure.stamp}.${format}"`);
+    response.setHeader("Content-Disposition", `inline; filename="incident-${boundedIdentifier(request.params.eventId)}-${figure.stamp}${kind === "analysis" ? "-analysis" : ""}.${format}"`);
     response.type(format === "svg" ? "image/svg+xml" : "image/png").send(figure.bytes);
   } catch {
     response.status(400).json({ error: "The incident image could not be read" });
   }
+}
+
+app.get("/api/events/:eventId/figure.:format", async (request, response) => {
+  const format = request.params.format;
+  if (format !== "svg" && format !== "png") {
+    response.status(404).json({ error: "Unknown image format" });
+    return;
+  }
+  await sendIncidentFigure(request, response, format);
 });
+
+app.get("/api/events/:eventId/analysis.svg", (request, response) => void sendIncidentFigure(request, response, "analysis"));
 
 app.get("/api/events/:eventId/export", (request, response) => {
   if (exportBuildPressure()) {

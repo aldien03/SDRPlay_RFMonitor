@@ -1055,9 +1055,9 @@ describe("bounded monitor runtime", () => {
     internal.figureScheduler.eventEnded(incident);
     await internal.figureQueue;
     const names = await savedNames();
-    expect(names).toHaveLength(2);
-    expect(names.every((name) => /^20260820T\d{6}Z-end\.(svg|png)$/.test(name))).toBe(true);
-    expect(await readFile(path.join(imageDirectory, names.find((name) => name.endsWith(".svg"))!), "utf8")).toContain("Figure generated (UTC) 2026-08-20");
+    expect(names).toHaveLength(3);
+    expect(names.every((name) => /^20260820T\d{6}Z-end(-analysis)?\.(svg|png)$/.test(name))).toBe(true);
+    expect(await readFile(path.join(imageDirectory, names.find((name) => name.endsWith("-end.svg"))!), "utf8")).toContain("Figure generated (UTC) 2026-08-20");
     expect((await monitor.getIncidentFigure(incident.id, "svg"))?.reason).toBe("end");
 
     // The user's retention choice deletes it: 1 day kept, 2 days later.

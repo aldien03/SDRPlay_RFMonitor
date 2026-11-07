@@ -9,6 +9,8 @@
  * states that on its face. Gaps in time are drawn as gaps; nothing is interpolated.
  */
 import { deflateSync } from "node:zlib";
+import { frequencyTicks, plain, timeTicks, utc, xml } from "./chartKit";
+import { ABOVE_USUAL_SPREADS, IncidentAnalysisCollector, renderAnalysisCharts, type AnalysisChartSet, type AnalysisStats, type BaselinePixels } from "./incidentAnalysis";
 import { buildWaterfallPalette, packPixel, pixelBinSpan } from "../shared/waterfallRaster";
 
 const MAX_WIDTH_PX = 1024;
@@ -68,12 +70,17 @@ export interface IncidentFigureSummary {
   analysisWindowHz?: [number, number];
   sourceFramesSha256?: string;
   levelScale: "relative-uncalibrated-uint8";
+  /** Numbers and plain sentences for a report, drawn from the same frames. */
+  analysis: AnalysisStats;
+  findings: string[];
 }
 
 export interface IncidentFigureResult {
   svg: string;
   /** Waterfall alone, with the time stamp burned into its pixels. */
   waterfallPng: Uint8Array;
+  /** Analysis charts: each as a standalone SVG, and all together on one sheet. */
+  analysis: AnalysisChartSet;
   summary: IncidentFigureSummary;
 }
 
@@ -261,51 +268,6 @@ export function composeCaptionedPng(
 
 // ---- Rendering helpers -----------------------------------------------------------------------
 
-function xml(value: unknown): string {
-  return String(value ?? "")
-    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
-}
-
-/** Same wording rules as the rest of the evidence package. */
-function plain(value: string): string {
-  return value
-    .replace(/spoof(?:ing|ed)?/gi, "navigation anomaly")
-    .replace(/\bd\s*b\s*m\b/gi, "relative units")
-    .replace(/confidence/gi, "evidence strength");
-}
-
-function utc(ms: number, withDate: boolean): string {
-  const iso = new Date(ms).toISOString();
-  return withDate ? `${iso.slice(0, 10)} ${iso.slice(11, 19)}` : iso.slice(11, 19);
-}
-
-function niceStep(rawStep: number): number {
-  const exponent = Math.pow(10, Math.floor(Math.log10(rawStep)));
-  const fraction = rawStep / exponent;
-  return (fraction <= 1 ? 1 : fraction <= 2 ? 2 : fraction <= 5 ? 5 : 10) * exponent;
-}
-
-const TIME_STEPS_MS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 21600, 43200, 86400].map((seconds) => seconds * 1000);
-
-function timeTicks(startMs: number, endMs: number, target: number): number[] {
-  const span = Math.max(1, endMs - startMs);
-  const step = TIME_STEPS_MS.find((candidate) => span / candidate <= target) ?? TIME_STEPS_MS[TIME_STEPS_MS.length - 1];
-  const ticks: number[] = [];
-  for (let tick = Math.ceil(startMs / step) * step; tick <= endMs; tick += step) ticks.push(tick);
-  return ticks;
-}
-
-function frequencyTicks(startHz: number, endHz: number, target: number): number[] {
-  const step = niceStep((endHz - startHz) / target);
-  const ticks: number[] = [];
-  for (let tick = Math.ceil(startHz / step) * step; tick <= endHz + 1; tick += step) ticks.push(tick);
-  return ticks;
-}
-
 function pixelRange(widthPx: number, binStart: number, binEnd: number, pixel: number): { lo: number; hi: number } {
   return pixelBinSpan(pixel, widthPx, binStart, binEnd);
 }
@@ -337,6 +299,8 @@ export class IncidentFigureBuilder {
   private afterFrames = 0;
   private used = 0;
   private excluded = 0;
+  private collector?: IncidentAnalysisCollector;
+  private baselinePixels?: BaselinePixels;
 
   constructor(private readonly input: IncidentFigureInput) {
     const duration = Math.max(1, input.windowEndMs - input.windowStartMs);
@@ -372,6 +336,33 @@ export class IncidentFigureBuilder {
       this.duringPeak = new Uint8Array(this.widthPx);
       this.duringHistogram = new Uint32Array(this.widthPx * 256);
       this.beforeHistogram = new Uint32Array(this.widthPx * 256);
+      if (this.input.baseline && this.input.baseline.median.length === analysisBins) {
+        const binCount = analysisBins;
+        const median = new Float64Array(this.widthPx);
+        const scale = new Float64Array(this.widthPx);
+        for (let pixel = 0; pixel < this.widthPx; pixel += 1) {
+          const { lo, hi } = pixelRange(this.widthPx, 0, binCount, pixel);
+          let medianSum = 0;
+          let spread = 0;
+          for (let index = lo; index < hi; index += 1) {
+            medianSum += this.input.baseline.median[index];
+            spread = Math.max(spread, SIGMA_FROM_MAD * this.input.baseline.mad[index]);
+          }
+          median[pixel] = medianSum / (hi - lo);
+          scale[pixel] = Math.max(1, spread);
+        }
+        this.baselinePixels = { median, scale };
+      }
+      this.collector = new IncidentAnalysisCollector({
+        widthPx: this.widthPx,
+        rows: this.rows,
+        rowMs: this.rowMs,
+        windowStartMs: this.input.windowStartMs,
+        windowEndMs: this.input.windowEndMs,
+        incidentStartMs: this.input.incidentStartMs,
+        incidentEndMs: this.input.incidentEndMs,
+        baseline: this.baselinePixels,
+      });
     } else if (JSON.stringify(key) !== JSON.stringify(this.config)) {
       // A different RF setup cannot share axes with the rest of the figure.
       this.excluded += 1;
@@ -393,10 +384,12 @@ export class IncidentFigureBuilder {
     this.rowFilled[row] = 1;
     let frameSum = 0;
     const base = row * this.widthPx;
+    const levels = new Uint8Array(this.widthPx);
     for (let pixel = 0; pixel < this.widthPx; pixel += 1) {
       const { lo, hi } = pixelRange(this.widthPx, frame.analysisStartBin, frame.analysisEndBin, pixel);
       let peak = 0;
       for (let index = lo; index < hi; index += 1) if (frame.bins[index] > peak) peak = frame.bins[index];
+      levels[pixel] = peak;
       frameSum += peak;
       if (peak > this.rowPeak[base + pixel]) this.rowPeak[base + pixel] = peak;
       if (phase === "during") {
@@ -408,6 +401,7 @@ export class IncidentFigureBuilder {
     }
     this.rowSum[row] += frameSum / this.widthPx;
     this.rowCount[row] += 1;
+    this.collector?.addFrame(levels, frame.timestampMs, phase, row);
   }
 
   finish(): IncidentFigureResult {
@@ -457,25 +451,10 @@ export class IncidentFigureBuilder {
     let baselineMedian: number[] | undefined;
     let baselineLow: number[] | undefined;
     let baselineHigh: number[] | undefined;
-    if (config && input.baseline && input.baseline.median.length === config.analysisEndBin - config.analysisStartBin) {
-      const binCount = input.baseline.median.length;
-      baselineMedian = [];
-      baselineLow = [];
-      baselineHigh = [];
-      for (let pixel = 0; pixel < widthPx; pixel += 1) {
-        const { lo, hi } = pixelRange(widthPx, 0, binCount, pixel);
-        let medianSum = 0;
-        let spread = 0;
-        for (let index = lo; index < hi; index += 1) {
-          medianSum += input.baseline.median[index];
-          spread = Math.max(spread, SIGMA_FROM_MAD * input.baseline.mad[index]);
-        }
-        const centre = medianSum / (hi - lo);
-        const band = BASELINE_SIGMAS * Math.max(1, spread);
-        baselineMedian.push(centre);
-        baselineLow.push(Math.max(0, centre - band));
-        baselineHigh.push(Math.min(255, centre + band));
-      }
+    if (this.baselinePixels) {
+      baselineMedian = Array.from(this.baselinePixels.median);
+      baselineLow = baselineMedian.map((value, pixel) => Math.max(0, value - ABOVE_USUAL_SPREADS * this.baselinePixels!.scale[pixel]));
+      baselineHigh = baselineMedian.map((value, pixel) => Math.min(255, value + ABOVE_USUAL_SPREADS * this.baselinePixels!.scale[pixel]));
     }
 
     // ---- Layout --------------------------------------------------------------------------
@@ -661,7 +640,23 @@ export class IncidentFigureBuilder {
       ...(config ? { analysisWindowHz: [Math.round(analysisStartHz), Math.round(analysisEndHz)] as [number, number] } : {}),
       ...(input.sourceFramesSha256 ? { sourceFramesSha256: input.sourceFramesSha256 } : {}),
       levelScale: "relative-uncalibrated-uint8",
+      analysis: undefined as unknown as AnalysisStats,
+      findings: [],
     };
-    return { svg: out.join("\n"), waterfallPng, summary };
+    const analysis = renderAnalysisCharts(
+      this.collector?.finish(analysisStartHz, analysisEndHz) ?? new IncidentAnalysisCollector({
+        widthPx,
+        rows,
+        rowMs: this.rowMs,
+        windowStartMs: input.windowStartMs,
+        windowEndMs: input.windowEndMs,
+        incidentStartMs: input.incidentStartMs,
+        incidentEndMs: input.incidentEndMs,
+      }).finish(analysisStartHz, analysisEndHz),
+      { label: input.label, incidentId: input.incidentId, generatedAtMs: input.generatedAtMs },
+    );
+    summary.analysis = analysis.stats;
+    summary.findings = analysis.findings;
+    return { svg: out.join("\n"), waterfallPng, analysis, summary };
   }
 }

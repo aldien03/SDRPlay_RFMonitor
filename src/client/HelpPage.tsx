@@ -84,7 +84,7 @@ export function HelpPage({ snapshot, onClose, onOpenHealth, onOpenRecording, onO
             <li>Check free space and the writer state.</li>
             <li>Resolve any Critical finding before relying on new evidence.</li>
             <li>In Evidence history, choose an eligible session and select Play session. Saved .bin data is opened automatically.</li>
-            <li>In Evidence history, select Image on an incident to open its latest time-stamped image.</li>
+            <li>In Evidence history, select Image or Analysis on an incident to open its latest time-stamped overview or analysis charts.</li>
           </ol>
           <p>Incident images are saved automatically and deleted after the number of days set in Settings, Recording.</p>
           <button type="button" onClick={onOpenRecording}>Open Recording</button>

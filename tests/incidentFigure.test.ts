@@ -1,6 +1,7 @@
 import { inflateSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 import { IncidentFigureBuilder, captionText, chooseRowMs, composeCaptionedPng, encodePng, type FigureFrame, type IncidentFigureInput } from "../src/server/incidentFigure";
+import { describeAnalysis } from "../src/server/incidentAnalysis";
 import { buildWaterfallPalette, packPixel } from "../src/shared/waterfallRaster";
 
 const T0 = Date.parse("2026-11-07T06:00:00.000Z");
@@ -212,5 +213,70 @@ describe("incident figure", () => {
     const right = decodePng(composeCaptionedPng(pixels, 8, 4, ["BBBB", ""]));
     expect(Buffer.from(left.rgba).equals(Buffer.from(right.rgba))).toBe(false);
     expect(left.height).toBe(right.height);
+  });
+
+  it("describes a fixed spike at the window centre, with the learned level and a receiver caution", () => {
+    const frames = Array.from({ length: 20 }, (_, index) => {
+      const bins = new Uint8Array(64).fill(20);
+      if (index >= 5) bins[32] = 90; // exactly the centre of the capture window
+      return frameAt(index * 5, bins);
+    });
+    const builder = new IncidentFigureBuilder(baseInput({
+      windowEndMs: T0 + 100_000,
+      incidentStartMs: T0 + 25_000,
+      incidentEndMs: T0 + 100_000,
+      frameTimestampsMs: frames.map((frame) => frame.timestampMs),
+      baseline: { median: new Uint8Array(64).fill(20), mad: new Uint8Array(64).fill(1) },
+    }));
+    for (const frame of frames) builder.add(frame);
+    const result = builder.finish();
+    expect(result.summary.analysis).toMatchObject({
+      framesBefore: 5, framesDuring: 15, strongestLevel: 90, peakStablePct: 100, peakAtWindowCentre: true,
+      duringFramesAboveUsualPct: 100, learnedTypical: 20,
+    });
+    expect(result.summary.analysis.maxExcessSpreads).toBeGreaterThan(30);
+    expect(result.summary.analysis.typicalBefore).toBeCloseTo(20, 0);
+    const text = result.summary.findings.join(" ");
+    expect(text).toContain("fixed-frequency feature");
+    expect(text).toContain("centre of the capture window");
+    expect(text).toContain("can also come from the receiver itself");
+    expect(text).not.toMatch(/intent|jam|spoof|confidence|dbm/i);
+    expect(result.analysis.charts.map((chart) => chart.file)).toEqual([
+      "figures/chart-level-over-time.svg", "figures/chart-excess-over-time.svg",
+      "figures/chart-strongest-frequency.svg", "figures/chart-above-normal-by-frequency.svg",
+    ]);
+    for (const chart of result.analysis.charts) {
+      expect(chart.svg).toContain("Figure generated 2026-11-07 06:30:12 UTC");
+      expect(chart.svg).toContain("RF data can show interference, not intent.");
+    }
+    expect(result.analysis.sheetSvg).toContain("What the recorded frames show");
+  });
+
+  it("describes a moving signal differently, and says so when there is no learned level", () => {
+    const frames = Array.from({ length: 24 }, (_, index) => {
+      const bins = new Uint8Array(200).fill(20);
+      bins[10 + index * 7] = 120; // sweeps across the band
+      return frameAt(index * 4, bins);
+    });
+    const builder = new IncidentFigureBuilder(baseInput({
+      windowEndMs: T0 + 100_000,
+      incidentStartMs: T0,
+      incidentEndMs: T0 + 100_000,
+      frameTimestampsMs: frames.map((frame) => frame.timestampMs),
+    }));
+    for (const frame of frames) builder.add(frame);
+    const result = builder.finish();
+    const text = result.summary.findings.join(" ");
+    expect(text).toContain("The strongest signal moved");
+    expect(text).toContain("No learned normal level is available");
+    expect(result.summary.analysis.peakAtWindowCentre).toBe(false);
+    expect(result.summary.analysis.maxExcessSpreads).toBeUndefined();
+    expect(result.analysis.charts[1].svg).toContain("No learned normal level is available");
+  });
+
+  it("states plainly when there are no frames during the incident", () => {
+    const result = new IncidentFigureBuilder(baseInput()).finish();
+    expect(result.summary.findings[0]).toContain("No frames were recorded");
+    expect(describeAnalysis).toBeTypeOf("function");
   });
 });
