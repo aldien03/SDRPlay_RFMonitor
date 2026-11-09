@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import { ImageUp, Trash2 } from "lucide-react";
 import { alertPresetLabel, describeAlertPolicy, matchingAlertPreset } from "../shared/alertPolicy";
 import { selectedMonitoringTargetIds } from "../shared/settings";
@@ -73,12 +73,12 @@ export function AlertSensitivitySection({ response, draft, setDraft, disabled, e
   const sensitivityErrors = Object.entries(errors).filter(([key]) => key.startsWith("alerting."));
 
   return (
-    <section className="settings-subsection sensitivity-panel" aria-labelledby="alert-sensitivity-title">
-      <div>
-        <h2 id="alert-sensitivity-title" className="settings-subheading">Alert sensitivity</h2>
-        <p className="sensitivity-note">Signal learning continues and open incidents stay open when you change this.</p>
+    <section className="mission-panel sensitivity-panel" aria-labelledby="alert-sensitivity-title">
+      <div className="mission-panel-heading">
+        <strong id="alert-sensitivity-title">Alert sensitivity</strong>
+        <span>Learning continues · open incidents stay open</span>
       </div>
-      <div className="sensitivity-choices" role="radiogroup" aria-label="Alert sensitivity">
+      <div className="mission-choice-grid sensitivity-choices" role="radiogroup" aria-label="Alert sensitivity">
         {PRESET_ORDER.map((id, index) => {
           const preset = presets.find((candidate) => candidate.id === id);
           const checked = current.preset === id;
@@ -87,7 +87,7 @@ export function AlertSensitivitySection({ response, draft, setDraft, disabled, e
               key={id}
               type="button"
               role="radio"
-              className="sensitivity-choice"
+              className={checked ? "selected" : ""}
               aria-checked={checked}
               tabIndex={checked || (current.preset === "custom" && index === 1) ? 0 : -1}
               disabled={disabled || !preset}
@@ -100,15 +100,18 @@ export function AlertSensitivitySection({ response, draft, setDraft, disabled, e
           );
         })}
       </div>
-      {current.preset === "custom" ? <p className="sensitivity-note">Custom values are set in Advanced › Alert rules.</p> : null}
-      <dl className="sensitivity-facts" aria-label="What triggers an alert">
-        {facts.map((fact) => <div key={fact.id}><dt>{fact.label}</dt><dd>{fact.text}</dd></div>)}
-      </dl>
-      <p className="sensitivity-note">“Normal variation” is how much each frequency usually moves around its learned level. Levels are relative, not calibrated power.</p>
+      {current.preset === "custom" ? <p className="correction-watch-note">Custom values are set in Advanced › Alert rules.</p> : null}
+      <div className="read-only-grid" aria-label="What triggers an alert">
+        {facts.map((fact) => <Fragment key={fact.id}><span>{fact.label}</span><strong>{fact.text}</strong></Fragment>)}
+      </div>
+      <p className="correction-watch-note">Normal variation is how much each frequency usually moves around its learned level. Levels are relative, not calibrated power.</p>
 
       {preview?.targets.length ? (
-        <div>
-          <h3 className="settings-subheading">Estimated alerts, last {Math.max(...preview.targets.map((target) => target.observedHours)).toFixed(1)} h</h3>
+        <>
+          <div className="mission-panel-heading">
+            <strong>Estimated alerts</strong>
+            <span>Last {Math.max(...preview.targets.map((target) => target.observedHours)).toFixed(1)} h of live checks · estimate</span>
+          </div>
           <table className="sensitivity-preview">
             <thead><tr><th scope="col">Window</th>{PRESET_ORDER.map((id) => <th key={id} scope="col">{alertPresetLabel(id)}</th>)}</tr></thead>
             <tbody>
@@ -120,13 +123,12 @@ export function AlertSensitivitySection({ response, draft, setDraft, disabled, e
               ))}
             </tbody>
           </table>
-          <p className="sensitivity-note">Counted from live checks since the service started. An estimate, not a guarantee.</p>
-        </div>
+        </>
       ) : null}
 
       {monitoredTargets.length > 1 || Object.keys(draft.alerting.targetOverrides).length ? (
         <div className="sensitivity-windows">
-          <h3 className="settings-subheading">Per window</h3>
+          <div className="mission-panel-heading"><strong>Per window</strong><span>Optional</span></div>
           {response.catalog.captureTargets
             .filter((target) => monitoredTargets.some((candidate) => candidate.id === target.id) || draft.alerting.targetOverrides[target.id])
             .map((target) => {
@@ -305,8 +307,8 @@ export function ReportIdentitySection({ draft, setDraft, disabled, errors, uploa
   ];
   return (
     <section className="settings-subsection" aria-labelledby="report-identity-title">
-      <h2 id="report-identity-title" className="settings-subheading">Report identity</h2>
-      <p className="sensitivity-note">Printed on the cover and header of every incident report.</p>
+      <h3 id="report-identity-title" className="settings-subheading">Report identity</h3>
+      <p className="protected-action-hint">Printed on the cover and header of every incident report.</p>
       {fields.map((field) => (
         <label key={field.key} className="form-field">
           <span>{field.label}</span>
@@ -317,7 +319,7 @@ export function ReportIdentitySection({ draft, setDraft, disabled, errors, uploa
       <div className="form-field">
         <span>Logo</span>
         <div className="report-logo-row">
-          {identity.logo ? <img className="report-logo-preview" src={`/api/site/report-logo?sha=${identity.logo.sha256}`} alt="Current report logo" /> : <span className="sensitivity-note">No logo. PNG or JPEG, up to 512 KB.</span>}
+          {identity.logo ? <img className="report-logo-preview" src={`/api/site/report-logo?sha=${identity.logo.sha256}`} alt="Current report logo" /> : <span className="protected-action-hint">No logo. PNG or JPEG, up to 512 KB.</span>}
           <label className={`button secondary compact ${disabled || uploading ? "disabled" : ""}`}>
             <ImageUp size={15} aria-hidden="true" /> {uploading ? "Uploading…" : identity.logo ? "Replace" : "Upload"}
             <input

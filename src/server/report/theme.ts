@@ -27,7 +27,8 @@ export const REPORT_COLORS = {
   warn: "#a35f00",
 } as const;
 
-export const REPORT_FONT_STACK = "Inter, 'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif";
+/** The dashboard's own font stack, so the in-app report and charts match the screen around them. */
+export const REPORT_FONT_STACK = "Inter, 'Segoe UI', Arial, sans-serif";
 
 export type ReportColor = string;
 

@@ -103,40 +103,41 @@ export function IncidentPanel({
 
   return (
     <section className="panel incident-panel incident-detail" aria-labelledby="incident-title">
-      {onBack ? <button type="button" className="incident-back" onClick={onBack}><ArrowLeft size={16} aria-hidden="true" /> Evidence history</button> : null}
-      <header className={`incident-hero tone-${tone}`}>
-        {incidentPresent ? <RadioTower size={28} aria-hidden="true" /> : operatorSummary.monitoring.state === "normal" ? <ShieldCheck size={28} aria-hidden="true" /> : <TriangleAlert size={28} aria-hidden="true" />}
-        <div className="incident-hero-copy">
-          {incidentPresent ? <small>{status}{record ? ` · ${incidentReference(record)}` : ""}</small> : null}
-          <h2 id="incident-title">{incidentPresent ? verdict ?? "Incident" : operatorSummary.monitoring.state === "normal" ? "No active incident" : presentation.monitoring}</h2>
-          {incidentPresent && affected ? <p>{affected}</p> : null}
+      {onBack ? <button type="button" className="incident-back" onClick={onBack}><ArrowLeft size={15} aria-hidden="true" /> Evidence history</button> : null}
+      <div className={`incident-heading ${tone}`}>
+        {incidentPresent ? <RadioTower size={29} aria-hidden="true" /> : operatorSummary.monitoring.state === "normal" ? <ShieldCheck size={29} aria-hidden="true" /> : <TriangleAlert size={29} aria-hidden="true" />}
+        <div className="incident-heading-copy">
+          {incidentPresent ? <small>{status}</small> : null}
+          <strong id="incident-title">{incidentPresent ? verdict ?? "Incident" : operatorSummary.monitoring.state === "normal" ? "No active incident" : presentation.monitoring}</strong>
         </div>
         {incidentPresent ? (
           <div className="incident-chips">
             {synthetic ? <span className="incident-chip simulation">Simulation</span> : null}
-            {evidenceStrength ? <span className={`incident-chip evidence-${evidenceStrength.toLowerCase()}`} title={EVIDENCE_MEANING[evidenceStrength]}>{evidenceStrength} evidence</span> : null}
+            {evidenceStrength ? <span className="incident-chip" title={EVIDENCE_MEANING[evidenceStrength]}>{evidenceStrength} evidence</span> : null}
           </div>
         ) : null}
-      </header>
+      </div>
 
       {!incidentPresent ? <div className="incident-empty">{presentation.observation}</div> : (
         <>
-          <dl className="incident-summary">
+          <dl className="incident-facts">
+            {affected ? <IncidentFact label="Affected signal" value={affected} /> : null}
             {record ? <IncidentFact label="Disturbed" value={disturbedSummary(record)} strong /> : null}
-            {record?.startedAt ? <IncidentFact label="Started" value={dateTime(record.startedAt, displayTimeZone)} /> : null}
-            {record && endAt ? <IncidentFact label={live ? "Duration" : "Lasted"} value={formatDuration(record.startedAt, endAt)} /> : null}
-            {!archived && live && canonicalObservation.at ? <IncidentFact label="Last check" value={`${dateTime(canonicalObservation.at, displayTimeZone)} · ${canonicalObservation.ageLabel}`} /> : null}
+            {record?.startedAt ? <IncidentFact label="Start time" value={dateTime(record.startedAt, displayTimeZone)} /> : null}
+            {record && endAt ? <IncidentFact label="Duration" value={formatDuration(record.startedAt, endAt)} /> : null}
+            {!archived && live && canonicalObservation.at ? <IncidentFact label="Last observation" value={`${dateTime(canonicalObservation.at, displayTimeZone)} · ${canonicalObservation.ageLabel}`} /> : null}
             {placement && live ? <IncidentFact label="Now" value={disturbancePlacementCopy(placement)} /> : null}
-            {record ? <IncidentFact label="Checked window" value={formatRange(...record.affectedRangeHz)} /> : null}
+            {record ? <IncidentFact label="Checked span" value={formatRange(...record.affectedRangeHz)} /> : null}
             {record?.endReason ? <IncidentFact label="Ended because" value={record.endReason} /> : null}
+            {record ? <IncidentFact label="Reference" value={incidentReference(record)} /> : null}
           </dl>
-          <div className="incident-action-callout">
+          <div className="incident-section">
             <strong>Action</strong>
-            <p>{recommendedAction}</p>
+            <p><span className={`action-dot ${live ? "alert" : "clear"}`} />{recommendedAction}</p>
           </div>
 
           {record ? (
-            <section className="incident-block" aria-labelledby="incident-why">
+            <section className="incident-section" aria-labelledby="incident-why">
               <h3 id="incident-why">Why this alert</h3>
               <p className="incident-why-sentence">{whyAlertSentence(record)}</p>
               {bars.length ? (
@@ -155,25 +156,26 @@ export function IncidentPanel({
               ) : null}
               <p className="incident-policy">
                 <span>{ruleLabel(record) ?? "Alert"}{trigger ? ` · ${alertPresetLabel(trigger.policy.choice)} sensitivity${trigger.policy.source === "window" ? " for this window" : ""}` : ""}</span>
-                {onOpenSensitivity && !synthetic ? <button type="button" className="link-button" onClick={onOpenSensitivity}><SlidersHorizontal size={14} aria-hidden="true" /> Sensitivity</button> : null}
+                {onOpenSensitivity && !synthetic ? <button type="button" className="link-button" onClick={onOpenSensitivity}><SlidersHorizontal size={13} aria-hidden="true" /> Sensitivity</button> : null}
               </p>
             </section>
           ) : null}
 
           {record && trigger && !synthetic && snapshotAvailable ? (
-            <figure className="incident-block trigger-figure">
+            <figure className="incident-section trigger-figure">
+              <h3>At the alert</h3>
               <img
                 src={`/api/events/${encodeURIComponent(record.id)}/trigger.svg`}
                 alt={`Spectrum when the alert was raised: ${whyAlertSentence(record)}`}
                 loading="lazy"
                 onError={() => setSnapshotAvailable(false)}
               />
-              <figcaption>What the detector saw at the alert. Blue: received. Green: usual level. Dashed amber: alert level. Red: above the alert level. Relative levels, not calibrated power.</figcaption>
+              <figcaption>Blue: received. Green: usual level. Dashed amber: alert level. Red: above the alert level. Relative levels, not calibrated power.</figcaption>
             </figure>
           ) : null}
 
           {record ? (
-            <section className="incident-block" aria-labelledby="incident-timeline">
+            <section className="incident-section" aria-labelledby="incident-timeline">
               <h3 id="incident-timeline">Timeline</h3>
               <ol className="incident-timeline">
                 {timeline.map((entry, index) => (
@@ -188,8 +190,8 @@ export function IncidentPanel({
           ) : null}
 
           {record ? (
-            <section className="incident-block" aria-labelledby="incident-notes">
-              <div className="incident-block-heading">
+            <section className="incident-section" aria-labelledby="incident-notes">
+              <div className="incident-section-heading">
                 <h3 id="incident-notes">Notes</h3>
                 <button className="button secondary compact" type="button" onClick={onAddNote} disabled={archived || synthetic}><FileText size={15} aria-hidden="true" /> Add note</button>
               </div>
@@ -201,27 +203,28 @@ export function IncidentPanel({
             </section>
           ) : null}
 
-          <section className="incident-block" aria-labelledby="incident-evidence">
-            <h3 id="incident-evidence">Evidence</h3>
-            <p className="incident-muted">{synthetic ? "Test data only. Not part of field evidence." : archived || !live ? "Recorded spectrum, trigger snapshot, timeline, notes and report, with SHA-256 checks." : recordingOk ? "Recording on. The package includes the report, spectrum, timeline and notes." : `${presentation.recording}. Open Recording before downloading.`}</p>
-            <div className="incident-evidence-actions">
-              <button className="button primary" type="button" onClick={onExport} disabled={!canDownload || exporting}>
-                <Download size={17} aria-hidden="true" /> {synthetic ? "Test record only" : exporting ? "Preparing package…" : "Download evidence package"}
-              </button>
-              {onOpenAnalysis && record && !synthetic ? <button className="button secondary" type="button" onClick={onOpenAnalysis}><LineChart size={17} aria-hidden="true" /> Incident report</button> : null}
-            </div>
+          <div className="incident-section">
+            <strong>Evidence</strong>
+            <p><span className={`action-dot ${synthetic || (!archived && live && !recordingOk) ? "alert" : "clear"}`} />{synthetic ? "Test data only. Not part of field evidence." : archived || !live ? "Recorded spectrum, trigger snapshot, timeline, notes and report, with SHA-256 checks." : recordingOk ? "Recording on." : `${presentation.recording}. Open Recording before downloading.`}</p>
             {downloadFiles?.length ? (
               <div className="package-hash">
                 {downloadFiles.map((file) => (
                   <div key={file.filename}>
                     <span>{file.filename}</span>
                     {file.sha256 ? <code title="SHA-256 of the downloaded file">SHA-256 {file.sha256}</code> : null}
-                    {file.sha256 && onCopy ? <button type="button" className="link-button" onClick={() => void onCopy(file.sha256!)}><ClipboardCopy size={14} aria-hidden="true" /> Copy</button> : null}
+                    {file.sha256 && onCopy ? <button type="button" className="link-button" onClick={() => void onCopy(file.sha256!)}><ClipboardCopy size={13} aria-hidden="true" /> Copy</button> : null}
                   </div>
                 ))}
               </div>
             ) : null}
-          </section>
+          </div>
+          <button className="button primary export-button" type="button" onClick={onExport} disabled={!canDownload || exporting}>
+            <Download size={19} aria-hidden="true" /> {synthetic ? "Test record only" : exporting ? "Preparing package…" : "Download evidence package"}
+          </button>
+          <div className="incident-actions">
+            <button className="button secondary" type="button" onClick={onOpenAnalysis} disabled={!onOpenAnalysis || !record || synthetic}><LineChart size={17} aria-hidden="true" /> {synthetic ? "Test record" : "Incident report"}</button>
+            <button className="button secondary" type="button" onClick={onAcknowledge} disabled={!record || archived || Boolean(record?.acknowledgedAt) || synthetic}><Check size={18} aria-hidden="true" /> {synthetic ? "Test only" : record?.acknowledgedAt ? "Acknowledged" : archived ? "Read only" : "Acknowledge"}</button>
+          </div>
 
           {record ? (
             <details className="incident-technical">
@@ -240,10 +243,6 @@ export function IncidentPanel({
               </dl>
             </details>
           ) : null}
-
-          <div className="incident-actions">
-            <button className="button secondary" type="button" onClick={onAcknowledge} disabled={!record || archived || Boolean(record?.acknowledgedAt) || synthetic}><Check size={17} aria-hidden="true" /> {synthetic ? "Test only" : record?.acknowledgedAt ? "Acknowledged" : archived ? "Read only" : "Acknowledge"}</button>
-          </div>
         </>
       )}
     </section>

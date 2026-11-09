@@ -1064,7 +1064,7 @@ function AdvancedSettings({ response, draft, setDraft, errors, unlocked, onMaint
         <details className="advanced-settings-group">
           <summary><span><strong>Signal-learning rules</strong><small>Changing these restarts learning</small></span><ChevronDown size={18} aria-hidden="true" /></summary>
           <div className="advanced-settings-body">
-            <p className="learning-rules-warning">These rules decide which checks are learned as normal. They are part of every learned baseline, so saving a change restarts signal learning for every window and ends open incidents. To change when alerts are raised, use Monitoring › Alert sensitivity.</p>
+            <div className="schedule-capacity attention"><strong>Restarts learning</strong><span>These rules are part of every learned baseline. Saving a change restarts signal learning for every window and ends open incidents. To change when alerts are raised, use Monitoring › Alert sensitivity.</span></div>
             <div className="settings-form-grid detection-grid">
               <NumberField disabled={!unlocked} label="Scale floor" suffix="relative bin" min={0.1} max={32} step={0.1} value={draft.detection.scaleFloorBins} onChange={(value) => updateDetection("scaleFloorBins", value)} />
               <NumberField disabled={!unlocked} label="Wideband observation" suffix="robust scales" min={0.1} max={50} step={0.1} value={draft.detection.widebandObservationSigma} onChange={(value) => updateDetection("widebandObservationSigma", value)} />
