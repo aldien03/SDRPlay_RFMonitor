@@ -2,7 +2,8 @@ import { CalendarDays, Database, Flag, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Header } from "./client/Header";
 import { EvidenceArchive, OptionsPanel, type DisplayOptions } from "./client/BottomPanels";
-import { IncidentPanel } from "./client/MonitorPanels";
+import { IncidentPanel, type PackageDownloadInfo } from "./client/MonitorPanels";
+import { IncidentReportDialog } from "./client/IncidentReportDialog";
 import { NoteModal } from "./client/Modals";
 import { SettingsPage, type SettingsTab } from "./client/SettingsPage";
 import { EngineerWorkspace } from "./client/EngineerWorkspace";
@@ -105,7 +106,7 @@ function loadSignalWallPreferences(): SignalWallPreferences {
 
 export function App() {
   const monitor = useMonitor();
-  const { snapshot, targetFrames, sweepFrames, error, reloadRequired, pause, acknowledge, addNote, captureScreenshot, exportIncident, exportSession, getEvidenceArchive, getEvidenceSessionEvents, getEvidenceReplayBatch, setEngineerStream, setVisibleTargets } = monitor;
+  const { snapshot, targetFrames, sweepFrames, error, reloadRequired, pause, acknowledge, addNote, captureScreenshot, exportIncident, exportSession, getEvent, getEvidenceArchive, getEvidenceSessionEvents, getEvidenceReplayBatch, setEngineerStream, setVisibleTargets } = monitor;
   const [options, setOptions] = useState<DisplayOptions>(loadOptions);
   const [wallPreferences, setWallPreferences] = useState<SignalWallPreferences>(loadSignalWallPreferences);
   const [feedManagerOpen, setFeedManagerOpen] = useState(false);
@@ -117,6 +118,10 @@ export function App() {
   const [selectedEventId, setSelectedEventId] = useState<string>();
   const [archivedEvent, setArchivedEvent] = useState<DetectionEvent>();
   const [detailsView, setDetailsView] = useState<DetailsView>();
+  const [incidentFromEvidence, setIncidentFromEvidence] = useState(false);
+  const [packageDownload, setPackageDownload] = useState<PackageDownloadInfo>();
+  const [exportingEventId, setExportingEventId] = useState<string>();
+  const [reportEvent, setReportEvent] = useState<DetectionEvent>();
   const [now, setNow] = useState(() => Date.now());
   const lastAlertId = useRef<string | undefined>(undefined);
   const operator = presentOperatorSummary(snapshot.operatorSummary);
@@ -124,11 +129,12 @@ export function App() {
   const affectedTargetIds = operatorAffectedTargetIds(snapshot.operatorSummary);
   const affectedTargetSignature = affectedTargetIds.join("\u0000");
   const event = currentOperatorEvent(snapshot);
+  // A selected incident stays on screen after it clears; the live list keeps it.
   const selectedEvent = archivedEvent?.id === selectedEventId
     ? archivedEvent
     : event?.id === selectedEventId
       ? event
-      : undefined;
+      : snapshot.events.find((candidate) => candidate.id === selectedEventId);
   const selectedEventArchived = Boolean(selectedEvent && archivedEvent?.id === selectedEvent.id);
   const activeDrawer: ActiveDrawer | undefined = options.engineer ? "engineer" : detailsView;
 
@@ -193,8 +199,10 @@ export function App() {
 
   useEffect(() => {
     if (archivedEvent) return;
-    setSelectedEventId(event?.id);
-  }, [archivedEvent, event?.id]);
+    // Follow a new live incident; keep the last one open while its drawer is showing.
+    if (event?.id) setSelectedEventId(event.id);
+    else if (detailsView !== "incident") setSelectedEventId(undefined);
+  }, [archivedEvent, detailsView, event?.id]);
 
   const changeOptions = async (next: DisplayOptions) => {
     if (next.popupAlerts && !options.popupAlerts && "Notification" in window && Notification.permission === "default") {
@@ -210,18 +218,23 @@ export function App() {
   };
 
   const exportEventPackage = async (target: DetectionEvent, captureLiveScreenshot: boolean) => {
+    setExportingEventId(target.id);
     try {
-      if (captureLiveScreenshot) await captureScreenshot(target.id);
-      await exportIncident(target.id, target.sessionId);
-      showTemporaryToast("Incident package downloaded.");
+      if (captureLiveScreenshot) await captureScreenshot(target.id).catch(() => undefined);
+      const result = await exportIncident(target.id, target.sessionId, target);
+      setPackageDownload({ eventId: target.id, files: result.files });
+      showTemporaryToast("Evidence package downloaded. Its SHA-256 is shown with the incident.");
     } catch (reason) {
       showTemporaryToast(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setExportingEventId(undefined);
     }
   };
 
   const handleExport = async () => {
     if (!selectedEvent) return;
-    await exportEventPackage(selectedEvent, !selectedEventArchived);
+    const live = selectedEvent.lifecycle === "active" || selectedEvent.lifecycle === "recovering";
+    await exportEventPackage(selectedEvent, !selectedEventArchived && live);
   };
 
   const handleSessionExport = async (session: EvidenceArchiveSession) => {
@@ -271,14 +284,22 @@ export function App() {
 
   const openCurrentIncident = () => {
     setArchivedEvent(undefined);
-    setSelectedEventId(event?.id);
+    setIncidentFromEvidence(false);
+    setSelectedEventId(event?.id ?? (detailsView === "incident" ? selectedEventId : undefined));
     openDetails("incident");
   };
 
   const openArchivedIncident = (archiveEvent: DetectionEvent) => {
     setArchivedEvent(archiveEvent);
     setSelectedEventId(archiveEvent.id);
+    setIncidentFromEvidence(true);
     openDetails("incident");
+  };
+
+  const backToEvidence = () => {
+    setIncidentFromEvidence(false);
+    setArchivedEvent(undefined);
+    openDetails("evidence");
   };
 
   const startLiveFeed = async () => {
@@ -368,6 +389,8 @@ export function App() {
           unlockSettings={monitor.unlockSettings}
           lockSettings={monitor.lockSettings}
           applySettings={monitor.applySettings}
+          getAlertPreview={monitor.getAlertPreview}
+          uploadReportLogo={monitor.uploadReportLogo}
           approveBaseline={monitor.approveBaseline}
           restartBaseline={monitor.restartBaseline}
           clearTestData={monitor.clearTestData}
@@ -468,12 +491,36 @@ export function App() {
           <div className="details-drawer-header"><div><span>{operator.mode} · {operator.productionQualification}</span><strong>{activeDrawer === "incident" ? "Incident details" : activeDrawer === "evidence" ? "Evidence history" : "Engineer"}</strong></div><button type="button" onClick={closeDetails} aria-label="Close details"><X size={20} /></button></div>
           <div className="details-drawer-scroll">
             {activeDrawer === "engineer" ? <><EngineerWorkspace snapshot={snapshot} sweepFrames={sweepFrames} selectedFeedId={wallPreferences.selectedFeedId} onSelectFeed={(selectedFeedId) => setWallPreferences((current) => ({ ...current, selectedFeedId }))} healthIndicator={<EngineerHealthIndicator onOpen={() => openSettings("health")} />} getSettings={monitor.getSettings} startFocus={monitor.startFocus} stopFocus={monitor.stopFocus} startSyntheticExercise={startSyntheticExercise} stopSyntheticExercise={stopSyntheticExercise} onToast={showTemporaryToast} /><OptionsPanel options={options} onChange={(next) => void changeOptions(next)} /></> : null}
-            {activeDrawer === "incident" ? <IncidentPanel archived={selectedEventArchived} event={selectedEvent} operatorSummary={snapshot.operatorSummary} services={snapshot.services} displayTimeZone={snapshot.displayTimeZone} onAddNote={() => setNoteOpen(true)} onAcknowledge={() => selectedEvent && void acknowledge(selectedEvent.id).then(() => showTemporaryToast("Incident marked as reviewed."))} onExport={() => void handleExport()} frame={selectedEventArchived ? undefined : selectedEvent?.targetId ? targetFrames[selectedEvent.targetId]?.frame : undefined} /> : null}
+            {activeDrawer === "incident" ? <IncidentPanel
+              archived={selectedEventArchived}
+              event={selectedEvent}
+              operatorSummary={snapshot.operatorSummary}
+              services={snapshot.services}
+              displayTimeZone={snapshot.displayTimeZone}
+              onAddNote={() => setNoteOpen(true)}
+              onAcknowledge={() => selectedEvent && void acknowledge(selectedEvent.id).then(() => showTemporaryToast("Incident marked as reviewed."))}
+              onExport={() => void handleExport()}
+              frame={selectedEventArchived ? undefined : selectedEvent?.targetId ? targetFrames[selectedEvent.targetId]?.frame : undefined}
+              getEvent={getEvent}
+              onBack={incidentFromEvidence ? backToEvidence : undefined}
+              onOpenAnalysis={selectedEvent ? () => setReportEvent(selectedEvent) : undefined}
+              onOpenSensitivity={() => openSettings("monitoring")}
+              packageDownload={packageDownload}
+              onCopy={(text) => copyText(text).then(() => showTemporaryToast("SHA-256 copied."))}
+              exporting={Boolean(selectedEvent && exportingEventId === selectedEvent.id)}
+            /> : null}
             {activeDrawer === "evidence" ? <EvidenceArchive snapshot={snapshot} getArchive={getEvidenceArchive} getSessionEvents={getEvidenceSessionEvents} getReplayBatch={getEvidenceReplayBatch} onOpenIncident={openArchivedIncident} onExportEvent={(archiveEvent) => exportEventPackage(archiveEvent, false)} onExportSession={handleSessionExport} /> : null}
           </div>
         </DialogShell>
       ) : null}
 
+      {reportEvent ? <IncidentReportDialog
+        event={reportEvent}
+        exporting={exportingEventId === reportEvent.id}
+        onExport={() => void exportEventPackage(reportEvent, false)}
+        onClose={() => setReportEvent(undefined)}
+        onToast={showTemporaryToast}
+      /> : null}
       {noteOpen && selectedEvent ? <NoteModal onClose={() => setNoteOpen(false)} onSave={async (text) => { await addNote(selectedEvent.id, text); setNoteOpen(false); showTemporaryToast("Note added."); }} /> : null}
       {feedManagerOpen ? <FeedManagerModal feeds={snapshot.monitorFeeds} pinnedFeedIds={wallPreferences.pinnedFeedIds} onOpenMonitoring={() => { setFeedManagerOpen(false); openSettings("monitoring"); }} onChange={(pinnedFeedIds) => setWallPreferences((current) => ({ ...current, pinnedFeedIds, selectedFeedId: pinnedFeedIds.includes(current.selectedFeedId ?? "") ? current.selectedFeedId : pinnedFeedIds[0] }))} onClose={() => setFeedManagerOpen(false)} /> : null}
       {focusFeed ? <FocusConfirmation feed={focusFeed} currentFeed={activeFeed} snapshot={snapshot} onCancel={() => setFocusFeed(undefined)} onConfirm={() => void startLiveFeed()} /> : null}

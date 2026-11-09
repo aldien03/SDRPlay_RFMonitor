@@ -24,7 +24,8 @@ import type {
 import type { DisplayOptions } from "./BottomPanels";
 import type { SweepFrameState, TargetFrameState } from "./useMonitor";
 import { formatFrequency } from "./format";
-import { carrierViewRange, SpectrumView, WaterfallView } from "./SpectrumViews";
+import { carrierViewRange, referenceMatchesFrame, SpectrumView, WaterfallView } from "./SpectrumViews";
+import { useTargetReference } from "./useTargetReference";
 import { detectorBaselineAvailable, disturbancePlacement, type DisturbancePlacement } from "./detectorPresentation";
 import { SIGNAL_WALL_CAPACITY, type SignalWallLayout } from "./signalWallPreferences";
 import { preferencesForWall, surfacedVisibleFeedIds } from "./feedVisibility";
@@ -281,7 +282,13 @@ function SignalFeedCard({
   const metricReadout = feedMetricReadout({ frame, metrics, baselineAvailable: detectorBaselineAvailable(frame, metrics), off, unavailable, placement });
   const stateCopy = SIGNAL_STATE_COPY[signalState];
   const cardState = off ? "off" : signalState;
-  const stateLabel = off ? "Off" : stateCopy.label;
+  // "Checking 2 of 3": how close a raised signal is to becoming an alert.
+  const pending = feed.targetIds
+    .map((targetId) => states.find((state) => state.targetId === targetId))
+    .find((state) => state?.lifecycle === "detecting" && state.candidateCount > 0 && state.requiredCount > 0);
+  const stateLabel = off ? "Off" : signalState === "checking" && pending ? `${stateCopy.label} ${Math.min(pending.candidateCount, pending.requiredCount)} of ${pending.requiredCount}` : stateCopy.label;
+  const showReference = options.baseline && (feed.kind !== "stitched-sweep" || isLive);
+  const reference = useTargetReference(target?.id, showReference && feed.kind === "capture-window" && !off);
   const displayCoverage = isLive && frame ? `${formatFrequency(frame.startHz, 3).replace(" MHz", "")}-${formatFrequency(frame.endHz, 3)}` : feed.coverageLabel;
   const frequencyGuides = useMemo(() => snapshot.bands
     .filter((band) => feed.bandIds.includes(band.id) && band.service === "fugro" && band.correctionBeam)
@@ -312,10 +319,10 @@ function SignalFeedCard({
         <span>{exercise ? "SIMULATION" : isLive || feed.kind === "capture-window" ? "One receiver window" : "Stitched sweep"}</span>
         <span>{exercise ? `${exercise.scenarioName} · ${exercise.phase === "waiting-for-target" ? "Starting" : exercise.phase === "alert" ? "Test alert" : exercise.phase === "recovering" ? `Recovering ${exercise.cleanChecks} of ${exercise.requiredCleanChecks}` : exercise.phase === "complete" ? exercise.verdict ?? "Test complete" : exercise.phase === "inconclusive" ? "Test inconclusive" : "Test running"}` : coverageLabel}</span>
       </div>
-      <div className="feed-chart-heading"><strong>Relative signal level</strong>{metricReadout ? <span className={`feed-metrics ${metricReadout.overload ? "overload" : ""}`}>{metricReadout.chips.map((chip) => <b key={chip}>{chip}</b>)}</span> : null}{carrierView ? <span className="feed-zoom-note">Zoomed to carriers</span> : null}<div><span><i className="legend-current" />{feed.kind === "stitched-sweep" && !isLive ? "Last full sweep" : "Current"}</span>{options.baseline && (feed.kind !== "stitched-sweep" || isLive) && detectorBaselineAvailable(frame, metrics) ? <span><i className="legend-usual" />Usual level</span> : null}</div></div>
+      <div className="feed-chart-heading"><strong>Relative signal level</strong>{metricReadout ? <span className={`feed-metrics ${metricReadout.overload ? "overload" : ""}`}>{metricReadout.chips.map((chip) => <b key={chip}>{chip}</b>)}</span> : null}{carrierView ? <span className="feed-zoom-note">Zoomed to carriers</span> : null}<div><span><i className="legend-current" />{feed.kind === "stitched-sweep" && !isLive ? "Last full sweep" : "Current"}</span>{showReference && detectorBaselineAvailable(frame, metrics) ? <span><i className="legend-usual" />Usual level</span> : null}{showReference && detectorBaselineAvailable(frame, metrics) && referenceMatchesFrame(reference, frame) ? <span><i className="legend-line alert-level" />Alert level</span> : null}{placement ? <span><i className="legend-swatch above-alert" />Above alert</span> : null}</div></div>
       <div className="feed-spectrum-grid">
-        <div className="plain-level-axis" aria-hidden="true"><span>High</span><span>Usual</span><span>Low</span></div>
-        <div className="feed-spectrum"><SpectrumView frame={frame} metrics={metrics} showBaseline={options.baseline && (feed.kind !== "stitched-sweep" || isLive)} showMarkers={options.markers} frequencyGuides={frequencyGuides} view={carrierView} />{off ? <p className="feed-off-notice">Off. Turn this window on in Settings, Monitoring.</p> : null}</div>
+        <div className="plain-level-axis" aria-hidden="true"><span>Stronger</span><span /><span>Weaker</span></div>
+        <div className="feed-spectrum"><SpectrumView frame={frame} metrics={metrics} showBaseline={showReference} showMarkers={options.markers} frequencyGuides={frequencyGuides} view={carrierView} reference={reference} showAlertLevel={showReference} />{off ? <p className="feed-off-notice">Off. Turn this window on in Settings, Monitoring.</p> : null}</div>
       </div>
       <FeedFrequencyAxis startHz={displayStartHz} endHz={displayEndHz} />
       <div className="feed-waterfall"><WaterfallView frames={history} frequencyGuides={frequencyGuides} view={carrierView} /></div>

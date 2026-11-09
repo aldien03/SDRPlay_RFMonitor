@@ -105,15 +105,30 @@ Select **Acknowledge** after the incident has been seen and assigned. Acknowledg
 
 Select **Download evidence package**. The queued export contains the incident slice, not the entire session. The browser downloads it directly after the application streams its SHA-256; large incidents are numbered multipart archives without truncation.
 
-Each incident package also contains a one-page figure of that incident only, in `figures/`:
+Open the incident first. The drawer leads with the verdict, the **disturbed frequencies** and the action, then **Why this alert**: the rule that fired, how strong and how wide the raised energy was against the alert level in force, and how often it repeated. Below that are a picture of exactly what the detector compared when the alert was raised, the timeline, notes and the evidence actions. **Incident report** opens the client report exactly as it is delivered, with **PDF**, **Open to print** and **Evidence package** buttons.
 
-- `report.html` is a self-contained incident report: key numbers, plain-language findings (peak level and frequency, how far above the learned normal level, how many frames and how much of the band were above usual, whether the strongest signal stayed on one frequency or moved, and whether that frequency is the centre of the capture window), then every chart. It opens on its own and prints cleanly to PDF from the browser.
-- `chart-level-over-time.svg`, `chart-excess-over-time.svg`, `chart-strongest-frequency.svg` and `chart-above-normal-by-frequency.svg` are the analysis charts as separate, time-stamped files, and `incident-analysis.svg` has them all on one sheet. "Above usual" means more than three usual spreads (1.4826 x the learned MAD, at least 1) above the learned typical level of that frequency.
-- `incident-overview.svg` shows the strongest and typical signal level across the analysed window against the learned normal level, a waterfall (newest at the top, UTC on the left) with the incident start and end marked, and the strongest level per row. The same sheet is embedded in `report.html`.
-- `waterfall.png` is the waterfall image on its own, and `figure.json` lists what was drawn: frame counts, row length, and the SHA-256 of `spectrum/frames.jsonl`.
-- The figure is drawn from the exported frames only. Time gaps are shown as gaps, never filled in, and frames from a different RF setup are left out and counted. Levels are relative and uncalibrated.
-- Every figure is time stamped: the sheet states when it was generated and the UTC window it covers, and the same text is burned into the pixels of `waterfall.png`, so the image keeps its time stamp when it is copied out of the package.
-- The figure is a derived view for people who do not read raw bins. The recorded frames and the manifest hashes remain the evidence, and the figure says so on its face. If the figure cannot be drawn, `figures/figure.json` says why and the rest of the package is unaffected.
+The package file is named `RF-Incident_<start UTC>_<window>_<id>.zip`. After the download, the drawer shows its SHA-256 with a Copy button; record it with the transfer.
+
+Package contents:
+
+| Path | Contents |
+|---|---|
+| `report.pdf`, `report.html` | The client report (same content): cover with company, client, vessel and project; summary; why the alert was raised; spectrum at the alert, before/during spectrum and waterfall; timeline; analysis; receiver and configuration; operator notes; evidence integrity; limitations and terms. |
+| `report.json` | The report as data. |
+| `README-VERIFY.txt` | What is in the package and how to check it on Linux, macOS, Windows and the RF Monitor host. |
+| `incident.json`, `events/history.jsonl` | The incident record (including its stored trigger, peak values and timeline) and every stored version of it. |
+| `spectrum/` | The recorded frames: the evidence itself. |
+| `evidence/trigger-snapshot.json` | The levels, usual level and alert level the detector compared when the alert was raised. |
+| `evidence/screenshots/`, `evidence/notes/` | Screenshots and operator note files for this incident. |
+| `logs/` | Operations, configuration-audit (with the preceding hash-chain entry) and SDRconnect logs for the incident window plus 10 minutes. |
+| `source-context/` | Configuration, receiver snapshot and integrity record of each recording session. |
+| `figures/` | Overview sheet, waterfall image and the four analysis charts as stand-alone, time-stamped files. |
+| `export-record.json` | When, from which address and by which software the package was made. |
+| `manifest.json`, `SHA256SUMS.txt` | SHA-256 of every file, including the report. |
+
+To check a package, extract it and run `sha256sum -c SHA256SUMS.txt` (Linux), `shasum -a 256 -c SHA256SUMS.txt` (macOS), or `Get-FileHash -Algorithm SHA256` per file (Windows), or `sudo rf-monitor verify-evidence <folder>` on the host. Every line must report OK.
+
+The report and charts are derived from the recorded frames. Analysis counts "above the alert level" with the incident's own sensitivity, and also shows the looser "above usual range" (three normal variations) for context. When few frames were recorded before the incident, the report says the comparison is weak. Levels are relative and uncalibrated. RF data can show interference, not intent.
 
 Store the ZIP in the approved incident repository. Do not rename or modify its contents before verification. Record who transferred it and where it was stored according to local procedure.
 

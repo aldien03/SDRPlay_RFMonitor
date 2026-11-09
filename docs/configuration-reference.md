@@ -111,6 +111,10 @@ Examples should describe the real installation, such as a vessel name, platform 
 - maximum 80 characters;
 - use a stable asset/deployment identifier rather than a person's name.
 
+### Report Identity
+
+**Settings › Site › Report identity** sets the company name, an optional PNG or JPEG logo (up to 512 KB and 2000 × 2000 pixels, stored by SHA-256 next to the operational profile), the client, the vessel or platform and the project or job reference. They are printed on the cover and header of every incident report. They apply live.
+
 ### Display Time Zone
 
 Choose an IANA time zone such as `UTC` or a relevant regional zone. This changes browser display only.
@@ -193,7 +197,29 @@ Milliseconds spent on a scheduled service window. Valid range: 250 to 300000 ms.
 
 Relative scheduling weight from 0 to 10. It does not create a second receiver. Review the displayed revisit estimate after every change.
 
-### Detection And Baseline Defaults
+### Alert Sensitivity
+
+**Settings › Monitoring › Alert sensitivity** decides when relative RF energy raises an alert. It is separate from the signal-learning rules below: it is not part of any baseline fingerprint, so changing it **never restarts signal learning, never ends an open incident and never retunes the receiver**. The change applies within a second, starts a new recording session that continues any open incident, adds a "Sensitivity changed" entry to each open incident's timeline, and is written to the configuration audit.
+
+| Preset | Raised level | Band-wide share | Narrow peak | Must repeat | Noise-floor rise | Short bursts |
+|---|---|---|---|---|---|---|
+| Conservative | 8× | 50% | 12× | 4 of 5 checks, 1.5 s observed | 5× for 20 s, approved baselines only | Off |
+| **Standard** (default) | 6× | 35% | 10× | 3 of 5 checks, 1 s observed | 4× for 10 s | Off |
+| Sensitive | 5× | 30% | 8× (2 bins or wider) | 2 of 4 checks, 0.8 s observed | 3.5× for 8 s | Single frames at 8× |
+| Very sensitive | 4× | 25% | 6× (2 bins or wider) | 2 of 3 checks | 3× for 6 s | Single frames at 7× |
+
+"×" means multiples of each frequency's **normal variation** (`1.4826 × MAD`, at least one relative bin). A check is one completed visit to a frequency window (the per-bin median of three frames). The alert rules are:
+
+- **Band-wide rise**: at least the band-wide share of the analysed window is at or above the raised level.
+- **Wider signal (partial band)**: one raised block wider than the narrow limit (10% of the window, 0.8 MHz of 8 MHz) whose middle strength reaches the raised level. This closes the gap where a 0.8–4 MHz emission matched neither the narrow nor the band-wide rule.
+- **Narrow signal**: a raised block no wider than the narrow limit whose peak reaches the narrow-peak level. Each block is judged on its own, so a wider block elsewhere does not hide it.
+- **Noise-floor rise**: the middle level of the whole window sits at or above the noise-floor level for the stated observed time. It is checked against provisional and reviewable local references as well as approved baselines (Low evidence unless approved).
+- **Short bursts** (Sensitive and Very sensitive): a raised block seen in a single frame that the three-frame median would hide. Bursts are never learned.
+- **Must repeat**: raised checks of any shape count together; the alert names the most severe shape seen. Checks further apart than three times the window's revisit objective (at least 30 s) start a new count, so slowly revisited windows can still alert.
+
+Choose **Custom** values in **Advanced › Alert rules**, and a different preset for one frequency window under **Per window**. When a baseline is learning, the page shows how many alerts each preset would have raised during live checks so far, as an estimate.
+
+### Signal-Learning Rules
 
 Raw SDRconnect spectrum bins are normalized relative display values. SDRconnect's vendor-reported power field is labelled as sourced/relative and is not treated as calibrated dBm.
 
@@ -206,7 +232,7 @@ Raw SDRconnect spectrum bins are normalized relative display values. SDRconnect'
 | Slow drift | Median deviation at least 4 scales against the protected baseline and at least 10 seconds observed exposure |
 | Clear | Ten valid clean observations; missing/incomplete/stale/mistuned visits are unknown |
 
-These are versioned commissioning recommendations, not certified limits. A valid detector observation is the per-bin median of at least three accepted frames from one completed, epoch-confirmed visit. At the current 512-bin output, describe an observed temporal feature as **moving narrowband energy**, not a chirp or trustworthy 25 kHz StarTrack classification.
+**Advanced › Signal-learning rules** decide which checks are learned as normal. They are hashed into every baseline fingerprint, so saving a change restarts signal learning for every window and ends open incidents; the server refuses the change unless the operator confirms it. Use Alert sensitivity to change when alerts are raised. These are versioned commissioning recommendations, not certified limits. A valid detector observation is the per-bin median of at least three accepted frames from one completed, epoch-confirmed visit. At the current 512-bin output, describe an observed temporal feature as **moving narrowband energy**, not a chirp or trustworthy 25 kHz StarTrack classification.
 
 Baseline states are Learning, Provisional, Reviewable, Protected, and Stale. Learning requires at least 30 minutes and valid-visit coverage. Reviewable requires 24 representative UTC hours of stable RF configuration/health; elapsed wall time or isolated samples do not count. The default representative-hour gate requires a 30-minute visit spread, 10 seconds of accumulated observed exposure, and at least 80% valid scheduled opportunities without a tune, health, overload, candidate, or data-gap invalidation. Protected requires explicit approval through the protected Settings session after the bounded 24-hour timing and signal-learning gate. A fingerprint change—including receiver serial or any detector-rule value—selects an exact prior baseline or returns the target to Checking; it never silently transforms or deletes a baseline.
 
@@ -240,12 +266,21 @@ Starting another focus replaces the current temporary focus only after validatio
 
 ## Applying Settings
 
+Before saving, the Settings footer states what Apply will do:
+
+| Change | What happens |
+|---|---|
+| Alert sensitivity, site name, deployment ID, time zone, retention, report identity | **Applies now.** No retune; open incidents stay open; a new recording session continues them. |
+| Monitoring task, windows, scan timing | **Retunes the receiver.** Open incidents end and a new recording session starts. |
+| Signal-learning rules | **Restarts signal learning** for every window after an explicit confirmation (`428` without it). |
+
 The browser sends the complete draft and expected revision. Possible results:
 
 - `200`: applied, persisted, audited, and running;
 - `401`: Settings is locked or the session expired;
 - `409`: another client changed the revision first; the browser reloads the latest profile;
 - `422`: one or more fields are invalid and the running profile is unchanged;
+- `428`: the change restarts signal learning and was not confirmed;
 - `5xx`: persistence or runtime apply failed; RF Monitor attempts rollback and records failure.
 
 A successful apply:

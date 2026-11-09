@@ -113,6 +113,36 @@ describe("settings persistence", () => {
     expect(migrationAudit.previousConfigurationHash).toBe(migrationAudit.configurationHash);
   });
 
+  it("backs up a schema-v5 profile and rewrites it as v6 with Standard alert sensitivity and unchanged learning rules", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "rf-monitor-settings-"));
+    temporaryRoots.push(root);
+    const operationalPath = path.join(root, "operational.json");
+    const auditPath = path.join(root, "config-audit.jsonl");
+    const revisionsPath = path.join(root, "revisions");
+    const legacy = structuredClone(settings()) as any;
+    legacy.schemaVersion = 5;
+    delete legacy.alerting;
+    delete legacy.reportIdentity;
+    const rawLegacy = `${JSON.stringify(legacy)}\n`;
+    await writeFile(operationalPath, rawLegacy);
+    const migrated = validateOperationalSettings(legacy, TEST_CATALOG);
+
+    const store = await SettingsStore.create({ settings: migrated, catalog: TEST_CATALOG, operationalPath, auditPath, revisionsPath });
+
+    const backup = (await readdir(revisionsPath)).find((name) => /^operational-r000001-pre-v6-.*\.json$/.test(name));
+    expect(backup).toBeDefined();
+    expect(await readFile(path.join(revisionsPath, backup!), "utf8")).toBe(rawLegacy);
+    const onDisk = JSON.parse(await readFile(operationalPath, "utf8"));
+    expect(onDisk).toMatchObject({ schemaVersion: 6, alerting: { default: { preset: "standard" } }, reportIdentity: {} });
+    expect(onDisk.detection).toEqual(legacy.detection);
+    expect((await store.recentAudit()).at(-1)).toMatchObject({
+      actor: "service-migration",
+      changedFields: ["schemaVersion", "alerting", "reportIdentity"],
+      reason: expect.stringMatching(/v5 to v6/),
+    });
+    expect((await readdir(root)).some((name) => name.includes(".invalid-"))).toBe(false);
+  });
+
   it("fails closed when an audit record is modified", async () => {
     const files = await fixture();
     const draft = files.store.settings;

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { EvidenceStore } from "../src/server/evidenceStore";
+import { incidentPackageBaseName } from "../src/shared/incidentNaming";
 import { verifyEvidenceDirectory, verifyMultipartEvidenceDirectories } from "../src/server/evidenceVerifier";
 import type { DetectionEvent, PersistedSpectrumFrame } from "../src/shared/types";
 
@@ -382,7 +383,7 @@ describe("evidence store", { timeout: 60_000 }, () => {
     const zipPath = singleExportPath(await store.exportIncident(legacyEvent));
     const zip = await readFile(zipPath);
     const entries = storedZipEntries(zip);
-    const packageRoot = `${session.id}-${legacyEvent.id}`;
+    const packageRoot = incidentPackageBaseName(legacyEvent);
     expect(zip.subarray(0, 2).toString()).toBe("PK");
     expect((await stat(zipPath)).size).toBeGreaterThan(200);
     expect([...entries.values()].every((entry) => entry.method === 0)).toBe(true);
@@ -411,9 +412,20 @@ describe("evidence store", { timeout: 60_000 }, () => {
     expect(figureSummary).toMatchObject({ derived: true, framesUsed: 1, levelScale: "relative-uncalibrated-uint8" });
     expect(figureSummary.sourceFramesSha256).toMatch(/^[a-f0-9]{64}$/);
     // The report is self-contained: findings, key numbers and every chart are in it.
-    expect(report).toContain("What the recorded frames show");
+    expect(report).toContain("Analysis of the recorded frames");
+    expect(report).toContain("Why the alert was raised");
     expect(report).toContain("<svg");
     expect(report).toContain("Signal level over time");
+    // The client deliverables: the same report as a PDF and as data, plus verification steps.
+    const pdf = entries.get(`${packageRoot}/report.pdf`)?.contents;
+    expect(pdf?.subarray(0, 5).toString()).toBe("%PDF-");
+    const reportModel = JSON.parse(entries.get(`${packageRoot}/report.json`)?.contents.toString("utf8") ?? "{}");
+    expect(reportModel).toMatchObject({ kind: "rf-incident-report", scope: "evidence-package" });
+    expect(JSON.stringify(reportModel)).not.toMatch(/confidence|dbm|spoof/i);
+    expect(entries.get(`${packageRoot}/README-VERIFY.txt`)?.contents.toString("utf8")).toContain("sha256sum -c SHA256SUMS.txt");
+    expect(JSON.parse(entries.get(`${packageRoot}/export-record.json`)?.contents.toString("utf8") ?? "{}")).toMatchObject({ packageType: "incident-evidence", incidentId: legacyEvent.id });
+    for (const log of ["operations", "configuration-audit", "sdrconnect-events"]) expect(entries.has(`${packageRoot}/logs/${log}.jsonl`)).toBe(true);
+    expect(entries.has(`${packageRoot}/source-context/${session.id}/integrity.json`)).toBe(true);
     for (const name of ["incident-analysis.svg", "chart-level-over-time.svg", "chart-excess-over-time.svg", "chart-strongest-frequency.svg", "chart-above-normal-by-frequency.svg"]) {
       const chart = entries.get(`${packageRoot}/figures/${name}`)?.contents.toString("utf8") ?? "";
       expect(chart).toContain("<svg");
@@ -425,9 +437,10 @@ describe("evidence store", { timeout: 60_000 }, () => {
     expect(figureSummary.generatedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     expect(figureSvg).toContain("Figure generated (UTC)");
     const exportedManifest = JSON.parse(entries.get(`${packageRoot}/manifest.json`)?.contents.toString("utf8") ?? "{}");
-    for (const name of ["figures/incident-overview.svg", "figures/waterfall.png", "figures/figure.json"]) {
+    for (const name of ["figures/incident-overview.svg", "figures/waterfall.png", "figures/figure.json", "report.pdf", "report.html", "report.json", "README-VERIFY.txt", "export-record.json"]) {
       expect(exportedManifest.files.some((entry: { path: string }) => entry.path === name)).toBe(true);
     }
+    expect(exportedManifest.packageType).toBe("incident-evidence");
     await expect(stat(path.join(session.path, "events", "incident-event-1.html"))).rejects.toThrow();
     expect((await readdir(path.join(root, "exports"))).every((name) => !name.includes(".partial-"))).toBe(true);
   });
@@ -464,19 +477,23 @@ describe("evidence store", { timeout: 60_000 }, () => {
     const stray = path.join(path.dirname(second!.svgPath), "notes.txt");
     await writeFile(stray, "keep me");
     const now = Date.parse("2026-11-07T07:00:00.000Z");
-    expect(await store.pruneIncidentFigures(45 * 60_000, now)).toEqual({ removedFiles: 3, keptFiles: 3 });
-    expect((await readdir(path.dirname(second!.svgPath))).sort()).toEqual(["20261107T063012Z-end-analysis.svg", "20261107T063012Z-end.png", "20261107T063012Z-end.svg", "notes.txt"]);
+    expect(await store.pruneIncidentFigures(45 * 60_000, now)).toEqual({ removedFiles: 5, keptFiles: 5 });
+    expect((await readdir(path.dirname(second!.svgPath))).sort()).toEqual([
+      "20261107T063012Z-end-analysis.svg", "20261107T063012Z-end-report.html", "20261107T063012Z-end-report.json", "20261107T063012Z-end.png", "20261107T063012Z-end.svg", "notes.txt",
+    ]);
+    const savedReport = await store.readIncidentFigure(incident.id, "report-html");
+    expect(savedReport?.bytes.toString("utf8")).toContain("RF Incident Report");
     // Past the retention, everything of ours goes and the stray file keeps its folder.
-    expect(await store.pruneIncidentFigures(60_000, now)).toEqual({ removedFiles: 3, keptFiles: 0 });
+    expect(await store.pruneIncidentFigures(60_000, now)).toEqual({ removedFiles: 5, keptFiles: 0 });
     expect(await readFile(stray, "utf8")).toBe("keep me");
 
     // The hard cap holds even when retention is long.
     await rm(stray);
     for (const minute of [1, 2, 3, 4]) await store.saveIncidentFigureSnapshot(incident, { reason: "progress", now: Date.parse(`2026-11-07T06:0${minute}:00.000Z`) });
-    expect(await store.pruneIncidentFigures(30 * 86_400_000, now, 6)).toEqual({ removedFiles: 6, keptFiles: 6 });
+    expect(await store.pruneIncidentFigures(30 * 86_400_000, now, 10)).toEqual({ removedFiles: 10, keptFiles: 10 });
     expect((await readdir(path.dirname(second!.svgPath))).sort()).toEqual([
-      "20261107T060300Z-progress-analysis.svg", "20261107T060300Z-progress.png", "20261107T060300Z-progress.svg",
-      "20261107T060400Z-progress-analysis.svg", "20261107T060400Z-progress.png", "20261107T060400Z-progress.svg",
+      "20261107T060300Z-progress-analysis.svg", "20261107T060300Z-progress-report.html", "20261107T060300Z-progress-report.json", "20261107T060300Z-progress.png", "20261107T060300Z-progress.svg",
+      "20261107T060400Z-progress-analysis.svg", "20261107T060400Z-progress-report.html", "20261107T060400Z-progress-report.json", "20261107T060400Z-progress.png", "20261107T060400Z-progress.svg",
     ]);
     expect(await store.pruneIncidentFigures(0, now)).toEqual({ removedFiles: 0, keptFiles: 0 });
   });
@@ -497,13 +514,13 @@ describe("evidence store", { timeout: 60_000 }, () => {
       "20261107T063012Z-end-analysis.svg", "20261107T063012Z-end-report.html", "20261107T063012Z-end.png", "20261107T063012Z-end.svg",
     ]);
     const report = await readFile(path.join(share, incident.id, "20261107T063012Z-end-report.html"), "utf8");
-    expect(report).toContain("What the recorded frames show");
+    expect(report).toContain("Analysis of the recorded frames");
     expect(report).toContain("RF data can show interference, not intent.");
-    expect((await readdir(path.join(root, "incident-figures", incident.id))).length).toBe(3);
+    expect((await readdir(path.join(root, "incident-figures", incident.id))).length).toBe(5);
 
     // The retention choice applies to the share as well, and to nothing else in it.
     await writeFile(path.join(share, "readme-from-a-person.txt"), "mine");
-    expect(await store.pruneIncidentFigures(60_000, Date.parse("2026-11-08T06:30:12.000Z"))).toEqual({ removedFiles: 7, keptFiles: 0 });
+    expect(await store.pruneIncidentFigures(60_000, Date.parse("2026-11-08T06:30:12.000Z"))).toEqual({ removedFiles: 9, keptFiles: 0 });
     expect(await readdir(share)).toEqual(["readme-from-a-person.txt"]);
   });
 
@@ -575,7 +592,7 @@ describe("evidence store", { timeout: 60_000 }, () => {
 
     const zipPath = singleExportPath(await store.exportIncident(incident));
     const entries = storedZipEntries(await readFile(zipPath));
-    const packageRoot = `${session.id}-${incident.id}`;
+    const packageRoot = incidentPackageBaseName(incident);
     expect(JSON.parse(entries.get(`${packageRoot}/baseline-reference.json`)?.contents.toString("utf8") ?? "{}").descriptor.generation).toBe(1);
     expect(JSON.parse(entries.get(`${packageRoot}/manifest.json`)?.contents.toString("utf8") ?? "{}")).toMatchObject({ complete: true, evidenceGap: false });
   });
@@ -590,7 +607,7 @@ describe("evidence store", { timeout: 60_000 }, () => {
     await store.recordEvent(incident);
     await store.closeActive();
     const entries = storedZipEntries(await readFile(singleExportPath(await store.exportIncident(incident))));
-    const manifest = JSON.parse(entries.get(`${session.id}-${incident.id}/manifest.json`)?.contents.toString("utf8") ?? "{}");
+    const manifest = JSON.parse(entries.get(`${incidentPackageBaseName(incident)}/manifest.json`)?.contents.toString("utf8") ?? "{}");
     expect(manifest).toMatchObject({ complete: false, evidenceGap: true });
     expect(manifest.missingParts).toContain(`baseline:${incident.baselineFingerprintId}`);
   });
@@ -622,7 +639,7 @@ describe("evidence store", { timeout: 60_000 }, () => {
     expect(restored).toMatchObject({ id: continued.id, sessionIds: [first.id, second.id] });
     const zipPath = singleExportPath(await store.exportIncident(restored!));
     const entries = storedZipEntries(await readFile(zipPath));
-    const packageRoot = `${first.id}-${continued.id}`;
+    const packageRoot = incidentPackageBaseName(continued);
     const indexedFrames = (entries.get(`${packageRoot}/spectrum/frames.jsonl`)?.contents.toString("utf8") ?? "")
       .trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
     expect(indexedFrames.map((entry) => entry.frame.id)).toEqual(["part-1-frame", "part-2-frame"]);
@@ -653,7 +670,7 @@ describe("evidence store", { timeout: 60_000 }, () => {
 
     const zipPath = singleExportPath(await store.exportIncident(incident));
     const entries = storedZipEntries(await readFile(zipPath));
-    const rootName = `${second.id}-${incident.id}`;
+    const rootName = incidentPackageBaseName(incident);
     const completeness = JSON.parse(entries.get(`${rootName}/completeness.json`)?.contents.toString("utf8") ?? "{}");
     const manifest = JSON.parse(entries.get(`${rootName}/manifest.json`)?.contents.toString("utf8") ?? "{}");
     expect(completeness).toMatchObject({ complete: false, evidenceGap: true, missingSessionIds: [first.id] });
@@ -697,7 +714,7 @@ describe("evidence store", { timeout: 60_000 }, () => {
       expect((await stat(partPath)).size).toBeLessThanOrEqual(32_768);
       const entries = storedZipEntries(await readFile(partPath));
       expect([...entries.keys()].some((name) => name.endsWith("multipart.json"))).toBe(true);
-      const packageRoot = `${session.id}-${incident.id}`;
+      const packageRoot = incidentPackageBaseName(incident);
       const extractedRoot = path.join(root, `verify-part-${index + 1}`);
       extractedPartRoots.push(extractedRoot);
       for (const [name, entry] of entries) {
@@ -816,7 +833,7 @@ describe("evidence store", { timeout: 60_000 }, () => {
     expect(recoveredManifest).toMatchObject({ complete: false, evidenceGap: true });
     const recoveredIncident = (await recoveredStore.listSessionEvents(interrupted.id))[0];
     const incidentExport = storedZipEntries(await readFile(singleExportPath(await recoveredStore.exportIncident(recoveredIncident))));
-    const incidentManifest = JSON.parse(incidentExport.get(`${interrupted.id}-${recoveredIncident.id}/manifest.json`)?.contents.toString("utf8") ?? "{}");
+    const incidentManifest = JSON.parse(incidentExport.get(`${incidentPackageBaseName(recoveredIncident)}/manifest.json`)?.contents.toString("utf8") ?? "{}");
     expect(incidentManifest).toMatchObject({
       complete: false,
       evidenceGap: true,

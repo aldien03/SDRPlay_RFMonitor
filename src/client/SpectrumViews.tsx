@@ -1,3 +1,4 @@
+import type { TargetReferenceView } from "./useTargetReference";
 import { memo, useCallback, useEffect, useLayoutEffect, useRef } from "react";
 import type { SignalMetricSample, SpectrumFrame } from "../shared/types";
 import { buildWaterfallPalette, composeWaterfall, rasterizeRow, waterfallColor } from "../shared/waterfallRaster";
@@ -85,6 +86,21 @@ interface SpectrumViewProps {
   showMarkers: boolean;
   frequencyGuides?: ReadonlyArray<{ frequencyHz: number; label: string }>;
   view?: ViewRange;
+  /** Per-bin usual level and alert level from the detector; drawn when it matches this frame's grid. */
+  reference?: TargetReferenceView;
+  showAlertLevel?: boolean;
+}
+
+/** The reference arrays apply only to the exact display grid they were projected for. */
+export function referenceMatchesFrame(reference: TargetReferenceView | undefined, frame: SpectrumFrame | undefined): reference is TargetReferenceView {
+  if (!reference || !frame?.bins.length) return false;
+  const start = frame.analysisStartBin ?? 0;
+  const end = frame.analysisEndBin ?? frame.bins.length;
+  return reference.frameBinCount === frame.bins.length
+    && reference.analysisStartBin === start
+    && reference.analysisEndBin === end
+    && reference.usual.length === end - start
+    && reference.alertLevel.length === end - start;
 }
 
 function guideX(frequencyHz: number, startHz: number, endHz: number, width: number): number {
@@ -149,6 +165,8 @@ export const SpectrumView = memo(function SpectrumView({
   showMarkers,
   frequencyGuides = [],
   view,
+  reference,
+  showAlertLevel = false,
 }: SpectrumViewProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   // Ref, not state: pointer moves at 4 spectrum updates/sec across up to nine cards must not re-render this memoised component.
@@ -313,7 +331,31 @@ export const SpectrumView = memo(function SpectrumView({
       context.stroke();
     }
 
-    if (showBaseline && detectorBaselineAvailable(frame, metrics)) {
+    const baselineAvailable = detectorBaselineAvailable(frame, metrics);
+    if (showBaseline && baselineAvailable && referenceMatchesFrame(reference, frame)) {
+      // Per-frequency usual level and alert level, exactly as the detector compares.
+      const drawReferenceLine = (values: number[], color: string, dash: number[], lineWidth: number) => {
+        context.setLineDash(dash);
+        context.beginPath();
+        let started = false;
+        for (let offset = 0; offset < values.length; offset += 1) {
+          const index = reference.analysisStartBin + offset;
+          if (index < window.startBin || index >= window.endBin) continue;
+          const x = xFor(index);
+          const y = yFor(values[offset]);
+          if (!started) {
+            context.moveTo(x, y);
+            started = true;
+          } else context.lineTo(x, y);
+        }
+        context.strokeStyle = color;
+        context.lineWidth = lineWidth;
+        context.stroke();
+        context.setLineDash([]);
+      };
+      drawReferenceLine(reference.usual, "#1d7f45", [5, 4], 1.2);
+      if (showAlertLevel) drawReferenceLine(reference.alertLevel, "#a35f00", [3, 3], 1.2);
+    } else if (showBaseline && baselineAvailable) {
       const y = yFor(metrics!.baselineLevel);
       context.setLineDash([5, 5]);
       context.beginPath();

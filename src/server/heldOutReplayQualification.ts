@@ -19,6 +19,7 @@ import {
 import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import {
+  alertingSettingsHash,
   baselineFingerprintId,
   centralAnalysisBinBounds,
   DetectionEngine,
@@ -130,6 +131,8 @@ export interface V5ReplayFrozenIdentity {
   detectorRuleSetId: string;
   detectorRuleHash: string;
   detectorThresholds: DetectionThresholds;
+  /** Hash of every resolved alert policy frozen with the corpus (alert sensitivity). */
+  alertingHash?: string;
   targetIds: string[];
   families: V5ReplayFamily[];
 }
@@ -887,6 +890,9 @@ function assertCandidateBinding(frozen: V5ReplayFrozenIdentity, candidate: V5Can
     || frozen.detectorRuleHash !== detectionRuleFingerprint(frozen.detectorThresholds)
     || sha256CanonicalV5(frozen.detectorThresholds) !== sha256CanonicalV5(candidate.operationalSettings.detection)) {
     throw new Error("V5 corpus detector thresholds/rule hash do not match the frozen candidate; holdout tuning is forbidden");
+  }
+  if (frozen.alertingHash !== undefined && frozen.alertingHash !== alertingSettingsHash(candidate.operationalSettings.alerting)) {
+    throw new Error("V5 corpus alert sensitivity does not match the frozen candidate; holdout tuning is forbidden");
   }
   const plan = detectorQualificationPlan(candidate.catalog);
   const expectedTargets = plan.targets.map((target) => target.id);

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage } from "node:http";
 import { createReadStream, existsSync } from "node:fs";
 import path from "node:path";
@@ -10,9 +11,12 @@ import express from "express";
 import { WebSocketServer, WebSocket } from "ws";
 import { estimateRevisitMs } from "../shared/bands";
 import { liveSubscriptionSignature, normalizeLiveSubscription, type NormalizedLiveSubscription } from "../shared/liveSubscription";
-import { evaluateSettingsFeasibility, SettingsValidationError } from "../shared/settings";
+import { changedFieldPaths, classifySettingsChange, evaluateSettingsFeasibility, MAX_REPORT_LOGO_BYTES, MAX_REPORT_LOGO_PIXELS, ROBUST_DETECTION_DEFAULTS, SettingsValidationError } from "../shared/settings";
+import { ALERT_POLICY_BOUNDS, alertPresetDefinitions } from "../shared/alertPolicy";
+import { chartToSvg } from "./report/svgChart";
+import { triggerSnapshotChart } from "./report/triggerChart";
 import type { CurrentMonitoringHealth, DetectionEvent, DiagnosticSummaryState, HealthSnapshotV2, LiveSubscription, MonitorSnapshot, MonitorStateDelta, OperationalSettings, ProductionQualification, ResourceHealth, ServiceMessage, SettingsRevision, StreamingHealth } from "../shared/types";
-import { encodeSpectrumEnvelope, LIVE_HEARTBEAT_INTERVAL_MS } from "../shared/liveProtocol";
+import { compactLiveEvent, encodeSpectrumEnvelope, LIVE_HEARTBEAT_INTERVAL_MS } from "../shared/liveProtocol";
 import { AdminAuth, AdminAuthenticationError } from "./adminAuth";
 import { loadConfig, withOperationalSettings } from "./config";
 import { BaselineApprovalUnavailableError, CommittedBaselineRestartRecoveryError, MonitorService } from "./monitorService";
@@ -132,7 +136,7 @@ const productionQualificationStore = await ProductionQualificationStore.open(pat
     ?? "/etc/rf-monitor/qualification-approval-v1.json",
 });
 type ExportRequest =
-  | { kind: "incident"; eventId: string; sessionId?: string }
+  | { kind: "incident"; eventId: string; sessionId?: string; requester?: string }
   | { kind: "session"; sessionId: string };
 const protectedExportByteLimit = () => Math.max(
   1,
@@ -141,7 +145,7 @@ const protectedExportByteLimit = () => Math.max(
 const exportQueue = new ExportJobQueue<ExportRequest>({
   builder: async (request, context) => {
     const outputPath = request.kind === "incident"
-      ? await monitor.exportIncident(request.eventId, request.sessionId, context.jobId)
+      ? await monitor.exportIncident(request.eventId, request.sessionId, context.jobId, request.requester)
       : await monitor.exportSession(request.sessionId, context.jobId);
     if (!outputPath) throw new Error(request.kind === "incident" ? "Incident evidence was not found" : "Evidence session was not found");
     return outputPath;
@@ -242,6 +246,9 @@ function settingsResponse(request: express.Request): SettingsRevision {
     baselineApprovals: monitor.getBaselineApprovalEligibility(),
     commissioning: monitor.getCommissioningHealth(),
     admin: { available: adminAuth.available, unlocked: session.unlocked, expiresAt: session.expiresAt },
+    alertPresets: alertPresetDefinitions(),
+    alertPolicyBounds: ALERT_POLICY_BOUNDS,
+    detectionDefaults: { ...ROBUST_DETECTION_DEFAULTS },
     infrastructure: {
       dataDomain: config.dataDomain,
       receiverUrls: config.receiverUrls,
@@ -444,10 +451,7 @@ function downloadRateLimiter(bytesPerSecond = 5 * 1024 * 1024): Transform {
 }
 
 function compactSnapshot(snapshot: MonitorSnapshot, engineer = false): MonitorSnapshot {
-  const compactEvent = (event: DetectionEvent | undefined) => event ? {
-    ...event,
-    notes: event.notes.slice(-8).map((note) => ({ ...note, text: note.text.slice(0, 512) })),
-  } : undefined;
+  const compactEvent = (event: DetectionEvent | undefined, includeTrigger = false) => event ? compactLiveEvent(event, includeTrigger) : undefined;
   return {
     ...snapshot,
     currentFrame: snapshot.currentFrame ? { ...snapshot.currentFrame, bins: new Uint8Array() } : undefined,
@@ -458,7 +462,7 @@ function compactSnapshot(snapshot: MonitorSnapshot, engineer = false): MonitorSn
       waterfall: [],
     })),
     panorama: engineer ? snapshot.panorama.map((segment) => ({ ...segment, bins: new Uint8Array() })) : [],
-    activeEvent: compactEvent(snapshot.activeEvent),
+    activeEvent: compactEvent(snapshot.activeEvent, true),
     events: snapshot.events.slice(0, 10).map((event) => compactEvent(event)!),
     sessions: snapshot.sessions.slice(0, 6),
   };
@@ -1097,19 +1101,42 @@ app.put("/api/settings", async (request, response) => {
   let prepared;
   try {
     prepared = settingsStore.prepare(incoming, expectedRevision);
+    const changedFields = changedFieldPaths(settingsStore.settings, prepared.settings)
+      .filter((field) => !["revision", "updatedAt"].includes(field));
+    const applied = classifySettingsChange(changedFields);
+    if (applied === "learning-restart" && request.body?.confirmSignalLearningRestart !== true) {
+      response.status(428).json({
+        error: "Changing signal-learning rules restarts signal learning for every window and ends active incidents. Confirm to continue.",
+        code: "SIGNAL_LEARNING_RESTART_CONFIRMATION_REQUIRED",
+        applied,
+      });
+      return;
+    }
     const previousConfig = config;
     const nextConfig = withOperationalSettings(config, prepared.settings);
-    await monitor.reconfigure(nextConfig);
     let auditEntry;
-    try {
-      auditEntry = await settingsStore.commit(prepared, "settings-admin", clientAddress(request));
-    } catch (error) {
-      await monitor.reconfigure(previousConfig).catch(() => undefined);
-      throw error;
+    if (applied === "live" || applied === "none") {
+      // Alert sensitivity, site identity, time zone, retention and report
+      // identity never retune the receiver or end an incident.
+      if (applied === "live") await monitor.applyLiveSettings(nextConfig, changedFields);
+      try {
+        auditEntry = await settingsStore.commit(prepared, "settings-admin", clientAddress(request));
+      } catch (error) {
+        if (applied === "live") await monitor.applyLiveSettings(previousConfig, changedFields).catch(() => undefined);
+        throw error;
+      }
+    } else {
+      await monitor.reconfigure(nextConfig);
+      try {
+        auditEntry = await settingsStore.commit(prepared, "settings-admin", clientAddress(request));
+      } catch (error) {
+        await monitor.reconfigure(previousConfig).catch(() => undefined);
+        throw error;
+      }
     }
     config = nextConfig;
     await monitor.recordConfigurationAudit(auditEntry);
-    response.json(settingsResponse(request));
+    response.json({ ...settingsResponse(request), applied });
   } catch (error) {
     await settingsStore.recordRejected(error instanceof Error ? error.message : String(error), "settings-admin", clientAddress(request), prepared?.configurationHash).catch(() => undefined);
     if (error instanceof RevisionConflictError) {
@@ -1565,6 +1592,7 @@ app.post("/api/exports", async (request, response) => {
         kind,
         eventId: boundedIdentifier(request.body?.eventId),
         sessionId: request.body?.sessionId === undefined ? undefined : boundedIdentifier(request.body.sessionId),
+        requester: clientAddress(request),
       }, { estimatedOutputBytes: incidentExportReservationBytes() });
     } else if (kind === "session") {
       job = await submitSessionExport(boundedIdentifier(request.body?.sessionId));
@@ -1671,6 +1699,228 @@ app.get("/api/events/:eventId/export", (request, response) => {
   } catch (error) {
     respondExportSubmissionError(response, error);
   }
+});
+
+app.get("/api/events/:eventId", async (request, response) => {
+  let eventId: string;
+  try {
+    eventId = boundedIdentifier(request.params.eventId);
+  } catch (error) {
+    response.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    return;
+  }
+  const sessionId = typeof request.query.sessionId === "string" ? request.query.sessionId : undefined;
+  const event = await monitor.getEvent(eventId, sessionId).catch(() => undefined);
+  if (!event) {
+    response.status(404).json({ error: "Incident not found" });
+    return;
+  }
+  response.setHeader("Cache-Control", "no-store");
+  response.json(event);
+});
+
+app.get("/api/events/:eventId/trigger.json", async (request, response) => {
+  try {
+    const snapshot = await monitor.getTriggerSnapshot(boundedIdentifier(request.params.eventId));
+    if (!snapshot) {
+      response.status(404).json({ error: "No trigger snapshot exists for this incident" });
+      return;
+    }
+    response.setHeader("Cache-Control", "no-store");
+    response.json(snapshot);
+  } catch {
+    response.status(400).json({ error: "The trigger snapshot could not be read" });
+  }
+});
+
+app.get("/api/events/:eventId/trigger.svg", async (request, response) => {
+  try {
+    const eventId = boundedIdentifier(request.params.eventId);
+    const [snapshot, event] = await Promise.all([monitor.getTriggerSnapshot(eventId), monitor.getEvent(eventId)]);
+    if (!snapshot) {
+      response.status(404).json({ error: "No trigger snapshot exists for this incident" });
+      return;
+    }
+    response.setHeader("Cache-Control", "no-store");
+    response.setHeader("X-Content-Type-Options", "nosniff");
+    response.setHeader("Content-Security-Policy", "default-src 'none'; img-src data:; style-src 'unsafe-inline'; sandbox");
+    response.type("image/svg+xml").send(chartToSvg(triggerSnapshotChart(snapshot, event), { standalone: true, idPrefix: "trigger" }));
+  } catch {
+    response.status(400).json({ error: "The trigger snapshot could not be drawn" });
+  }
+});
+
+// ---- Client incident report -------------------------------------------------
+// The report is data-only HTML: inline styles and data: images, no script.
+const REPORT_CSP = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'";
+
+function reportFailure(response: express.Response, error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  const busy = /paused|busy/i.test(message);
+  response.status(busy ? 503 : 500).setHeader("Retry-After", busy ? "10" : "0").json({ error: busy ? message : "The incident report could not be prepared" });
+}
+
+app.get("/api/events/:eventId/report.html", async (request, response) => {
+  try {
+    const eventId = boundedIdentifier(request.params.eventId);
+    const report = await monitor.getIncidentReport(eventId, "html");
+    if (!report) {
+      response.status(404).json({ error: "No recorded frames are available for this incident yet" });
+      return;
+    }
+    response.setHeader("Cache-Control", "no-store");
+    response.setHeader("X-Content-Type-Options", "nosniff");
+    response.setHeader("Content-Security-Policy", REPORT_CSP);
+    response.type("text/html; charset=utf-8").send(report.bytes);
+  } catch (error) {
+    reportFailure(response, error);
+  }
+});
+
+app.get("/api/events/:eventId/report.json", async (request, response) => {
+  try {
+    const report = await monitor.getIncidentReport(boundedIdentifier(request.params.eventId), "json");
+    if (!report) {
+      response.status(404).json({ error: "No recorded frames are available for this incident yet" });
+      return;
+    }
+    response.setHeader("Cache-Control", "no-store");
+    response.type("application/json").send(report.bytes);
+  } catch (error) {
+    reportFailure(response, error);
+  }
+});
+
+let reportPdfInFlight = false;
+app.get("/api/events/:eventId/report.pdf", async (request, response) => {
+  if (reportPdfInFlight) {
+    response.status(429).setHeader("Retry-After", "3").json({ error: "Another report PDF is being prepared; try again in a moment" });
+    return;
+  }
+  reportPdfInFlight = true;
+  try {
+    const eventId = boundedIdentifier(request.params.eventId);
+    const pdf = await monitor.getIncidentReportPdf(eventId);
+    if (!pdf) {
+      response.status(404).json({ error: "No recorded frames are available for this incident yet" });
+      return;
+    }
+    response.setHeader("Cache-Control", "no-store");
+    response.setHeader("X-Content-Type-Options", "nosniff");
+    response.setHeader("Content-Disposition", `attachment; filename="RF-Incident-Report_${eventId.replace(/[^A-Za-z0-9]/g, "").slice(0, 8)}.pdf"`);
+    response.type("application/pdf").send(Buffer.from(pdf));
+  } catch (error) {
+    reportFailure(response, error);
+  } finally {
+    reportPdfInFlight = false;
+  }
+});
+
+const reportRefreshLimiter = new Map<string, number>();
+app.post("/api/events/:eventId/report/refresh", async (request, response) => {
+  try {
+    const eventId = boundedIdentifier(request.params.eventId);
+    const last = reportRefreshLimiter.get(eventId) ?? 0;
+    if (Date.now() - last < 15_000) {
+      response.status(429).setHeader("Retry-After", "15").json({ error: "The report was updated moments ago" });
+      return;
+    }
+    reportRefreshLimiter.set(eventId, Date.now());
+    if (reportRefreshLimiter.size > 256) reportRefreshLimiter.delete(reportRefreshLimiter.keys().next().value!);
+    const report = await monitor.getIncidentReport(eventId, "html", true);
+    if (!report) {
+      response.status(404).json({ error: "No recorded frames are available for this incident yet" });
+      return;
+    }
+    response.json({ updated: true, stamp: report.stamp });
+  } catch (error) {
+    reportFailure(response, error);
+  }
+});
+
+const reportLogoParser = express.raw({ type: ["image/png", "image/jpeg"], limit: MAX_REPORT_LOGO_BYTES });
+
+/** PNG or JPEG pixel size from the file header, without decoding the image. */
+function imageDimensions(bytes: Buffer, mediaType: "image/png" | "image/jpeg"): { width: number; height: number } | undefined {
+  if (mediaType === "image/png") {
+    if (bytes.length < 24 || bytes.readUInt32BE(0) !== 0x89504e47 || bytes.toString("ascii", 12, 16) !== "IHDR") return undefined;
+    return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) };
+  }
+  if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return undefined;
+  let offset = 2;
+  while (offset + 9 < bytes.length) {
+    if (bytes[offset] !== 0xff) return undefined;
+    const marker = bytes[offset + 1];
+    const length = bytes.readUInt16BE(offset + 2);
+    if (marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker)) {
+      return { height: bytes.readUInt16BE(offset + 5), width: bytes.readUInt16BE(offset + 7) };
+    }
+    offset += 2 + length;
+  }
+  return undefined;
+}
+
+app.put("/api/settings/report-logo", reportLogoParser, async (request, response) => {
+  if (!requireAdmin(request, response)) return;
+  const mediaType = request.is("image/png") ? "image/png" : request.is("image/jpeg") ? "image/jpeg" : undefined;
+  const bytes = Buffer.isBuffer(request.body) ? request.body : undefined;
+  if (!mediaType || !bytes?.length) {
+    response.status(415).json({ error: "Upload a PNG or JPEG logo" });
+    return;
+  }
+  const size = imageDimensions(bytes, mediaType);
+  if (!size || size.width < 1 || size.height < 1 || size.width > MAX_REPORT_LOGO_PIXELS || size.height > MAX_REPORT_LOGO_PIXELS) {
+    response.status(422).json({ error: `The logo must be a valid PNG or JPEG up to ${MAX_REPORT_LOGO_PIXELS} × ${MAX_REPORT_LOGO_PIXELS} pixels` });
+    return;
+  }
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  try {
+    await monitor.storeReportLogo(new Uint8Array(bytes), mediaType, sha256);
+    response.json({ sha256, mediaType, widthPx: size.width, heightPx: size.height, bytes: bytes.length });
+  } catch {
+    response.status(500).json({ error: "The logo could not be saved" });
+  }
+});
+
+app.get("/api/site/report-logo", async (request, response) => {
+  const sha = typeof request.query.sha === "string" ? request.query.sha : undefined;
+  const logo = sha ? await monitor.readReportLogoBySha(sha) : await monitor.readReportLogo();
+  if (!logo) {
+    response.status(404).json({ error: "No report logo is set" });
+    return;
+  }
+  response.setHeader("Cache-Control", "private, max-age=300");
+  response.setHeader("X-Content-Type-Options", "nosniff");
+  response.setHeader("Content-Security-Policy", "default-src 'none'; sandbox");
+  response.type(logo.mediaType).send(Buffer.from(logo.bytes));
+});
+
+app.get("/api/targets/:targetId/reference", (request, response) => {
+  let targetId: string;
+  try {
+    targetId = boundedIdentifier(request.params.targetId);
+  } catch (error) {
+    response.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    return;
+  }
+  const reference = monitor.getTargetReference(targetId);
+  if (!reference) {
+    response.status(404).json({ error: "No usual level is available for this window yet" });
+    return;
+  }
+  const etag = `"${createHash("sha256").update(`${reference.revision}:${reference.alertSigma}:${reference.frameBinCount}`).digest("hex").slice(0, 32)}"`;
+  response.setHeader("Cache-Control", "no-cache");
+  response.setHeader("ETag", etag);
+  if (request.headers["if-none-match"] === etag) {
+    response.status(304).end();
+    return;
+  }
+  response.json(reference);
+});
+
+app.get("/api/alert-preview", (_request, response) => {
+  response.setHeader("Cache-Control", "no-store");
+  response.json(monitor.getAlertPreview());
 });
 
 app.get("/api/evidence/archive", async (request, response) => {

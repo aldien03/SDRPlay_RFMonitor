@@ -1,5 +1,33 @@
 import { createHash, randomUUID } from "node:crypto";
+import {
+  ALERT_CLASSIFIER_VERSION,
+  ALERT_PRESET_IDS,
+  ALERT_PRESET_TABLE_VERSION,
+  alertPresetValues,
+  alertVoteGapMs,
+  analysisKindFor,
+  binRangesToHz,
+  burstFromFrame,
+  classifyAlert,
+  createAlertTrackerState,
+  deriveAlertingFromDetection,
+  publicDetectionKind,
+  referenceKind,
+  segmentFeatures,
+  updateAlertTracker,
+  type AlertSegment,
+  type AlertTrackerState,
+  type EmissionKind,
+} from "./alertPolicy";
 import type {
+  AlertDetailKind,
+  AlertingSettings,
+  AlertPolicyChoice,
+  AlertPolicyValues,
+  AlertPresetId,
+  AlertRuleComparison,
+  AlertTrigger,
+  AlertTriggerSnapshot,
   BandPreset,
   BaselineDescriptor,
   BaselineFingerprint,
@@ -8,6 +36,7 @@ import type {
   DetectionEvent,
   DetectionKind,
   DetectionRuleSettings,
+  DetectorGauge,
   ObservationDisposition,
   SignalMetricSample,
   SpectrumFrame,
@@ -79,10 +108,55 @@ interface BaselineState {
   lastDriftAtMs?: number;
   lastObservedAtMs: number;
   protectedAt?: string;
+  /** Alert-track persistence; independent of the learning-track votes above. */
+  alert: AlertTrackerState;
+  /** Shadow trackers per preset for the sensitivity preview (estimates only). */
+  shadow?: ShadowPreviewState;
+}
+
+interface ShadowPreviewState {
+  firstAtMs: number;
+  trackers: Record<AlertPresetId, AlertTrackerState>;
+  onsets: Record<AlertPresetId, number[]>;
+  activeOnsets: number[];
+}
+
+const PREVIEW_WINDOW_MS = 24 * 60 * 60_000;
+const MAX_PREVIEW_ONSETS = 512;
+const MAX_TRIGGER_SNAPSHOT_BINS = 4_096;
+
+export interface ResolvedAlertPolicyWithHash {
+  choice: AlertPolicyChoice;
+  source: "default" | "window";
+  values: AlertPolicyValues;
+  hash: string;
+}
+
+export function alertPolicyHash(values: AlertPolicyValues): string {
+  return createHash("sha256").update(JSON.stringify(canonical({
+    classifierVersion: ALERT_CLASSIFIER_VERSION,
+    presetTableVersion: ALERT_PRESET_TABLE_VERSION,
+    values,
+  }))).digest("hex");
+}
+
+/** Hash of every resolved alert policy; binds qualification records to exact alert behaviour. */
+export function alertingSettingsHash(alerting: AlertingSettings): string {
+  return createHash("sha256").update(JSON.stringify(canonical({
+    classifierVersion: ALERT_CLASSIFIER_VERSION,
+    presetTableVersion: alerting.presetTableVersion,
+    default: alerting.default.values,
+    targetOverrides: Object.fromEntries(Object.entries(alerting.targetOverrides ?? {}).map(([id, setting]) => [id, setting.values])),
+  }))).digest("hex");
+}
+
+export function withAlertPolicyHash(policy: { choice: AlertPolicyChoice; source: "default" | "window"; values: AlertPolicyValues }): ResolvedAlertPolicyWithHash {
+  return { ...policy, hash: alertPolicyHash(policy.values) };
 }
 
 export interface DetectionCandidate {
   kind: DetectionKind;
+  detailKind?: AlertDetailKind;
   hits: number;
   window: number;
   observedExposureMs: number;
@@ -102,6 +176,20 @@ export interface DetectionResult {
   unknownReason?: "observation-ineligible" | "baseline-unavailable" | "baseline-mismatch";
   /** Detector-owned display semantics for this exact observation. */
   analysis: DetectorObservationAnalysis;
+  /** Engineer-only margins against every alert rule for this check. */
+  gauge?: DetectorGauge;
+  /** The usual-level arrays this check was compared with (for the live reference view). */
+  reference?: DetectionReferenceView;
+  /** Exact detector view for the evidence record; built only when an incident is first created. */
+  triggerSnapshot?: (eventId: string) => AlertTriggerSnapshot;
+}
+
+export interface DetectionReferenceView {
+  revision: string;
+  medians: Uint8Array;
+  mads: Uint8Array;
+  scaleFloorBins: number;
+  alertSigma: number;
 }
 
 export interface DetectorObservationAnalysis {
@@ -113,6 +201,8 @@ export interface DetectorObservationAnalysis {
   baselineAvailable: boolean;
   overload: boolean;
   anomalyKind?: Exclude<DetectionKind, "gnss-energy-anomaly" | "overload">;
+  anomalyDetailKind?: AlertDetailKind;
+  referenceRevision?: string;
   anomalyBinRanges: DetectorAnomalyBinRange[];
 }
 
@@ -301,6 +391,8 @@ export function projectDetectorAnalysisToFrame(input: {
     baselineAvailable: input.analysis.baselineAvailable,
     overload: input.analysis.overload,
     anomalyKind: input.analysis.anomalyKind,
+    ...(input.analysis.anomalyDetailKind ? { anomalyDetailKind: input.analysis.anomalyDetailKind } : {}),
+    ...(input.analysis.referenceRevision ? { referenceRevision: input.analysis.referenceRevision } : {}),
     anomalyBinRanges: projected,
   };
 }
@@ -310,12 +402,36 @@ export class DetectionEngine {
   private readonly histogram = new Uint16Array(256);
   private readonly zHistogram = new Uint32Array(2_561);
   private readonly ruleFingerprint: string;
+  private readonly defaultAlertPolicy: ResolvedAlertPolicyWithHash;
+  private readonly presetPolicies: Array<{ id: AlertPresetId; values: AlertPolicyValues; hash: string }>;
+  private zScratch = new Float32Array(0);
+  private frameZScratch = new Float32Array(0);
 
   constructor(
     private readonly thresholds: DetectionThresholds = DEFAULT_THRESHOLDS,
     private readonly random: () => number = Math.random,
   ) {
     this.ruleFingerprint = detectionRuleFingerprint(thresholds);
+    const derived = deriveAlertingFromDetection(thresholds, DEFAULT_THRESHOLDS).default;
+    this.defaultAlertPolicy = withAlertPolicyHash({ choice: derived.preset, source: "default", values: derived.values });
+    this.presetPolicies = ALERT_PRESET_IDS.map((id) => {
+      const values = alertPresetValues(id);
+      return { id, values, hash: alertPolicyHash(values) };
+    });
+  }
+
+  /** Bounded live estimate: alert onsets each preset would have raised for a target. */
+  getAlertPreview(targetId: string, nowMs = Date.now()): { observedHours: number; onsets: Record<AlertPresetId, number>; activeOnsets: number } | undefined {
+    const state = [...this.states.values()].find((candidate) => candidate.targetId === targetId);
+    const shadow = state?.shadow;
+    if (!shadow) return undefined;
+    const since = nowMs - PREVIEW_WINDOW_MS;
+    const count = (values: number[]) => values.filter((at) => at >= since).length;
+    return {
+      observedHours: Math.min(24, Math.max(0, (nowMs - Math.max(shadow.firstAtMs, since)) / 3_600_000)),
+      onsets: Object.fromEntries(ALERT_PRESET_IDS.map((id) => [id, count(shadow.onsets[id])])) as Record<AlertPresetId, number>,
+      activeOnsets: count(shadow.activeOnsets),
+    };
   }
 
   getBaselineStates(): BaselineDescriptor[] {
@@ -380,6 +496,14 @@ export class DetectionEngine {
      * may be trained on. Alerts, overload and protected baselines are unaffected.
      */
     acceptCandidates?: boolean;
+    /** Alert sensitivity for this target. Defaults to the policy implied by the learning rules. */
+    alertPolicy?: ResolvedAlertPolicyWithHash;
+    /** Repeated checks further apart than this do not count together. */
+    voteGapMs?: number;
+    /** Single accepted frames of this visit (analysis bins only); used only for short-burst checks. */
+    frameBins?: Uint8Array[];
+    /** Run the four preset shadow trackers that feed the sensitivity preview. */
+    shadowPreview?: boolean;
   } = {}): DetectionResult {
     if (observation.dataDomain !== observation.fingerprint.dataDomain) {
       throw new Error("Observation and baseline fingerprint cross a data-domain boundary");
@@ -545,10 +669,13 @@ export class DetectionEngine {
       && external!.descriptor.lifecycle === "protected"
       && state.reservoirCount >= MIN_BASELINE_OBSERVATIONS;
     const referenceState = useOperationalReference ? state : externalState ?? state;
-    const features = this.features(observation, referenceState);
     const protectedMedianZ = externalState?.lifecycle === "protected"
       ? this.features(observation, externalState).medianZ
       : undefined;
+    // The reference features fill the shared z vector used by both tracks.
+    const features = this.features(observation, referenceState, true);
+
+    // ---- Learning track (unchanged; alone decides training admission) ----
     const kind = this.classify(features, observation.overload, protectedMedianZ);
     if (state.votes.at(-1) && observedAtMs - state.votes.at(-1)!.observedAtMs > MAX_CANDIDATE_GAP_MS) state.votes = [];
     state.votes.push({ kind, exposureMs: observation.exposureMs, observedAtMs });
@@ -562,36 +689,138 @@ export class DetectionEngine {
       state.driftExposureMs = 0;
       state.lastDriftAtMs = undefined;
     }
-    const exposureMs = kind === "baseline-drift"
+    const learningExposureMs = kind === "baseline-drift"
       ? state.driftExposureMs
       : matchingVotes.reduce((total, vote) => total + vote.exposureMs, 0);
-    const alertEligible = kind === "overload"
+    const learningAlertEligible = kind === "overload"
       ? true
       : kind === "baseline-drift"
-        ? exposureMs >= this.thresholds.driftExposureMs
+        ? learningExposureMs >= this.thresholds.driftExposureMs
         : kind === "narrowband-spike"
           ? matchingVotes.length >= this.thresholds.interferenceHits
-          : matchingVotes.length >= this.thresholds.interferenceHits && exposureMs >= this.thresholds.interferenceExposureMs;
-
-    const acceptedCandidate = Boolean(options.acceptCandidates) && kind !== undefined && kind !== "overload" && !alertEligible;
+          : matchingVotes.length >= this.thresholds.interferenceHits && learningExposureMs >= this.thresholds.interferenceExposureMs;
+    const acceptedCandidate = Boolean(options.acceptCandidates) && kind !== undefined && kind !== "overload" && !learningAlertEligible;
     if (kind && !acceptedCandidate) this.invalidateHourBucket(state, observation);
     const trainingEligible = (!kind || acceptedCandidate) && !observation.overload && !options.freezeTraining;
-    if (trainingEligible && (!externalExact || external!.descriptor.lifecycle === "protected")) {
+
+    // ---- Alert track (operator sensitivity; never changes what is learned) ----
+    const policy = options.alertPolicy ?? this.defaultAlertPolicy;
+    const values = policy.values;
+    const binCount = observation.bins.length;
+    const referenceLifecycle = externalExact ? external!.descriptor.lifecycle : state.lifecycle;
+    const floorAllowed = referenceLifecycle !== "learning"
+      && referenceLifecycle !== "stale"
+      && (!values.noiseFloorRequiresProtected || referenceLifecycle === "protected");
+    const floorMedianZ = protectedMedianZ ?? features.medianZ;
+    const segments = segmentFeatures(this.zScratch, binCount, values.segmentSigma, values.segmentGapRatio, features.medianZ);
+    const classification = classifyAlert(segments, values, { floorMedianZ, floorAllowed });
+    let emission: EmissionKind | undefined = observation.overload ? undefined : classification.emission;
+    let burstSegments: AlertSegment[] = [];
+    let burstPeakZ: number | undefined;
+    const frameZ = !observation.overload && values.burstSigma > 0 ? this.frameZVectors(options.frameBins, referenceState, binCount) : [];
+    if (!observation.overload && !emission && values.burstSigma > 0) {
+      for (const z of frameZ) {
+        const frameFeatures = segmentFeatures(z, binCount, values.burstSigma, values.segmentGapRatio, 0);
+        burstPeakZ = Math.max(burstPeakZ ?? 0, frameFeatures.peakZ);
+        if (burstFromFrame(frameFeatures, values)) {
+          emission = "burst";
+          burstSegments = frameFeatures.segments.filter((segment) => segment.medianZ >= values.burstSigma);
+          break;
+        }
+      }
+    }
+    const voteGapMs = options.voteGapMs ?? alertVoteGapMs(undefined);
+    const tracker = observation.overload ? undefined : updateAlertTracker(state.alert, {
+      atMs: observedAtMs,
+      emission,
+      floor: classification.floor,
+      exposureMs: observation.exposureMs,
+      values,
+      voteGapMs,
+      policyHash: policy.hash,
+    });
+    const candidateDetail: AlertDetailKind | undefined = observation.overload ? "overload" : tracker!.candidateKind;
+    const alertDetail: AlertDetailKind | undefined = observation.overload ? "overload" : tracker!.alertKind;
+    const alertEligible = alertDetail !== undefined;
+    const alertsPossible = !(externalExact && referenceLifecycle === "learning");
+    if (options.shadowPreview && alertsPossible && !observation.overload) {
+      this.updateShadowPreview(state, observedAtMs, observation.exposureMs, binCount, floorMedianZ, referenceLifecycle, frameZ, voteGapMs, Boolean(tracker?.onset));
+    }
+
+    // In-memory adaptive reference: admit only checks clean under both tracks.
+    if (trainingEligible && !candidateDetail && (!externalExact || external!.descriptor.lifecycle === "protected")) {
       this.addReservoirObservation(state, observation.bins);
     }
     if (!externalExact) this.promoteLifecycle(state, observedAtMs);
     const metrics = this.metrics(observation, referenceState, features);
     const baseline = externalExact ? external!.descriptor : this.descriptor(state);
-    const disposition: ObservationDisposition = kind ? "anomalous" : "clean";
-    const candidate = kind ? {
-      kind,
-      hits: matchingVotes.length,
-      window: this.thresholds.interferenceWindow,
-      observedExposureMs: exposureMs,
-      count: matchingVotes.length,
-      required: kind === "overload" ? 1 : this.thresholds.interferenceHits,
+    const disposition: ObservationDisposition = candidateDetail ? "anomalous" : "clean";
+    const floorProgress = tracker && candidateDetail === "noise-floor"
+      ? {
+        hits: Math.max(1, Math.round(tracker.floorExposureMs / Math.max(1, observation.exposureMs))),
+        required: Math.max(1, Math.ceil(tracker.floorRequiredMs / Math.max(1, observation.exposureMs))),
+      }
+      : undefined;
+    const candidate: DetectionCandidate | undefined = candidateDetail ? {
+      kind: publicDetectionKind(candidateDetail, band.service),
+      detailKind: candidateDetail,
+      hits: observation.overload ? 1 : floorProgress?.hits ?? tracker!.votes,
+      window: values.alertWindow,
+      observedExposureMs: observation.overload ? observation.exposureMs : candidateDetail === "noise-floor" ? tracker!.floorExposureMs : tracker!.exposureMs,
+      count: observation.overload ? 1 : floorProgress?.hits ?? tracker!.votes,
+      required: observation.overload ? 1 : floorProgress?.required ?? values.alertVisits,
     } : undefined;
-    if (externalExact && baseline.lifecycle === "learning" && kind !== "overload") {
+    const referenceRevision = referenceState === state
+      ? `memory:${state.learningGenerationId}:${state.derivedRevision}`
+      : `stored:${external!.descriptor.fingerprintId.slice(0, 16)}:${external!.descriptor.learningGenerationId}:${external!.descriptor.observationCount}`;
+    const reference: DetectionReferenceView = {
+      revision: referenceRevision,
+      medians: referenceState.medians,
+      mads: referenceState.mads,
+      scaleFloorBins: this.thresholds.scaleFloorBins,
+      alertSigma: values.segmentSigma,
+    };
+    const persistenceRule: AlertRuleComparison = {
+      rule: "persistence",
+      label: "Raised checks",
+      measured: tracker?.votes ?? 0,
+      threshold: values.alertVisits,
+      unit: "checks",
+      met: Boolean(tracker && tracker.votes >= values.alertVisits && tracker.exposureMs >= values.minExposureMs),
+    };
+    const ruleComparisons: AlertRuleComparison[] = [
+      ...classification.rules,
+      ...(values.burstSigma > 0 ? [{
+        rule: "burst" as const,
+        label: "Short-burst strength",
+        measured: Math.round((burstPeakZ ?? 0) * 100) / 100,
+        threshold: values.burstSigma,
+        unit: "x" as const,
+        met: emission === "burst",
+      }] : []),
+      persistenceRule,
+    ];
+    const gauge: DetectorGauge = {
+      observedAt: observation.observedAt,
+      preset: policy.choice,
+      rules: ruleComparisons,
+      votes: tracker?.votes ?? 0,
+      required: values.alertVisits,
+      window: values.alertWindow,
+      exposureMs: tracker?.exposureMs ?? 0,
+      requiredExposureMs: values.minExposureMs,
+      floorExposureMs: tracker?.floorExposureMs ?? 0,
+      floorRequiredMs: values.noiseFloorExposureMs,
+    };
+    const rangeSegments: Array<{ startBin: number; endBin: number }> = !candidateDetail || candidateDetail === "overload"
+      ? []
+      : candidateDetail === "burst"
+        ? burstSegments
+        : candidateDetail === "noise-floor"
+          ? segmentFeatures(this.zScratch, binCount, values.noiseFloorSigma, values.segmentGapRatio, features.medianZ).segments
+          : classification.qualifying;
+    const anomalyBinRanges = rangeSegments.map((segment) => ({ startBin: segment.startBin, endBin: segment.endBin }));
+    if (externalExact && baseline.lifecycle === "learning" && !observation.overload) {
       // A robust seed may quarantine a change during Learning, but it cannot
       // claim a clean/anomalous operational observation or draw red anomaly
       // regions before the persistent baseline becomes Provisional.
@@ -602,13 +831,77 @@ export class DetectionEngine {
         candidate,
         alertEligible: false,
         trainingEligible,
-        analysis: this.observationAnalysis(observation, undefined, "unknown", baseline, undefined),
+        analysis: this.observationAnalysis(observation, undefined, "unknown", baseline, undefined, [], referenceRevision),
+        gauge,
+        reference,
       };
     }
-    const analysis = this.observationAnalysis(observation, kind, disposition, baseline, referenceState);
-    if (!kind || !alertEligible) return { disposition, metrics, baseline, candidate, alertEligible, trainingEligible, analysis };
+    const analysis = this.observationAnalysis(observation, candidateDetail, disposition, baseline, referenceState, anomalyBinRanges, referenceRevision);
+    if (!candidateDetail || !alertEligible) return { disposition, metrics, baseline, candidate, alertEligible, trainingEligible, analysis, gauge, reference };
 
+    const detail = alertDetail!;
     const evidenceStrength = baseline.lifecycle === "protected" && observation.healthComplete ? "Medium" as const : "Low" as const;
+    const analyzedRangeHz = analyzedFrequencyRange(observation);
+    const binWidthHz = binCount ? (analyzedRangeHz[1] - analyzedRangeHz[0]) / binCount : 0;
+    const disturbedRangesHz = binRangesToHz(anomalyBinRanges, analyzedRangeHz, binCount);
+    const peakBin = segments.peakBin;
+    const usualAtPeak = referenceState.medians[peakBin] ?? 0;
+    const levelAtPeak = observation.bins[peakBin] ?? 0;
+    const trigger: AlertTrigger = {
+      schemaVersion: 1,
+      classifierVersion: ALERT_CLASSIFIER_VERSION,
+      detailKind: detail,
+      firedAt: observation.observedAt,
+      observationId: observation.id,
+      policy: { choice: policy.choice, source: policy.source, values: { ...values }, hash: policy.hash },
+      reference: {
+        lifecycle: baseline.lifecycle,
+        kind: referenceKind(baseline.lifecycle),
+        fingerprintId,
+        generationId: baseline.learningGenerationId,
+        revision: referenceRevision,
+      },
+      measured: {
+        peakZ: round2(segments.peakZ),
+        medianZ: round2(floorMedianZ),
+        occupancyRatio: Math.round(segments.occupancy * 10_000) / 10_000,
+        widestSegmentRatio: Math.round(segments.widestSegmentRatio * 10_000) / 10_000,
+        widestSegmentMedianZ: round2(segments.widestSegmentMedianZ),
+        ...(binCount && !observation.overload ? { peakFrequencyHz: Math.round(analyzedRangeHz[0] + (peakBin + 0.5) * binWidthHz) } : {}),
+        peakLevel: levelAtPeak,
+        usualLevelAtPeak: usualAtPeak,
+        levelAboveUsual: levelAtPeak - usualAtPeak,
+        ...(burstPeakZ !== undefined ? { burstPeakZ: round2(burstPeakZ) } : {}),
+      },
+      rules: ruleComparisons,
+      persistence: {
+        votes: tracker?.votes ?? 1,
+        window: values.alertWindow,
+        required: observation.overload ? 1 : values.alertVisits,
+        exposureMs: tracker?.exposureMs ?? observation.exposureMs,
+        requiredExposureMs: values.minExposureMs,
+      },
+      disturbedRangesHz,
+      analyzedRangeHz,
+      binWidthHz: Math.round(binWidthHz),
+    };
+    const levels = observation.bins;
+    const usual = Uint8Array.from(referenceState.medians);
+    const mads = Uint8Array.from(referenceState.mads);
+    const scaleFloor = this.thresholds.scaleFloorBins;
+    const triggerSnapshot = (eventId: string): AlertTriggerSnapshot => buildTriggerSnapshot({
+      eventId,
+      observation,
+      detail,
+      policyHash: policy.hash,
+      analyzedRangeHz,
+      levels,
+      usual,
+      mads,
+      scaleFloor,
+      alertSigma: values.segmentSigma,
+      anomalyBinRanges,
+    });
     return {
       disposition,
       metrics,
@@ -617,10 +910,14 @@ export class DetectionEngine {
       alertEligible,
       trainingEligible,
       analysis,
+      gauge,
+      reference,
+      triggerSnapshot,
       event: {
         dataDomain: observation.dataDomain,
-        kind: eventKind(kind, band),
-        status: kind === "baseline-drift" || kind === "overload" ? "suspicious" : "interference-likely",
+        kind: publicDetectionKind(detail, band.service),
+        detailKind: detail,
+        status: detail === "noise-floor" || detail === "overload" || detail === "burst" ? "suspicious" : "interference-likely",
         severity: evidenceStrength === "Medium" ? "medium" : "low",
         evidenceStrength,
         evidenceBasis: baseline.lifecycle === "protected"
@@ -636,8 +933,19 @@ export class DetectionEngine {
         scanWindowId: observation.visitId,
         bandLabel: band.label,
         affectedBandIds: observation.affectedBandIds,
-        affectedRangeHz: analyzedFrequencyRange(observation),
-        observed: this.describe(kind, band.service === "gnss"),
+        affectedRangeHz: analyzedRangeHz,
+        disturbedRangesHz,
+        trigger,
+        observed: describeObservation({
+          detail,
+          gnss: band.service === "gnss",
+          lifecycle: baseline.lifecycle,
+          disturbedRangesHz,
+          occupancyRatio: segments.occupancy,
+          votes: trigger.persistence.votes,
+          window: values.alertWindow,
+          floorSeconds: (tracker?.floorExposureMs ?? 0) / 1_000,
+        }),
         recommendedAction: band.service === "gnss"
           ? "Check position and time on an independent receiver. Keep recording."
           : "Use the approved backup channel if available. Keep recording.",
@@ -646,6 +954,80 @@ export class DetectionEngine {
         metrics,
       },
     };
+  }
+
+  /** Per-frame z vectors against the same reference, for the single-frame burst rule. */
+  private frameZVectors(frames: Uint8Array[] | undefined, reference: Pick<BaselineState, "medians" | "mads">, binCount: number): Float32Array[] {
+    if (!frames?.length) return [];
+    const usable = frames.filter((frame) => frame.length === binCount).slice(0, 5);
+    if (!usable.length) return [];
+    if (this.frameZScratch.length < usable.length * binCount) this.frameZScratch = new Float32Array(usable.length * binCount);
+    return usable.map((frame, frameIndex) => {
+      const z = this.frameZScratch.subarray(frameIndex * binCount, (frameIndex + 1) * binCount);
+      for (let index = 0; index < binCount; index += 1) {
+        const scale = Math.max(1.4826 * reference.mads[index], this.thresholds.scaleFloorBins);
+        z[index] = Math.max(0, (frame[index] - reference.medians[index]) / scale);
+      }
+      return z;
+    });
+  }
+
+  private updateShadowPreview(
+    state: BaselineState,
+    observedAtMs: number,
+    exposureMs: number,
+    binCount: number,
+    floorMedianZ: number,
+    referenceLifecycle: BaselineDescriptor["lifecycle"],
+    frameZ: Float32Array[],
+    voteGapMs: number,
+    activeOnset: boolean,
+  ): void {
+    state.shadow ??= {
+      firstAtMs: observedAtMs,
+      trackers: Object.fromEntries(this.presetPolicies.map((preset) => [preset.id, createAlertTrackerState(preset.hash)])) as Record<AlertPresetId, AlertTrackerState>,
+      onsets: Object.fromEntries(ALERT_PRESET_IDS.map((id) => [id, [] as number[]])) as Record<AlertPresetId, number[]>,
+      activeOnsets: [],
+    };
+    const shadow = state.shadow;
+    const prune = (values: number[]) => {
+      const since = observedAtMs - PREVIEW_WINDOW_MS;
+      while (values.length && (values[0] < since || values.length > MAX_PREVIEW_ONSETS)) values.shift();
+    };
+    if (activeOnset) {
+      shadow.activeOnsets.push(observedAtMs);
+      prune(shadow.activeOnsets);
+    }
+    for (const preset of this.presetPolicies) {
+      const values = preset.values;
+      const floorAllowed = referenceLifecycle !== "learning"
+        && referenceLifecycle !== "stale"
+        && (!values.noiseFloorRequiresProtected || referenceLifecycle === "protected");
+      const presetSegments = segmentFeatures(this.zScratch, binCount, values.segmentSigma, values.segmentGapRatio, floorMedianZ);
+      const presetClass = classifyAlert(presetSegments, values, { floorMedianZ, floorAllowed });
+      let emission: EmissionKind | undefined = presetClass.emission;
+      if (!emission && values.burstSigma > 0) {
+        for (const z of frameZ) {
+          if (burstFromFrame(segmentFeatures(z, binCount, values.burstSigma, values.segmentGapRatio, 0), values)) {
+            emission = "burst";
+            break;
+          }
+        }
+      }
+      const result = updateAlertTracker(shadow.trackers[preset.id], {
+        atMs: observedAtMs,
+        emission,
+        floor: presetClass.floor,
+        exposureMs,
+        values,
+        voteGapMs,
+        policyHash: preset.hash,
+      });
+      if (result.onset) {
+        shadow.onsets[preset.id].push(observedAtMs);
+        prune(shadow.onsets[preset.id]);
+      }
+    }
   }
 
   private createState(
@@ -677,6 +1059,7 @@ export class DetectionEngine {
       votes: [],
       driftExposureMs: 0,
       lastObservedAtMs: now,
+      alert: createAlertTrackerState(""),
     };
   }
 
@@ -712,7 +1095,8 @@ export class DetectionEngine {
     }
   }
 
-  private features(observation: TargetObservation, state: BaselineState): { medianZ: number; peakZ: number; occupied6: number; occupied8: number; maxWidthRatio: number; mean: number; peak: number; baselineMean: number } {
+  private features(observation: TargetObservation, state: Pick<BaselineState, "medians" | "mads">, writeZ = false): { medianZ: number; peakZ: number; occupied6: number; occupied8: number; maxWidthRatio: number; mean: number; peak: number; baselineMean: number } {
+    if (writeZ && this.zScratch.length < observation.bins.length) this.zScratch = new Float32Array(observation.bins.length);
     this.zHistogram.fill(0);
     let peakZ = 0;
     let occupied6 = 0;
@@ -727,6 +1111,7 @@ export class DetectionEngine {
       const baseline = state.medians[index];
       const scale = Math.max(1.4826 * state.mads[index], this.thresholds.scaleFloorBins);
       const z = Math.max(0, (value - baseline) / scale);
+      if (writeZ) this.zScratch[index] = z;
       this.zHistogram[Math.min(this.zHistogram.length - 1, Math.round(z * 10))] += 1;
       peakZ = Math.max(peakZ, z);
       if (z >= this.thresholds.widebandObservationSigma) {
@@ -770,34 +1155,15 @@ export class DetectionEngine {
 
   private observationAnalysis(
     observation: TargetObservation,
-    kind: DetectionKind | undefined,
+    detail: AlertDetailKind | undefined,
     disposition: ObservationDisposition,
     baseline: BaselineDescriptor,
     referenceState: Pick<BaselineState, "medians" | "mads"> | undefined,
+    anomalyBinRanges: DetectorAnomalyBinRange[] = [],
+    referenceRevision?: string,
   ): DetectorObservationAnalysis {
-    const anomalyBinRanges: DetectorAnomalyBinRange[] = [];
-    if (kind && kind !== "overload" && referenceState) {
-      const threshold = kind === "narrowband-spike"
-        ? this.thresholds.narrowbandPeakSigma
-        : kind === "baseline-drift"
-          ? this.thresholds.driftSigma
-          : this.thresholds.widebandObservationSigma;
-      let startBin: number | undefined;
-      for (let index = 0; index <= observation.bins.length; index += 1) {
-        const baselineValue = referenceState.medians[index] ?? 0;
-        const mad = referenceState.mads[index] ?? 0;
-        const z = index < observation.bins.length
-          ? Math.max(0, (observation.bins[index] - baselineValue) / Math.max(1.4826 * mad, this.thresholds.scaleFloorBins))
-          : -Infinity;
-        if (z >= threshold) {
-          startBin ??= index;
-        } else if (startBin !== undefined) {
-          anomalyBinRanges.push({ startBin, endBin: index });
-          startBin = undefined;
-        }
-      }
-    }
-    const anomalyKind = kind && kind !== "overload" && kind !== "gnss-energy-anomaly" ? kind : undefined;
+    const anomalyKind = analysisKindFor(detail);
+    const ranges = detail && detail !== "overload" && referenceState ? anomalyBinRanges : [];
     return {
       observationId: observation.id,
       ruleSetId: this.thresholds.ruleSetId,
@@ -805,9 +1171,11 @@ export class DetectionEngine {
       analyzedRangeHz: analyzedFrequencyRange(observation),
       inputBinCount: observation.bins.length,
       baselineAvailable: baseline.lifecycle !== "learning" && baseline.lifecycle !== "stale" && Boolean(referenceState),
-      overload: kind === "overload" || observation.overload,
+      overload: detail === "overload" || observation.overload,
       ...(anomalyKind ? { anomalyKind } : {}),
-      anomalyBinRanges,
+      ...(anomalyKind && detail ? { anomalyDetailKind: detail } : {}),
+      ...(referenceRevision ? { referenceRevision } : {}),
+      anomalyBinRanges: ranges,
     };
   }
 
@@ -883,12 +1251,122 @@ export class DetectionEngine {
       reason: state.lifecycle === "learning" ? "Collecting at least 30 minutes and sufficient valid visits." : undefined,
     };
   }
+}
 
-  private describe(kind: DetectionKind, gnss: boolean): string {
-    if (kind === "overload") return "Receiver input is overloaded. Readings may be wrong.";
-    if (kind === "narrowband-spike") return "Moving or stationary narrowband energy stayed above its usual level.";
-    if (kind === "baseline-drift") return "The relative signal level drifted above the approved baseline.";
-    if (gnss) return "Relative RF energy stayed above normal across this navigation frequency. RF data can show interference, not intent.";
-    return "Relative RF energy rose across much of this monitored section.";
+function round2(value: number): number {
+  return Math.round(value * 100) / 100;
+}
+
+function formatMHz(hz: number): string {
+  return (hz / 1e6).toFixed(3);
+}
+
+function rangeText(ranges: Array<[number, number]>): string {
+  if (!ranges.length) return "";
+  const first = ranges[0];
+  const last = ranges.at(-1)!;
+  if (ranges.length === 1) return `${formatMHz(first[0])}-${formatMHz(first[1])} MHz`;
+  return `${ranges.length} parts between ${formatMHz(first[0])} and ${formatMHz(last[1])} MHz`;
+}
+
+function widthText(ranges: Array<[number, number]>): string {
+  const width = ranges.reduce((total, [start, end]) => total + (end - start), 0) / 1e6;
+  return width >= 1 ? `${width.toFixed(1)} MHz` : `${Math.max(1, Math.round(width * 1_000))} kHz`;
+}
+
+/** Plain operator copy naming where the disturbance was. Never claims intent or calibration. */
+export function describeObservation(input: {
+  detail: AlertDetailKind;
+  gnss: boolean;
+  lifecycle: BaselineDescriptor["lifecycle"];
+  disturbedRangesHz: Array<[number, number]>;
+  occupancyRatio: number;
+  votes: number;
+  window: number;
+  floorSeconds: number;
+}): string {
+  const where = rangeText(input.disturbedRangesHz);
+  const repeated = `in ${input.votes} of the last ${input.window} checks`;
+  let sentence: string;
+  switch (input.detail) {
+    case "overload":
+      return "Receiver input is overloaded. Readings may be wrong.";
+    case "wideband":
+      sentence = `Raised RF energy across ${Math.round(input.occupancyRatio * 100)}% of the checked window ${repeated}.`;
+      break;
+    case "partial-band":
+      sentence = `Raised RF energy over ${widthText(input.disturbedRangesHz)}${where ? ` (${where})` : ""} ${repeated}.`;
+      break;
+    case "narrowband":
+      sentence = `Raised narrowband energy${where ? ` at ${where}` : ""} stayed above its usual level ${repeated}.`;
+      break;
+    case "burst":
+      sentence = `Short bursts of RF energy${where ? ` over ${where}` : ""} were seen in single frames ${repeated}.`;
+      break;
+    case "noise-floor":
+      sentence = `The whole window sat above the ${input.lifecycle === "protected" ? "approved baseline" : "local reference"} for ${Math.round(input.floorSeconds)} s of observation.`;
+      break;
   }
+  return input.gnss ? `${sentence} RF data can show interference, not intent.` : sentence;
+}
+
+function hex(values: Uint8Array): string {
+  return Buffer.from(values.buffer, values.byteOffset, values.byteLength).toString("hex");
+}
+
+function reduceMax(values: Uint8Array, outputCount: number): Uint8Array {
+  if (values.length <= outputCount) return Uint8Array.from(values);
+  const output = new Uint8Array(outputCount);
+  for (let index = 0; index < outputCount; index += 1) {
+    const start = Math.floor((index * values.length) / outputCount);
+    const end = Math.max(start + 1, Math.floor(((index + 1) * values.length) / outputCount));
+    let maximum = 0;
+    for (let source = start; source < end; source += 1) maximum = Math.max(maximum, values[source]);
+    output[index] = maximum;
+  }
+  return output;
+}
+
+function buildTriggerSnapshot(input: {
+  eventId: string;
+  observation: TargetObservation;
+  detail: AlertDetailKind;
+  policyHash: string;
+  analyzedRangeHz: [number, number];
+  levels: Uint8Array;
+  usual: Uint8Array;
+  mads: Uint8Array;
+  scaleFloor: number;
+  alertSigma: number;
+  anomalyBinRanges: DetectorAnomalyBinRange[];
+}): AlertTriggerSnapshot {
+  const sourceBinCount = input.levels.length;
+  const alertLevel = new Uint8Array(sourceBinCount);
+  for (let index = 0; index < sourceBinCount; index += 1) {
+    const scale = Math.max(1.4826 * (input.mads[index] ?? 0), input.scaleFloor);
+    alertLevel[index] = Math.min(255, Math.round((input.usual[index] ?? 0) + input.alertSigma * scale));
+  }
+  const binCount = Math.min(sourceBinCount, MAX_TRIGGER_SNAPSHOT_BINS);
+  const scale = sourceBinCount ? binCount / sourceBinCount : 1;
+  return {
+    schemaVersion: 1,
+    eventId: input.eventId,
+    dataDomain: input.observation.dataDomain,
+    targetId: input.observation.targetId,
+    observationId: input.observation.id,
+    observedAt: input.observation.observedAt,
+    detailKind: input.detail,
+    policyHash: input.policyHash,
+    analyzedRangeHz: input.analyzedRangeHz,
+    sourceBinCount,
+    binCount,
+    reduction: binCount === sourceBinCount ? "native" : "peak-preserving",
+    levelsHex: hex(reduceMax(input.levels, binCount)),
+    usualHex: hex(reduceMax(input.usual, binCount)),
+    alertLevelHex: hex(reduceMax(alertLevel, binCount)),
+    anomalyBinRanges: input.anomalyBinRanges.map((range) => ({
+      startBin: Math.floor(range.startBin * scale),
+      endBin: Math.max(Math.floor(range.startBin * scale) + 1, Math.ceil(range.endBin * scale)),
+    })),
+  };
 }

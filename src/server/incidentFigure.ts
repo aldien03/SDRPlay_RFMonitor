@@ -26,6 +26,8 @@ export interface FigureFrame {
   endHz: number;
   analysisStartBin: number;
   analysisEndBin: number;
+  /** Detector anomaly ranges for this frame, in this frame's bin indexes (half-open). */
+  anomalyBinRanges?: ReadonlyArray<{ startBin: number; endBin: number }>;
 }
 
 export interface IncidentFigureInput {
@@ -48,6 +50,10 @@ export interface IncidentFigureInput {
   frameTimestampsMs: readonly number[];
   /** When this picture was drawn. Shown on the figure, so a saved copy always states its age. */
   generatedAtMs: number;
+  /** Operator verdict for the headline; defaults to "Suspected RF interference". */
+  verdict?: string;
+  /** The incident's alert level in normal variations, so analysis counts what the alert counted. */
+  alertSigma?: number;
 }
 
 export interface IncidentFigureSummary {
@@ -75,10 +81,36 @@ export interface IncidentFigureSummary {
   findings: string[];
 }
 
+/** Data behind the report's spectrum and waterfall charts (same reduction as the figure). */
+export interface IncidentFigureData {
+  analysisStartHz: number;
+  analysisEndHz: number;
+  widthPx: number;
+  rows: number;
+  windowStartMs: number;
+  windowEndMs: number;
+  incidentStartMs: number;
+  incidentEndMs: number;
+  /** Waterfall pixels without caption, newest row first, contrast-stretched. */
+  waterfallPngBase64: string;
+  /** Relative levels mapped to the waterfall's darkest and brightest colours. */
+  waterfallLevelRange: [number, number];
+  before: Array<number | null>;
+  during: Array<number | null>;
+  strongest: Array<number | null>;
+  usual?: number[];
+  usualHigh?: number[];
+  alertLevel?: number[];
+  framesBefore: number;
+  framesDuring: number;
+  framesAfter: number;
+}
+
 export interface IncidentFigureResult {
   svg: string;
   /** Waterfall alone, with the time stamp burned into its pixels. */
   waterfallPng: Uint8Array;
+  data: IncidentFigureData;
   /** Analysis charts: each as a standalone SVG, and all together on one sheet. */
   analysis: AnalysisChartSet;
   summary: IncidentFigureSummary;
@@ -234,12 +266,25 @@ export function composeCaptionedPng(
   const textScale = 2;
   const advance = (GLYPH_WIDTH + 1) * textScale;
   const lineHeight = (GLYPH_HEIGHT + 3) * textScale;
-  const captionHeight = lines.length * lineHeight + 2 * textScale;
   const totalWidth = Math.max(imageWidth, 1);
-  const out = new Uint32Array(totalWidth * (captionHeight + imageHeight)).fill(backgroundColor);
   const maxChars = Math.max(1, Math.floor((totalWidth - 2 * advance) / advance));
-  lines.forEach((line, lineIndex) => {
-    const text = captionText(line).slice(0, maxChars);
+  // Wrap instead of cutting: the time stamp at the end of a long label must survive.
+  const wrapped: string[] = [];
+  for (const line of lines) {
+    let current = "";
+    for (const word of captionText(line).split(" ")) {
+      const candidate = current ? `${current} ${word}` : word;
+      if (candidate.length <= maxChars) current = candidate;
+      else {
+        if (current) wrapped.push(current);
+        current = word.slice(0, maxChars);
+      }
+    }
+    if (current) wrapped.push(current);
+  }
+  const captionHeight = wrapped.length * lineHeight + 2 * textScale;
+  const out = new Uint32Array(totalWidth * (captionHeight + imageHeight)).fill(backgroundColor);
+  wrapped.forEach((text, lineIndex) => {
     for (let index = 0; index < text.length; index += 1) {
       const glyph = GLYPHS[text[index]];
       if (!glyph) continue;
@@ -288,6 +333,7 @@ export class IncidentFigureBuilder {
   private config?: RfConfigurationKey;
   private widthPx = 0;
   private rowPeak = new Uint8Array(0);
+  private rowAnomaly = new Uint8Array(0);
   private rowFilled = new Uint8Array(0);
   private rowSum = new Float64Array(0);
   private rowCount = new Uint32Array(0);
@@ -330,6 +376,7 @@ export class IncidentFigureBuilder {
       this.config = key;
       this.widthPx = Math.max(1, Math.min(MAX_WIDTH_PX, analysisBins));
       this.rowPeak = new Uint8Array(this.rows * this.widthPx);
+      this.rowAnomaly = new Uint8Array(this.rows * this.widthPx);
       this.rowFilled = new Uint8Array(this.rows);
       this.rowSum = new Float64Array(this.rows);
       this.rowCount = new Uint32Array(this.rows);
@@ -362,6 +409,7 @@ export class IncidentFigureBuilder {
         incidentStartMs: this.input.incidentStartMs,
         incidentEndMs: this.input.incidentEndMs,
         baseline: this.baselinePixels,
+        alertSigma: this.input.alertSigma,
       });
     } else if (JSON.stringify(key) !== JSON.stringify(this.config)) {
       // A different RF setup cannot share axes with the rest of the figure.
@@ -399,6 +447,16 @@ export class IncidentFigureBuilder {
         this.beforeHistogram[pixel * 256 + peak] += 1;
       }
     }
+    // Detector-flagged bins of this frame, mapped onto the figure's pixel columns.
+    const analysisSpan = frame.analysisEndBin - frame.analysisStartBin;
+    for (const range of frame.anomalyBinRanges ?? []) {
+      const start = Math.max(frame.analysisStartBin, range.startBin) - frame.analysisStartBin;
+      const end = Math.min(frame.analysisEndBin, range.endBin) - frame.analysisStartBin;
+      if (end <= start) continue;
+      const firstPixel = Math.max(0, Math.floor((start / analysisSpan) * this.widthPx));
+      const lastPixel = Math.min(this.widthPx, Math.ceil((end / analysisSpan) * this.widthPx));
+      for (let pixel = firstPixel; pixel < lastPixel; pixel += 1) this.rowAnomaly[base + pixel] = 1;
+    }
     this.rowSum[row] += frameSum / this.widthPx;
     this.rowCount[row] += 1;
     this.collector?.addFrame(levels, frame.timestampMs, phase, row);
@@ -412,12 +470,38 @@ export class IncidentFigureBuilder {
     const rows = this.rows;
     const gapPixel = packPixel(43, 47, 54);
 
-    // Waterfall pixels: one pixel per column and row, gaps in neutral grey.
+    // Contrast: map the recorded range (2nd to 98th percentile) onto the full
+    // colour ramp, so a quiet band is not drawn as one uniform dark blue.
+    const levelHistogram = new Uint32Array(256);
+    let levelCount = 0;
+    for (let row = 0; row < rows; row += 1) {
+      if (!this.rowFilled[row]) continue;
+      for (let pixel = 0; pixel < widthPx; pixel += 1) {
+        levelHistogram[this.rowPeak[row * widthPx + pixel]] += 1;
+        levelCount += 1;
+      }
+    }
+    const percentile = (fraction: number) => {
+      let seen = 0;
+      for (let level = 0; level < 256; level += 1) {
+        seen += levelHistogram[level];
+        if (seen >= fraction * levelCount) return level;
+      }
+      return 255;
+    };
+    const stretchLow = levelCount ? percentile(0.02) : 0;
+    const stretchHigh = levelCount ? Math.min(255, Math.max(stretchLow + 16, percentile(0.98))) : 255;
+    const stretch = (level: number) => Math.max(0, Math.min(255, Math.round(((level - stretchLow) / Math.max(1, stretchHigh - stretchLow)) * 255)));
+    // Waterfall pixels: one pixel per column and row, gaps in neutral grey, detector-flagged bins tinted red.
     const pixels = new Uint32Array(widthPx * rows).fill(gapPixel);
     if (config) {
       for (let row = 0; row < rows; row += 1) {
         if (!this.rowFilled[row]) continue;
-        for (let pixel = 0; pixel < widthPx; pixel += 1) pixels[row * widthPx + pixel] = palette.plain[this.rowPeak[row * widthPx + pixel]];
+        for (let pixel = 0; pixel < widthPx; pixel += 1) {
+          const index = row * widthPx + pixel;
+          const level = stretch(this.rowPeak[index]);
+          pixels[index] = this.rowAnomaly[index] ? palette.anomaly[level] : palette.plain[level];
+        }
       }
     }
     const rawPng = encodePng(widthPx, rows, new Uint8Array(pixels.buffer, pixels.byteOffset, pixels.byteLength));
@@ -488,7 +572,7 @@ export class IncidentFigureBuilder {
     push(`<rect width="${totalWidth}" height="${totalHeight}" fill="#ffffff"/>`);
 
     // Header
-    push(`<text x="${left}" y="34" font-size="22" font-weight="700" fill="#142536">Suspected RF interference: ${xml(plain(input.label))}</text>`);
+    push(`<text x="${left}" y="34" font-size="22" font-weight="700" fill="#142536">${xml(plain(input.verdict ?? "Suspected RF interference"))}: ${xml(plain(input.label))}</text>`);
     const facts: Array<[string, string]> = [
       ["Frequency", `${(input.rangeHz[0] / 1e6).toFixed(3)} to ${(input.rangeHz[1] / 1e6).toFixed(3)} MHz`],
       ["Started (UTC)", utc(input.incidentStartMs, true)],
@@ -604,8 +688,8 @@ export class IncidentFigureBuilder {
       return `<stop offset="${index / 8}" stop-color="rgb(${bytes[0]},${bytes[1]},${bytes[2]})"/>`;
     }).join("")}</linearGradient></defs>`);
     push(`<rect x="${left}" y="${keyTop}" width="220" height="12" fill="url(#${gradientId})" stroke="#cbd2d9"/>`);
-    push(`<text x="${left}" y="${keyTop + 26}" font-size="10" fill="#142536">Quiet</text>`);
-    push(`<text x="${left + 220}" y="${keyTop + 26}" font-size="10" text-anchor="end" fill="#142536">Strong (relative, uncalibrated)</text>`);
+    push(`<text x="${left}" y="${keyTop + 26}" font-size="10" fill="#142536">Quiet (level ${stretchLow})</text>`);
+    push(`<text x="${left + 220}" y="${keyTop + 26}" font-size="10" text-anchor="end" fill="#142536">Strong (level ${stretchHigh}, relative)</text>`);
     push(`<rect x="${left + 280}" y="${keyTop}" width="14" height="12" fill="rgb(43,47,54)"/>`);
     push(`<text x="${left + 300}" y="${keyTop + 10}" font-size="10" fill="#142536">No frames in this row (the receiver was tuned elsewhere or recording had a gap)</text>`);
 
@@ -653,10 +737,33 @@ export class IncidentFigureBuilder {
         incidentStartMs: input.incidentStartMs,
         incidentEndMs: input.incidentEndMs,
       }).finish(analysisStartHz, analysisEndHz),
-      { label: input.label, incidentId: input.incidentId, generatedAtMs: input.generatedAtMs },
+      { label: input.label, incidentId: input.incidentId, generatedAtMs: input.generatedAtMs, alertSigma: input.alertSigma },
     );
     summary.analysis = analysis.stats;
     summary.findings = analysis.findings;
-    return { svg: out.join("\n"), waterfallPng, analysis, summary };
+    const alertLevel = this.baselinePixels && input.alertSigma
+      ? Array.from(this.baselinePixels.median, (value, pixel) => Math.min(255, value + input.alertSigma! * this.baselinePixels!.scale[pixel]))
+      : undefined;
+    const data: IncidentFigureData = {
+      analysisStartHz,
+      analysisEndHz,
+      widthPx,
+      rows,
+      windowStartMs: input.windowStartMs,
+      windowEndMs: input.windowEndMs,
+      incidentStartMs: input.incidentStartMs,
+      incidentEndMs: input.incidentEndMs,
+      waterfallPngBase64: Buffer.from(rawPng).toString("base64"),
+      waterfallLevelRange: [stretchLow, stretchHigh],
+      before: beforeMedian.map((value) => value ?? null),
+      during: duringMedian.map((value) => value ?? null),
+      strongest: this.duringFrames ? Array.from(this.duringPeak) : new Array(widthPx).fill(null),
+      ...(baselineMedian ? { usual: baselineMedian, usualHigh: baselineHigh } : {}),
+      ...(alertLevel ? { alertLevel } : {}),
+      framesBefore: this.beforeFrames,
+      framesDuring: this.duringFrames,
+      framesAfter: this.afterFrames,
+    };
+    return { svg: out.join("\n"), waterfallPng, analysis, summary, data };
   }
 }

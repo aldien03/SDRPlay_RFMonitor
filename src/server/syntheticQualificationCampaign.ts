@@ -16,7 +16,13 @@ import {
   RELEASE_SOURCE_ROOTS,
   digestReleaseFiles,
 } from "../../scripts/release-digest-policy.mjs";
-import { DEFAULT_THRESHOLDS, detectionRuleFingerprint, type DetectionThresholds } from "../shared/detection";
+import { alertPolicyHash, DEFAULT_THRESHOLDS, detectionRuleFingerprint, type DetectionThresholds } from "../shared/detection";
+import { ALERT_CLASSIFIER_VERSION, deriveAlertingFromDetection } from "../shared/alertPolicy";
+
+/** The alert policy an isolated campaign exercises: the one implied by its learning rules. */
+function qualificationAlertPolicyHash(thresholds: DetectionThresholds | undefined): string {
+  return alertPolicyHash(deriveAlertingFromDetection(thresholds ?? DEFAULT_THRESHOLDS, DEFAULT_THRESHOLDS).default.values);
+}
 import {
   DETECTOR_QUALIFICATION_PLAN_VERSION,
   detectorQualificationPlan,
@@ -141,6 +147,9 @@ export interface V4CampaignManifest {
     families: SyntheticEventKind[];
     detectorRuleSetId: string;
     detectorRuleHash: string;
+    /** Alert sensitivity the detector was qualified with (added with alert sensitivity). */
+    alertClassifierVersion?: string;
+    alertPolicyHash?: string;
   };
   protocol: {
     deterministicRunsPerTargetFamily: 1;
@@ -630,6 +639,8 @@ function createManifest(input: {
       families: [...FAMILIES],
       detectorRuleSetId: (input.options.thresholds ?? DEFAULT_THRESHOLDS).ruleSetId,
       detectorRuleHash: detectionRuleFingerprint(input.options.thresholds ?? DEFAULT_THRESHOLDS),
+      alertClassifierVersion: ALERT_CLASSIFIER_VERSION,
+      alertPolicyHash: qualificationAlertPolicyHash(input.options.thresholds),
     },
     protocol: {
       deterministicRunsPerTargetFamily: 1,
@@ -899,7 +910,9 @@ export async function executeV4DetectorCampaign(options: V4CampaignExecutionOpti
     if (manifest.schemaVersion !== 1 || manifest.campaignId !== campaignId || manifest.commitments.sha256 !== sha256(commitmentsBuffer)
         || manifest.commitments.lines !== commitments.length || manifest.release.sourceDigest !== options.candidate.sourceDigest
         || manifest.release.packageDigest !== options.candidate.packageDigest || manifest.frozen.catalogHash !== sha256Canonical(options.catalog)
-        || manifest.frozen.detectorRuleHash !== detectionRuleFingerprint(options.thresholds ?? DEFAULT_THRESHOLDS)) {
+        || manifest.frozen.detectorRuleHash !== detectionRuleFingerprint(options.thresholds ?? DEFAULT_THRESHOLDS)
+        || manifest.frozen.alertClassifierVersion !== ALERT_CLASSIFIER_VERSION
+        || manifest.frozen.alertPolicyHash !== qualificationAlertPolicyHash(options.thresholds)) {
       throw new Error("Existing V4 partial campaign does not match the frozen candidate/configuration");
     }
   } catch (error) {

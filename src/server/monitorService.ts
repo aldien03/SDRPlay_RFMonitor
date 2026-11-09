@@ -1,14 +1,15 @@
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
-import { readFile, unlink } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import type { AppConfig } from "./config";
-import { aggregateVisitFrames, centralAnalysisBinBounds, createBaselineFingerprint, detectionRuleFingerprint, DetectionEngine, projectDetectorAnalysisToFrame, type DetectionBaselineReference, type DetectionResult } from "../shared/detection";
+import { aggregateVisitFrames, centralAnalysisBinBounds, createBaselineFingerprint, detectionRuleFingerprint, DetectionEngine, projectDetectorAnalysisToFrame, withAlertPolicyHash, type DetectionBaselineReference, type DetectionResult, type ResolvedAlertPolicyWithHash } from "../shared/detection";
+import { alertPresetLabel, alertVoteGapMs, detailKindLabel, mergeHzRanges, moreSevereDetailKind, resolveAlertPolicy } from "../shared/alertPolicy";
 import { compileScanTargets, createScanJobs, describeMonitorTarget, estimateRevisitMs, monitorTargetId, type CompiledScanTarget } from "../shared/bands";
 import { captureTargetTierForProfile, createServiceSummaries, incidentFigurePolicy, validFocusFrequencies } from "../shared/settings";
 import { getMonitoringReadiness } from "../shared/monitoring";
 import { createMonitorFeeds, createMonitorGroups } from "../shared/monitorGroups";
-import { assertRfOnlyDetectionClaim, normalizeReceiverSerial } from "../shared/productContract";
+import { assertRfOnlyDetectionClaim, normalizeReceiverSerial, rfVerdictFor } from "../shared/productContract";
 import {
   resolveOperatorSummary,
   type OperatorMonitoringState,
@@ -16,6 +17,9 @@ import {
   type OperatorSummaryV1,
 } from "../shared/operatorSummary";
 import type {
+  AlertPreview,
+  AlertPreviewTarget,
+  AlertTrigger,
   BandPreset,
   BaselineApprovalEligibility,
   BaselineDescriptor,
@@ -30,6 +34,7 @@ import type {
   EvidenceSession,
   RecordingDeletionResult,
   FocusSession,
+  IncidentPeak,
   MonitorFeed,
   MonitorSnapshot,
   MonitorTarget,
@@ -51,7 +56,8 @@ import type {
   SweepCycle,
   SweepSegment,
 } from "../shared/types";
-import { EvidenceStore, WRITER_ORDINARY_MAX_BYTES, WRITER_ORDINARY_MAX_ITEMS, type EvidenceInterruptionContext, type IncidentFigureReason } from "./evidenceStore";
+import { EvidenceStore, WRITER_ORDINARY_MAX_BYTES, WRITER_ORDINARY_MAX_ITEMS, type EvidenceInterruptionContext, type IncidentFigureReason, type IncidentReportContext } from "./evidenceStore";
+import type { IncidentReportModel } from "./report/reportModel";
 import { IncidentFigureScheduler } from "./incidentFigureScheduler";
 import {
   type ScreenshotAdmissionLease,
@@ -315,6 +321,13 @@ export class MonitorService extends EventEmitter {
   private readonly metricsByTarget = new Map<string, SignalMetricSample>();
   private readonly targetStates = new Map<string, ChannelMonitorState>();
   private readonly activeEventsByTarget = new Map<string, DetectionEvent>();
+  /** Resolved alert policy per capture target, rebuilt whenever settings change. */
+  private readonly alertPolicyByTarget = new Map<string, ResolvedAlertPolicyWithHash>();
+  /** Effective revisit objective per capture target, from the active schedule. */
+  private readonly revisitObjectiveByTarget = new Map<string, number>();
+  /** Latest usual-level reference per target, copied only when its revision changes. */
+  private readonly referenceByTarget = new Map<string, { revision: string; medians: Uint8Array; mads: Uint8Array; scaleFloorBins: number; alertSigma: number; analysisStartBin: number; analysisEndBin: number; frameBinCount: number; analyzedRangeHz: [number, number] }>();
+  private readonly lastPeakPersistAtByEvent = new Map<string, number>();
   private currentFrame?: SpectrumFrame;
   private currentMetrics?: SignalMetricSample;
   private activeEvent?: DetectionEvent;
@@ -649,6 +662,7 @@ export class MonitorService extends EventEmitter {
     this.syntheticExercise = new LiveSyntheticExercise({
       scenarioId,
       thresholds: this.config.detectionThresholds,
+      alertPolicy: this.alertPolicyFor(targetId),
       target,
       affectedBands: this.config.bands.filter((band) => band.captureTargetId === targetId),
       excludedVisitId: currentVisitId,
@@ -1654,11 +1668,7 @@ export class MonitorService extends EventEmitter {
       });
     }
     const event = this.activeEvent;
-    const verdict = event?.kind === "overload"
-      ? "Receiver overloaded"
-      : event?.kind === "narrowband-spike"
-        ? "Narrow RF anomaly"
-        : "Suspected RF interference";
+    const verdict = event ? rfVerdictFor(event) : "Suspected RF interference";
     const recordingState = !this.evidenceHealthy || input.currentSession?.status === "storage-error"
       ? "error" as const
       : input.currentSession?.status === "recording"
@@ -1897,6 +1907,110 @@ export class MonitorService extends EventEmitter {
     }
   }
 
+  /**
+   * Close the current evidence session and continue every open incident (and
+   * any post-clear capture) in a fresh one, so each session's recorded
+   * configuration stays truthful.
+   */
+  private async rotateEvidenceSessionWithContinuation(reason: string): Promise<void> {
+    const continuingById = new Map([...this.activeEventsByTarget.values()].map((event) => [event.id, event]));
+    for (const [targetId, until] of this.postClearUntilByTarget) {
+      if (until <= Date.now()) continue;
+      const tailEvent = this.events.find((event) => event.targetId === targetId && event.clearedAt);
+      if (tailEvent) continuingById.set(tailEvent.id, tailEvent);
+    }
+    const continuingEvents = [...continuingById.values()];
+    await this.checkpointSessionContext(`${reason}-closing`);
+    const nextSession = await this.evidence.rotate(this.sessionMetadata(reason));
+    if (continuingEvents.length) {
+      for (const event of continuingEvents) {
+        event.sessionIds = [...new Set([event.sessionId, ...(event.sessionIds ?? []), nextSession.id])];
+        await this.persistEvent({ ...event }, nextSession.id);
+      }
+      await this.evidence.recordOperationalAction({
+        type: "incident-continuation",
+        incidents: continuingEvents.map((event) => ({ eventId: event.id, sessionIds: event.sessionIds })),
+      });
+    }
+  }
+
+  /**
+   * Apply settings that do not touch the receiver or signal learning (alert
+   * sensitivity, site identity, time zone, retention, report identity) without
+   * retuning, without ending incidents and without changing the RF epoch.
+   */
+  async applyLiveSettings(nextConfig: AppConfig, changedFields: string[]): Promise<MonitorSnapshot> {
+    if (this.reconfiguring) throw new Error("A settings change is already being applied");
+    const rfChanged = JSON.stringify(nextConfig.detectionThresholds) !== JSON.stringify(this.config.detectionThresholds)
+      || JSON.stringify(nextConfig.operationalSettings.monitoring) !== JSON.stringify(this.config.operationalSettings.monitoring)
+      || JSON.stringify(nextConfig.operationalSettings.scan) !== JSON.stringify(this.config.operationalSettings.scan);
+    if (rfChanged) throw new Error("Monitoring, scan or signal-learning changes require a receiver restart");
+    this.reconfiguring = true;
+    const previous = this.config;
+    const appliedAt = new Date().toISOString();
+    try {
+      this.clearSyntheticExercise();
+      await this.waitForStorageMaintenance();
+      const sensitivityChanged = JSON.stringify(previous.operationalSettings.alerting) !== JSON.stringify(nextConfig.operationalSettings.alerting);
+      this.config = nextConfig;
+      this.alertPolicyByTarget.clear();
+      this.storageMaintenance = {
+        ...nextConfig.retentionPolicy,
+        deletedSessions: this.storageMaintenance.deletedSessions,
+        deletedExports: this.storageMaintenance.deletedExports,
+        reclaimedBytes: this.storageMaintenance.reclaimedBytes,
+        pressure: this.storageMaintenance.pressure,
+        lastRunAt: this.storageMaintenance.lastRunAt,
+      };
+      if (previous.retentionPolicy.maintenanceIntervalMs !== nextConfig.retentionPolicy.maintenanceIntervalMs) {
+        if (this.maintenanceTimer) clearInterval(this.maintenanceTimer);
+        this.maintenanceTimer = setInterval(() => void this.runStorageMaintenance(), nextConfig.retentionPolicy.maintenanceIntervalMs);
+        this.maintenanceTimer.unref();
+      }
+      this.lastFigurePruneAt = 0;
+      if (sensitivityChanged) {
+        for (const event of this.activeEventsByTarget.values()) {
+          const policy = this.alertPolicyFor(event.targetId ?? "");
+          this.addTimeline(event, "sensitivity-changed", appliedAt, `Alert sensitivity set to ${alertPresetLabel(policy.choice)}. The incident stays open.`);
+        }
+        // Field false-alert evidence must describe one alert policy.
+        this.resetCommissioningEpoch();
+      }
+      if (this.evidenceHealthy && this.evidence.currentSession) {
+        await this.evidence.recordOperationalAction({
+          type: "settings-applied-live",
+          timestamp: appliedAt,
+          changedFields: changedFields.slice(0, 64),
+          configurationRevision: nextConfig.operationalSettings.revision,
+          configurationHash: nextConfig.configurationHash,
+          activeIncidentIds: [...this.activeEventsByTarget.values()].map((event) => event.id),
+        }).catch((error) => this.markStorageError(error));
+        await this.rotateEvidenceSessionWithContinuation("settings-applied-live");
+        await this.refreshSessionList();
+      }
+    } catch (error) {
+      this.config = previous;
+      this.alertPolicyByTarget.clear();
+      throw error;
+    } finally {
+      this.reconfiguring = false;
+      this.scheduleAllAssignments();
+      this.broadcastSnapshot();
+    }
+    return this.getSnapshot();
+  }
+
+  private resetCommissioningEpoch(): void {
+    this.commissioningEpochId = randomUUID();
+    this.commissioningStartedAtMonotonicMs = performance.now() + MonitorService.COMMISSIONING_WARMUP_MS;
+    this.commissioningStartedAtWallMs = Date.now() + MonitorService.COMMISSIONING_WARMUP_MS;
+    this.commissioningEvidenceFramesDroppedAtStart = this.evidenceFramesDropped;
+    this.commissioningFaults.clear();
+    this.commissioningLastValidCompletionByTarget.clear();
+    this.commissioningValidRevisitsByTarget.clear();
+    this.commissioningOnTimeRevisitsByTarget.clear();
+  }
+
   async reconfigure(nextConfig: AppConfig): Promise<MonitorSnapshot> {
     if (this.reconfiguring) throw new Error("A settings change is already being applied");
     this.clearSyntheticExercise();
@@ -1922,7 +2036,8 @@ export class MonitorService extends EventEmitter {
       for (const event of interruptedEvents) {
         event.lifecycle = "ended-unknown";
         event.endedAt = interruptedAt;
-        event.endReason = "RF configuration changed before ten clean observations";
+        event.endReason = "RF configuration changed before the alert cleared";
+        this.addTimeline(event, "ended", interruptedAt, "Monitoring settings changed; the receiver was retuned before the alert cleared.");
         this.figureScheduler.eventEnded(event);
         if (this.evidenceHealthy) await this.persistEvent({ ...event }).catch((error) => this.markStorageError(error));
       }
@@ -1939,6 +2054,9 @@ export class MonitorService extends EventEmitter {
         await this.evidence.closeActive();
       }
       this.config = nextConfig;
+      this.alertPolicyByTarget.clear();
+      this.revisitObjectiveByTarget.clear();
+      this.referenceByTarget.clear();
       if (JSON.stringify(previous.detectionThresholds) !== JSON.stringify(nextConfig.detectionThresholds)) {
         this.detector = new DetectionEngine(nextConfig.detectionThresholds);
       }
@@ -1971,14 +2089,7 @@ export class MonitorService extends EventEmitter {
       this.timingHistogramsByTarget.clear();
       this.acceptedAttributionInvariantViolations = 0;
       this.measuredPriorityGapMs = undefined;
-      this.commissioningEpochId = randomUUID();
-      this.commissioningStartedAtMonotonicMs = performance.now() + MonitorService.COMMISSIONING_WARMUP_MS;
-      this.commissioningStartedAtWallMs = Date.now() + MonitorService.COMMISSIONING_WARMUP_MS;
-      this.commissioningEvidenceFramesDroppedAtStart = this.evidenceFramesDropped;
-      this.commissioningFaults.clear();
-      this.commissioningLastValidCompletionByTarget.clear();
-      this.commissioningValidRevisitsByTarget.clear();
-      this.commissioningOnTimeRevisitsByTarget.clear();
+      this.resetCommissioningEpoch();
       this.storageMaintenance = {
         ...nextConfig.retentionPolicy,
         deletedSessions: this.storageMaintenance.deletedSessions,
@@ -1996,6 +2107,7 @@ export class MonitorService extends EventEmitter {
       this.lastFigurePruneAt = 0;
     } catch (error) {
       this.config = previous;
+      this.alertPolicyByTarget.clear();
       this.detector = new DetectionEngine(previous.detectionThresholds);
       this.configureAssignments();
       if (!this.evidence.currentSession) await this.evidence.initialize(this.sessionMetadata("settings-rollback")).catch(() => undefined);
@@ -2102,6 +2214,7 @@ export class MonitorService extends EventEmitter {
     const event = this.events.find((candidate) => candidate.id === eventId);
     if (!event) return undefined;
     event.acknowledgedAt = new Date().toISOString();
+    this.addTimeline(event, "acknowledged", event.acknowledgedAt, "Acknowledged by an operator.");
     if (this.activeEvent?.id === eventId) this.activeEvent = event;
     if (!event.syntheticExercise && this.evidenceHealthy) await this.persistEvent({ ...event }).catch((error) => this.markStorageError(error));
     this.broadcastSnapshot();
@@ -2117,6 +2230,7 @@ export class MonitorService extends EventEmitter {
     const projectedNoteBytes = event.notes.reduce((total, item) => total + Buffer.byteLength(item.text), 0) + Buffer.byteLength(note.text);
     if (projectedNoteBytes > MAX_EVENT_NOTE_BYTES) throw new Error("Incident notes have reached the 32 KiB resource bound");
     event.notes = [...event.notes, note];
+    this.addTimeline(event, "note", note.timestamp, note.text.length > 120 ? `${note.text.slice(0, 117)}...` : note.text);
     const currentSessionId = this.evidence.currentSession?.id;
     const destinationSessionId = currentSessionId && (event.sessionIds ?? [event.sessionId]).includes(currentSessionId)
       ? currentSessionId
@@ -2129,8 +2243,13 @@ export class MonitorService extends EventEmitter {
     return event;
   }
 
-  async exportIncident(eventId: string, sessionId?: string, immutableExportId?: string): Promise<string | string[] | undefined> {
+  async exportIncident(eventId: string, sessionId?: string, immutableExportId?: string, requester?: string): Promise<string | string[] | undefined> {
     let event = this.events.find((candidate) => candidate.id === eventId);
+    if (event && (event.lifecycle === "active" || event.lifecycle === "recovering") && !event.syntheticExercise && this.evidenceHealthy) {
+      // The package must carry the latest timeline and peak values, not the
+      // version written when the incident opened.
+      await this.persistEvent({ ...event }).catch((error) => this.markStorageError(error));
+    }
     if (!event) event = await this.evidence.findIncidentEvent(eventId, sessionId);
     if (!event || event.syntheticExercise || !this.evidenceHealthy) return undefined;
     if (event.clearedAt) {
@@ -2140,11 +2259,23 @@ export class MonitorService extends EventEmitter {
       }
     }
     try {
-      return await this.evidence.exportIncident(event, {
+      const exported = await this.evidence.exportIncident(event, {
         immutableExportId,
         minimumFreeBytes: this.config.retentionPolicy.minimumFreeBytes,
         baselineReference: this.baselineReferenceFor(event),
+        report: await this.reportContext(event),
+        requester,
       });
+      if (this.evidenceHealthy && this.evidence.currentSession) {
+        await this.evidence.recordOperationalAction({
+          type: "evidence-export",
+          eventId: event.id,
+          exportId: immutableExportId,
+          requestedFrom: requester,
+          files: (Array.isArray(exported) ? exported : [exported]).map((file) => path.basename(file)),
+        }).catch((error) => this.markStorageError(error));
+      }
+      return exported;
     } finally {
       await this.refreshSessionList().catch(() => undefined);
     }
@@ -2296,7 +2427,7 @@ export class MonitorService extends EventEmitter {
     this.figureQueue = this.figureQueue.then(async () => {
       try {
         if (!incidentFigurePolicy(this.config.retentionPolicy).enabled || this.resourcePressureActive || this.hostMemoryPressureActive) return;
-        await this.evidence.saveIncidentFigureSnapshot({ ...event }, { reason, baselineReference: this.baselineReferenceFor(event) });
+        await this.evidence.saveIncidentFigureSnapshot({ ...event }, { reason, baselineReference: this.baselineReferenceFor(event), report: await this.reportContext(event) });
       } catch (error) {
         const now = Date.now();
         if (now - this.figureFailureLoggedAt > 10 * 60_000) {
@@ -2325,6 +2456,110 @@ export class MonitorService extends EventEmitter {
     return this.evidence.readIncidentFigure(eventId, kind);
   }
 
+  /** Directory for the report logo, next to the operational profile. */
+  private reportLogoDirectory(): string {
+    return path.join(path.dirname(this.config.settingsPaths.operational), "report-logo");
+  }
+
+  /** A stored logo by hash, for the Settings preview before the change is applied. */
+  async readReportLogoBySha(sha256: string): Promise<{ bytes: Uint8Array; mediaType: "image/png" | "image/jpeg" } | undefined> {
+    if (!/^[a-f0-9]{64}$/.test(sha256)) return undefined;
+    for (const [extension, mediaType] of [["png", "image/png"], ["jpg", "image/jpeg"]] as const) {
+      try {
+        return { bytes: new Uint8Array(await readFile(path.join(this.reportLogoDirectory(), `${sha256}.${extension}`))), mediaType };
+      } catch {
+        // Try the other format.
+      }
+    }
+    return undefined;
+  }
+
+  async readReportLogo(): Promise<{ bytes: Uint8Array; mediaType: "image/png" | "image/jpeg" } | undefined> {
+    const logo = this.config.operationalSettings.reportIdentity?.logo;
+    if (!logo) return undefined;
+    try {
+      const bytes = await readFile(path.join(this.reportLogoDirectory(), `${logo.sha256}.${logo.mediaType === "image/png" ? "png" : "jpg"}`));
+      return { bytes: new Uint8Array(bytes), mediaType: logo.mediaType };
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Store an uploaded logo by its SHA-256; the settings reference it by hash. */
+  async storeReportLogo(bytes: Uint8Array, mediaType: "image/png" | "image/jpeg", sha256: string): Promise<void> {
+    const directory = this.reportLogoDirectory();
+    await mkdir(directory, { recursive: true, mode: 0o750 });
+    const target = path.join(directory, `${sha256}.${mediaType === "image/png" ? "png" : "jpg"}`);
+    const temporary = `${target}.${randomUUID().slice(0, 8)}.tmp`;
+    await writeFile(temporary, bytes, { mode: 0o640 });
+    await rename(temporary, target);
+  }
+
+  /** Site identity, report identity and logo for client reports. */
+  private async reportContext(event?: DetectionEvent): Promise<IncidentReportContext> {
+    const band = event ? this.config.bands.find((candidate) => candidate.id === event.bandId) : undefined;
+    return {
+      siteName: this.config.siteName,
+      deploymentId: this.config.deploymentId,
+      displayTimeZone: this.config.displayTimeZone,
+      reportIdentity: this.config.operationalSettings.reportIdentity,
+      logo: await this.readReportLogo(),
+      serviceLabel: band?.label,
+      runtimeIdentity: this.config.runtimeIdentity,
+    };
+  }
+
+  /**
+   * Latest saved client report for an incident. When none exists yet (or a
+   * refresh is requested), one is drawn now through the bounded figure queue.
+   */
+  async getIncidentReport(eventId: string, kind: "html" | "json", refresh = false): Promise<{ bytes: Buffer; stamp: string } | undefined> {
+    const existing = refresh ? undefined : await this.evidence.readIncidentFigure(eventId, kind === "html" ? "report-html" : "report-json");
+    if (existing) return existing;
+    const event = await this.getEvent(eventId);
+    if (!event || event.syntheticExercise) return undefined;
+    if (this.resourcePressureActive || this.hostMemoryPressureActive) throw new Error("Reports are paused while monitoring resources recover");
+    if (this.figureQueueDepth >= 8) throw new Error("Reports are busy; try again shortly");
+    this.figureQueueDepth += 1;
+    const task = this.figureQueue.then(async () => {
+      try {
+        await this.evidence.saveIncidentFigureSnapshot({ ...event }, { reason: "refresh", baselineReference: this.baselineReferenceFor(event), report: await this.reportContext(event) });
+      } finally {
+        this.figureQueueDepth = Math.max(0, this.figureQueueDepth - 1);
+      }
+    });
+    this.figureQueue = task.catch(() => undefined);
+    await task;
+    return this.evidence.readIncidentFigure(eventId, kind === "html" ? "report-html" : "report-json");
+  }
+
+  /** The client report as a PDF, drawn from the latest saved report model. */
+  async getIncidentReportPdf(eventId: string): Promise<Uint8Array | undefined> {
+    const saved = await this.getIncidentReport(eventId, "json");
+    if (!saved) return undefined;
+    const model = JSON.parse(saved.bytes.toString("utf8")) as IncidentReportModel;
+    if (model?.kind !== "rf-incident-report") return undefined;
+    // The logo is not stored in the live report model; add it for the PDF.
+    const logo = await this.readReportLogo();
+    if (logo && model.identity.logo && !model.identity.logo.dataUri) {
+      model.identity.logo.dataUri = `data:${logo.mediaType};base64,${Buffer.from(logo.bytes).toString("base64")}`;
+    }
+    return this.evidence.renderReportPdf(model);
+  }
+
+  /** Full incident record: live first, then the persisted archive. */
+  async getEvent(eventId: string, sessionId?: string): Promise<DetectionEvent | undefined> {
+    const live = this.events.find((candidate) => candidate.id === eventId);
+    if (live) return structuredClone(live);
+    return this.evidence.findIncidentEvent(eventId, sessionId);
+  }
+
+  async getTriggerSnapshot(eventId: string) {
+    const event = await this.getEvent(eventId);
+    if (!event || event.syntheticExercise) return undefined;
+    return this.evidence.readTriggerSnapshot(eventId, [event.sessionId, ...(event.sessionIds ?? [])]);
+  }
+
   async runStorageMaintenance(): Promise<StorageMaintenanceStatus> {
     if (this.reconfiguring) return this.storageMaintenance;
     if (this.maintenanceRunning) return this.storageMaintenance;
@@ -2335,25 +2570,7 @@ export class MonitorService extends EventEmitter {
         this.config.retentionPolicy.sessionMaxBytes,
         this.config.retentionPolicy.sessionMaxMs,
       )) {
-        const continuingById = new Map([...this.activeEventsByTarget.values()].map((event) => [event.id, event]));
-        for (const [targetId, until] of this.postClearUntilByTarget) {
-          if (until <= Date.now()) continue;
-          const tailEvent = this.events.find((event) => event.targetId === targetId && event.clearedAt);
-          if (tailEvent) continuingById.set(tailEvent.id, tailEvent);
-        }
-        const continuingEvents = [...continuingById.values()];
-        await this.checkpointSessionContext("session-rotation-closing");
-        const nextSession = await this.evidence.rotate(this.sessionMetadata("session-rotation"));
-        if (continuingEvents.length) {
-          for (const event of continuingEvents) {
-            event.sessionIds = [...new Set([event.sessionId, ...(event.sessionIds ?? []), nextSession.id])];
-            await this.persistEvent({ ...event }, nextSession.id);
-          }
-          await this.evidence.recordOperationalAction({
-            type: "incident-continuation",
-            incidents: continuingEvents.map((event) => ({ eventId: event.id, sessionIds: event.sessionIds })),
-          });
-        }
+        await this.rotateEvidenceSessionWithContinuation("session-rotation");
       }
       const protectedSessionIds = new Set(this.events
         .filter((event) => !event.clearedAt || Date.now() < Date.parse(event.clearedAt) + 10 * 60_000)
@@ -2636,12 +2853,14 @@ export class MonitorService extends EventEmitter {
       const tier = capture
         ? captureTargetTierForProfile(capture, this.config.operationalSettings, this.config.bandCatalog)
         : "survey" as const;
+      const revisitObjectiveMs = profile === "gnss-priority" && tier === "tier1"
+        ? this.config.operationalSettings.scan.maxPriorityGapMs
+        : target.revisitObjectiveMs ?? Math.max(target.dwellMs, targets.reduce((sum, item) => sum + item.dwellMs, 0));
+      this.revisitObjectiveByTarget.set(target.id, revisitObjectiveMs);
       return {
         id: target.id,
         tier,
-        revisitObjectiveMs: profile === "gnss-priority" && tier === "tier1"
-          ? this.config.operationalSettings.scan.maxPriorityGapMs
-          : target.revisitObjectiveMs ?? Math.max(target.dwellMs, targets.reduce((sum, item) => sum + item.dwellMs, 0)),
+        revisitObjectiveMs,
         nominalVisitMs: target.nominalVisitMs ?? target.dwellMs,
         maxVisitMs: target.maxVisitMs ?? target.dwellMs,
         // Service priority remains operator-configurable; the catalog weight is
@@ -3148,7 +3367,12 @@ export class MonitorService extends EventEmitter {
       acceptCandidates,
       referenceBaseline,
       requireReferenceBaseline: true,
+      alertPolicy: this.alertPolicyFor(targetId),
+      voteGapMs: alertVoteGapMs(this.revisitObjectiveByTarget.get(targetId)),
+      frameBins: active!.frames.slice(0, 5).map((visitFrame) => visitFrame.bins),
+      shadowPreview: true,
     });
+    if (result.reference) this.rememberReference(targetId, result.reference, frame, outcome.observation);
     frame.detectorAnalysis = projectDetectorAnalysisToFrame({
       analysis: result.analysis,
       frameBinCount: frame.bins.length,
@@ -3569,7 +3793,8 @@ export class MonitorService extends EventEmitter {
     syntheticExercise?: SyntheticExerciseMarker,
   ): ChannelMonitorState {
     const previous = this.targetStates.get(targetId) ?? this.clearTargetState(targetId);
-    const requiredCount = this.config.detectionThresholds.clearObservations;
+    const policy = this.alertPolicyFor(targetId);
+    const requiredCount = policy.values.clearVisits;
     let next: ChannelMonitorState;
     if (result.disposition === "unknown" && result.candidate) {
       next = {
@@ -3592,7 +3817,7 @@ export class MonitorService extends EventEmitter {
             ...previous,
             lifecycle: "detecting",
             candidateCount: 0,
-            requiredCount: this.config.detectionThresholds.interferenceHits,
+            requiredCount: policy.values.alertVisits,
             lastObservedAt: timestamp,
             observationDisposition: "unknown",
             baselineLifecycle: result.baseline.lifecycle,
@@ -3603,7 +3828,8 @@ export class MonitorService extends EventEmitter {
         targetId,
         lifecycle: "active",
         startedAt: previous.firstSeenAt ?? result.event.startedAt,
-      }, syntheticExercise);
+      }, syntheticExercise, result.triggerSnapshot);
+      if (previous.lifecycle === "recovering") this.addTimeline(event, "returned", timestamp, "Raised energy returned before the alert cleared.");
       next = {
         targetId,
         lifecycle: "active",
@@ -3615,6 +3841,7 @@ export class MonitorService extends EventEmitter {
         lastObservedAt: timestamp,
         eventId: event.id,
         kind: event.kind,
+        detailKind: event.detailKind,
         status: event.status,
         evidenceStrength: event.evidenceStrength,
         baselineLifecycle: result.baseline.lifecycle,
@@ -3652,6 +3879,7 @@ export class MonitorService extends EventEmitter {
         if (event) {
           event.lifecycle = "cleared";
           event.clearedAt = timestamp;
+          this.addTimeline(event, "cleared", timestamp, `${requiredCount} clean checks in a row.`);
           this.figureScheduler.eventEnded(event);
           this.activeEventsByTarget.delete(targetId);
           if (!event.syntheticExercise) {
@@ -3661,12 +3889,18 @@ export class MonitorService extends EventEmitter {
         }
         next = { ...this.clearTargetState(targetId), requiredCount, lastObservedAt: timestamp, clearedAt: timestamp, observationDisposition: "clean", baselineLifecycle: result.baseline.lifecycle };
       } else {
+        if (event && event.lifecycle !== "recovering") {
+          this.addTimeline(event, "recovering", timestamp, `Clean checks started; ${requiredCount} in a row clear the alert.`);
+          if (this.evidenceHealthy && !event.syntheticExercise) void this.persistEvent({ ...event }).catch((error) => this.markStorageError(error));
+        }
         if (event) event.lifecycle = "recovering";
         next = { ...previous, lifecycle: "recovering", candidateCount: 0, clearCount, requiredCount, lastObservedAt: timestamp, observationDisposition: "clean", baselineLifecycle: result.baseline.lifecycle };
       }
     } else {
       next = { ...this.clearTargetState(targetId), requiredCount, lastObservedAt: timestamp, clearedAt: previous.clearedAt, observationDisposition: "clean", baselineLifecycle: result.baseline.lifecycle };
     }
+    if (result.gauge) next = { ...next, gauge: result.gauge };
+    if (!next.detailKind && result.candidate?.detailKind) next = { ...next, detailKind: result.candidate.detailKind };
     this.targetStates.set(targetId, next);
     this.refreshActiveEvent();
     if (
@@ -3683,20 +3917,27 @@ export class MonitorService extends EventEmitter {
     targetId: string,
     candidate: Omit<DetectionEvent, "id" | "sessionId" | "notes">,
     syntheticExercise?: SyntheticExerciseMarker,
+    triggerSnapshot?: DetectionResult["triggerSnapshot"],
   ): DetectionEvent {
     assertRfOnlyDetectionClaim(candidate);
     const existing = this.activeEventsByTarget.get(targetId);
-    if (existing?.kind === candidate.kind) {
-      Object.assign(existing, candidate, { startedAt: existing.startedAt, targetId, lifecycle: "active", clearedAt: undefined });
+    // One incident per target while raised energy persists; only an overload,
+    // which is an acquisition fault with its own verdict, starts a separate one.
+    const splits = existing !== undefined && (existing.kind === "overload") !== (candidate.kind === "overload");
+    if (existing && !splits) {
+      this.mergeIntoIncident(existing, candidate);
       this.refreshActiveEvent();
       return existing;
     }
     if (existing) {
       existing.lifecycle = "cleared";
       existing.clearedAt = candidate.startedAt;
+      this.addTimeline(existing, "cleared", candidate.startedAt, "Replaced by a receiver overload incident.");
       if (this.evidenceHealthy) void this.persistEvent({ ...existing }).catch((error) => this.markStorageError(error));
       this.figureScheduler.eventEnded(existing);
     }
+    const now = candidate.lastSeenAt;
+    const policy = this.alertPolicyFor(targetId);
     const event: DetectionEvent = {
       ...candidate,
       targetId,
@@ -3706,13 +3947,176 @@ export class MonitorService extends EventEmitter {
       sessionIds: syntheticExercise ? [] : this.evidence.currentSession ? [this.evidence.currentSession.id] : [],
       notes: [],
       syntheticExercise,
+      peak: candidate.trigger ? peakFromTrigger(undefined, candidate.trigger, now) : undefined,
+      timeline: [
+        ...(Date.parse(candidate.startedAt) < Date.parse(now) ? [{ at: candidate.startedAt, code: "first-seen" as const, detail: "Raised energy first seen." }] : []),
+        {
+          at: now,
+          code: "alert" as const,
+          detail: `${candidate.detailKind ? detailKindLabel(candidate.detailKind) : "Alert"} · ${alertPresetLabel(policy.choice)} sensitivity`,
+        },
+      ],
     };
     this.activeEventsByTarget.set(targetId, event);
     this.events = [event, ...this.events].slice(0, 100);
     this.refreshActiveEvent();
-    if (this.evidenceHealthy) void this.persistEvent(event).catch((error) => this.markStorageError(error));
+    if (this.evidenceHealthy) {
+      void this.persistEvent(event).catch((error) => this.markStorageError(error));
+      if (triggerSnapshot && !syntheticExercise) {
+        void this.evidence.recordTriggerSnapshot(event.sessionId, triggerSnapshot(event.id)).catch((error) => this.markStorageError(error));
+      }
+    }
+    this.lastPeakPersistAtByEvent.set(event.id, Date.now());
     this.figureScheduler.eventStarted(event);
     return event;
+  }
+
+  /** Whitelisted merge: the first trigger, start time and identity never change. */
+  private mergeIntoIncident(existing: DetectionEvent, candidate: Omit<DetectionEvent, "id" | "sessionId" | "notes">): void {
+    const escalatedDetail = moreSevereDetailKind(existing.detailKind, candidate.detailKind);
+    const escalated = Boolean(candidate.detailKind && escalatedDetail === candidate.detailKind && existing.detailKind !== candidate.detailKind);
+    existing.lastSeenAt = candidate.lastSeenAt;
+    existing.metrics = candidate.metrics;
+    existing.observationId = candidate.observationId;
+    existing.scanWindowId = candidate.scanWindowId;
+    existing.status = candidate.status === "interference-likely" ? "interference-likely" : existing.status;
+    existing.severity = candidate.severity;
+    existing.evidenceStrength = candidate.evidenceStrength;
+    existing.evidenceBasis = candidate.evidenceBasis;
+    existing.baselineId = candidate.baselineId;
+    existing.baselineFingerprintId = candidate.baselineFingerprintId;
+    existing.baselineGenerationId = candidate.baselineGenerationId;
+    existing.ruleSetId = candidate.ruleSetId;
+    existing.recommendedAction = candidate.recommendedAction;
+    if (candidate.affectedBandIds) existing.affectedBandIds = candidate.affectedBandIds;
+    if (candidate.affectedLabel) existing.affectedLabel = candidate.affectedLabel;
+    existing.lifecycle = "active";
+    existing.clearedAt = undefined;
+    if (escalated || !existing.detailKind || existing.detailKind === candidate.detailKind) {
+      if (escalated) {
+        this.addTimeline(existing, "kind-escalated", candidate.lastSeenAt, `Now: ${detailKindLabel(candidate.detailKind!)}.`);
+        existing.kind = candidate.kind;
+        existing.detailKind = candidate.detailKind;
+        if (this.evidenceHealthy && !existing.syntheticExercise) void this.persistEvent({ ...existing }).catch((error) => this.markStorageError(error));
+      }
+      existing.observed = candidate.observed;
+    }
+    existing.trigger ??= candidate.trigger;
+    if (candidate.disturbedRangesHz?.length) {
+      existing.disturbedRangesHz = mergeHzRanges([...(existing.disturbedRangesHz ?? []), ...candidate.disturbedRangesHz]);
+    }
+    if (candidate.trigger) {
+      const before = JSON.stringify(existing.peak);
+      existing.peak = peakFromTrigger(existing.peak, candidate.trigger, candidate.lastSeenAt);
+      const lastPersist = this.lastPeakPersistAtByEvent.get(existing.id) ?? 0;
+      if (before !== JSON.stringify(existing.peak) && Date.now() - lastPersist >= 30_000 && this.evidenceHealthy && !existing.syntheticExercise) {
+        this.lastPeakPersistAtByEvent.set(existing.id, Date.now());
+        void this.persistEvent({ ...existing }).catch((error) => this.markStorageError(error));
+      }
+    }
+  }
+
+  private addTimeline(event: DetectionEvent, code: NonNullable<DetectionEvent["timeline"]>[number]["code"], at: string, detail?: string): void {
+    const entries = [...(event.timeline ?? []), { at, code, ...(detail ? { detail: detail.slice(0, 200) } : {}) }];
+    event.timeline = entries.length > 32 ? [...entries.slice(0, 8), ...entries.slice(-24)] : entries;
+  }
+
+  /** The alert policy for one capture target, with its canonical hash. */
+  alertPolicyFor(targetId: string): ResolvedAlertPolicyWithHash {
+    const cached = this.alertPolicyByTarget.get(targetId);
+    if (cached) return cached;
+    const resolved = withAlertPolicyHash(resolveAlertPolicy(this.config.operationalSettings.alerting, targetId));
+    this.alertPolicyByTarget.set(targetId, resolved);
+    return resolved;
+  }
+
+  private rememberReference(targetId: string, reference: NonNullable<DetectionResult["reference"]>, frame: SpectrumFrame, observation: { bins: Uint8Array; confirmedCenterHz: number; confirmedSampleRateHz: number; fingerprint: { inputBinCount: number; analysisStartBin: number; analysisEndBin: number } }): void {
+    const previous = this.referenceByTarget.get(targetId);
+    if (previous?.revision === reference.revision && previous.alertSigma === reference.alertSigma && previous.frameBinCount === frame.bins.length) return;
+    const captureStartHz = observation.confirmedCenterHz - observation.confirmedSampleRateHz / 2;
+    const binWidthHz = observation.confirmedSampleRateHz / Math.max(1, observation.fingerprint.inputBinCount);
+    this.referenceByTarget.set(targetId, {
+      revision: reference.revision,
+      medians: Uint8Array.from(reference.medians),
+      mads: Uint8Array.from(reference.mads),
+      scaleFloorBins: reference.scaleFloorBins,
+      alertSigma: reference.alertSigma,
+      analysisStartBin: frame.analysisStartBin ?? 0,
+      analysisEndBin: frame.analysisEndBin ?? frame.bins.length,
+      frameBinCount: frame.bins.length,
+      analyzedRangeHz: [
+        Math.round(captureStartHz + observation.fingerprint.analysisStartBin * binWidthHz),
+        Math.round(captureStartHz + observation.fingerprint.analysisEndBin * binWidthHz),
+      ],
+    });
+  }
+
+  /**
+   * Usual level and alert level for the live spectrum, projected onto the
+   * target's display grid (max per display bin, like the displayed trace).
+   */
+  getTargetReference(targetId: string): {
+    targetId: string;
+    revision: string;
+    frameBinCount: number;
+    analysisStartBin: number;
+    analysisEndBin: number;
+    analyzedRangeHz: [number, number];
+    alertSigma: number;
+    usual: number[];
+    alertLevel: number[];
+  } | undefined {
+    const reference = this.referenceByTarget.get(targetId);
+    if (!reference) return undefined;
+    const displayCount = Math.max(0, reference.analysisEndBin - reference.analysisStartBin);
+    const sourceCount = reference.medians.length;
+    const usual: number[] = new Array(displayCount).fill(0);
+    const alertLevel: number[] = new Array(displayCount).fill(0);
+    for (let display = 0; display < displayCount; display += 1) {
+      const start = Math.floor((display * sourceCount) / Math.max(1, displayCount));
+      const end = Math.max(start + 1, Math.floor(((display + 1) * sourceCount) / Math.max(1, displayCount)));
+      let usualMax = 0;
+      let alertMax = 0;
+      for (let source = start; source < Math.min(end, sourceCount); source += 1) {
+        const median = reference.medians[source];
+        const scale = Math.max(1.4826 * reference.mads[source], reference.scaleFloorBins);
+        usualMax = Math.max(usualMax, median);
+        alertMax = Math.max(alertMax, Math.min(255, Math.round(median + reference.alertSigma * scale)));
+      }
+      usual[display] = usualMax;
+      alertLevel[display] = alertMax;
+    }
+    return {
+      targetId,
+      revision: reference.revision,
+      frameBinCount: reference.frameBinCount,
+      analysisStartBin: reference.analysisStartBin,
+      analysisEndBin: reference.analysisEndBin,
+      analyzedRangeHz: reference.analyzedRangeHz,
+      alertSigma: reference.alertSigma,
+      usual,
+      alertLevel,
+    };
+  }
+
+  /** Bounded live estimate of how often each preset would have alerted. */
+  getAlertPreview(): AlertPreview {
+    const nowMs = Date.now();
+    const targets: AlertPreviewTarget[] = [];
+    for (const assignment of this.assignments) {
+      for (const target of assignment.targets) {
+        const preview = this.detector.getAlertPreview(target.id, nowMs);
+        if (!preview) continue;
+        targets.push({
+          targetId: target.id,
+          label: target.coverage.map((item) => item.band.service === "gnss" ? [item.band.constellation, item.band.signal].filter(Boolean).join(" ") : item.band.label).filter((value, index, all) => all.indexOf(value) === index).join(" / "),
+          observedHours: Math.round(preview.observedHours * 10) / 10,
+          onsets: preview.onsets,
+          activeOnsets: preview.activeOnsets,
+        });
+      }
+    }
+    return { generatedAt: new Date(nowMs).toISOString(), windowHours: 24, targets };
   }
 
   private baselineReferenceFor(event: DetectionEvent): object | undefined {
@@ -3752,7 +4156,7 @@ export class MonitorService extends EventEmitter {
       lifecycle: "clear",
       candidateCount: 0,
       clearCount: 0,
-      requiredCount: this.config.detectionThresholds.clearObservations,
+      requiredCount: this.alertPolicyFor(targetId).values.clearVisits,
       observationDisposition: "unknown",
     };
   }
@@ -4197,3 +4601,19 @@ export class MonitorService extends EventEmitter {
     if (changed) this.broadcastSnapshot();
   }
 }
+
+/** Running maxima across an incident, from each alert-eligible check's trigger. */
+function peakFromTrigger(previous: IncidentPeak | undefined, trigger: AlertTrigger, at: string): IncidentPeak {
+  const measured = trigger.measured;
+  const strongerPeak = !previous || measured.peakZ > previous.maxPeakZ;
+  return {
+    maxPeakZ: strongerPeak ? measured.peakZ : previous!.maxPeakZ,
+    maxPeakZAt: strongerPeak ? at : previous!.maxPeakZAt,
+    maxOccupancyRatio: Math.max(previous?.maxOccupancyRatio ?? 0, measured.occupancyRatio),
+    maxWidestSegmentRatio: Math.max(previous?.maxWidestSegmentRatio ?? 0, measured.widestSegmentRatio),
+    maxLevelAboveUsual: Math.max(previous?.maxLevelAboveUsual ?? 0, measured.levelAboveUsual),
+    strongestFrequencyHz: strongerPeak ? measured.peakFrequencyHz : previous!.strongestFrequencyHz,
+    updatedAt: at,
+  };
+}
+

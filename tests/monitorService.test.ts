@@ -1046,8 +1046,8 @@ describe("bounded monitor runtime", () => {
     internal.figureScheduler.eventEnded(incident);
     await internal.figureQueue;
     const names = await savedNames();
-    expect(names).toHaveLength(3);
-    expect(names.every((name) => /^20260820T\d{6}Z-end(-analysis)?\.(svg|png)$/.test(name))).toBe(true);
+    expect(names).toHaveLength(5);
+    expect(names.every((name) => /^20260820T\d{6}Z-end(-analysis|-report)?\.(svg|png|html|json)$/.test(name))).toBe(true);
     expect(await readFile(path.join(imageDirectory, names.find((name) => name.endsWith("-end.svg"))!), "utf8")).toContain("Figure generated (UTC) 2026-08-20");
     expect((await monitor.getIncidentFigure(incident.id, "svg"))?.reason).toBe("end");
 
@@ -1463,5 +1463,100 @@ describe("bounded monitor runtime", () => {
       ready: false,
       faults: [],
     });
+  });
+});
+
+describe("alert sensitivity applies live and incidents explain themselves", () => {
+  type Internal = {
+    stopSimulation(): void;
+    handleSpectrum(receiverId: number, bins: Uint8Array, source: "simulation"): void;
+    activeEventsByTarget: Map<string, DetectionEvent>;
+    events: DetectionEvent[];
+    configurationEpoch: number;
+    detector: unknown;
+    evidence: { currentSession?: { id: string }; flush(): Promise<void> };
+    upsertEvent(receiverId: number, targetId: string, candidate: Omit<DetectionEvent, "id" | "sessionId" | "notes">): DetectionEvent;
+  };
+
+  function candidate(targetId: string, overrides: Partial<DetectionEvent> = {}): Omit<DetectionEvent, "id" | "sessionId" | "notes"> {
+    return {
+      dataDomain: "test", kind: "narrowband-spike", detailKind: "narrowband", status: "interference-likely", severity: "low", evidenceStrength: "Low",
+      evidenceBasis: "Relative RF anomaly from an unapproved or provisional baseline.", baselineFingerprintId: "f".repeat(64), ruleSetId: "rf-relative-mad-v1",
+      observationId: "observation-1", service: "startrack", bandId: "startrack-410-470", targetId, bandLabel: "StarTrack", affectedRangeHz: [406_000_000, 414_000_000],
+      disturbedRangesHz: [[409_000_000, 409_100_000]], observed: "Raised narrowband energy stayed above its usual level.", recommendedAction: "Keep recording.",
+      startedAt: "2026-08-20T12:00:00.000Z", lastSeenAt: "2026-08-20T12:00:00.000Z", lifecycle: "active",
+      metrics: { timestamp: "2026-08-20T12:00:00.000Z", bandId: "startrack-410-470", meanLevel: 30, peakLevel: 90, baselineLevel: 30, baselineDelta: 0, occupiedRatio: 0.01, overload: false },
+      ...overrides,
+    };
+  }
+
+  it("keeps an open incident when sensitivity changes, records why, and never retunes", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-20T12:00:00.000Z"));
+    const config = enableSingleRadioTarget(await temporaryConfig("live-sensitivity"));
+    const monitor = new MonitorService(config);
+    await monitor.start();
+    const internal = monitor as unknown as Internal;
+    internal.stopSimulation();
+    const targetId = "startrack-target";
+    const event = internal.upsertEvent(0, targetId, candidate(targetId));
+    await internal.evidence.flush();
+    const firstSession = internal.evidence.currentSession!.id;
+    const epoch = internal.configurationEpoch;
+    const detector = internal.detector;
+
+    const settings = structuredClone(config.operationalSettings);
+    settings.revision += 1;
+    settings.alerting.default = { preset: "sensitive", values: { ...settings.alerting.default.values } };
+    await monitor.applyLiveSettings(withOperationalSettings(config, settings), ["alerting.default.preset"]);
+
+    expect(event.lifecycle).toBe("active");
+    expect(internal.activeEventsByTarget.get(targetId)).toBe(event);
+    expect(event.timeline?.map((entry) => entry.code)).toContain("sensitivity-changed");
+    expect(event.timeline?.at(-1)?.detail).toContain("Sensitive");
+    expect(internal.configurationEpoch).toBe(epoch);
+    expect(internal.detector).toBe(detector);
+    expect(internal.evidence.currentSession!.id).not.toBe(firstSession);
+    expect(event.sessionIds).toEqual(expect.arrayContaining([firstSession, internal.evidence.currentSession!.id]));
+    expect(monitor.alertPolicyFor(targetId).choice).toBe("sensitive");
+
+    const retune = structuredClone(settings);
+    retune.scan.dwellMs.startrack += 1_000;
+    await expect(monitor.applyLiveSettings(withOperationalSettings(config, retune), ["scan.dwellMs.startrack"])).rejects.toThrow(/receiver restart/);
+    await monitor.stop();
+  });
+
+  it("keeps one incident when the raised energy changes shape, preserving the first trigger; overload starts its own", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-20T12:00:00.000Z"));
+    const config = enableSingleRadioTarget(await temporaryConfig("incident-merge"));
+    const monitor = new MonitorService(config);
+    await monitor.start();
+    const internal = monitor as unknown as Internal;
+    internal.stopSimulation();
+    const targetId = "startrack-target";
+    const firstTrigger = {
+      schemaVersion: 1, detailKind: "narrowband", firedAt: "2026-08-20T12:00:00.000Z",
+      measured: { peakZ: 12, medianZ: 0, occupancyRatio: 0.01, widestSegmentRatio: 0.01, widestSegmentMedianZ: 12, peakLevel: 90, usualLevelAtPeak: 30, levelAboveUsual: 60 },
+    } as unknown as DetectionEvent["trigger"];
+    const first = internal.upsertEvent(0, targetId, candidate(targetId, { trigger: firstTrigger }));
+    const second = internal.upsertEvent(0, targetId, candidate(targetId, {
+      kind: "wideband-noise-rise",
+      detailKind: "partial-band",
+      trigger: { ...firstTrigger!, detailKind: "partial-band", measured: { ...firstTrigger!.measured, peakZ: 20, widestSegmentRatio: 0.25 } },
+      lastSeenAt: "2026-08-20T12:00:06.000Z",
+      disturbedRangesHz: [[408_000_000, 410_000_000]],
+      observed: "Raised RF energy over 2.0 MHz.",
+    }));
+    expect(second).toBe(first);
+    expect(first).toMatchObject({ detailKind: "partial-band", kind: "wideband-noise-rise", startedAt: "2026-08-20T12:00:00.000Z", trigger: firstTrigger });
+    expect(first.disturbedRangesHz).toEqual([[408_000_000, 410_000_000]]);
+    expect(first.timeline?.map((entry) => entry.code)).toEqual(["alert", "kind-escalated"]);
+    expect(first.peak).toMatchObject({ maxPeakZ: 20, maxWidestSegmentRatio: 0.25, maxLevelAboveUsual: 60 });
+
+    const overload = internal.upsertEvent(0, targetId, candidate(targetId, { kind: "overload", detailKind: "overload", status: "suspicious", observed: "Receiver input is overloaded. Readings may be wrong." }));
+    expect(overload.id).not.toBe(first.id);
+    expect(first.lifecycle).toBe("cleared");
+    await monitor.stop();
   });
 });

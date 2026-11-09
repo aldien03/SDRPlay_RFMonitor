@@ -444,6 +444,14 @@ export async function verifyEvidenceDirectory(
     };
   }
 
+  // Incident evidence packages must carry the client report and export record
+  // they were built with; a hashed but stripped package is incomplete.
+  if (manifest.packageType === "incident-evidence") {
+    const listed = new Set(manifest.files.map((entry) => entry.path));
+    // A numbered part carries only its share of the files; the set is checked as a whole.
+    const missing = listed.has("multipart.json") ? [] : ["report.html", "report.json", "export-record.json", "README-VERIFY.txt"].filter((name) => !listed.has(name));
+    if (missing.length) return { outcome: "INCOMPLETE", ...resultBase, reasons: missing.map((name) => `incident-package-missing:${name}`) };
+  }
   // Manifest-v1, pre-transaction manifest-v2, and extracted export packages
   // remain readable. Their manifest completeness flags remain authoritative.
   if (manifest.complete === false || manifest.evidenceGap === true) {

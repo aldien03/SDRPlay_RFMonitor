@@ -122,12 +122,16 @@ export class SettingsStore {
     const operationalExists = await exists(options.operationalPath);
     let restored = false;
     let migratedFromV2 = false;
+    let migratedFromSchema: number | undefined;
     if (operationalExists) {
       try {
         const rawOnDisk = JSON.parse(await readFile(options.operationalPath, "utf8")) as { schemaVersion?: unknown };
         const onDisk = validateOperationalSettings(rawOnDisk as OperationalSettings, options.catalog);
         const matchesSupplied = operationalConfigurationHash(onDisk, options.catalog.catalogVersion) === operationalConfigurationHash(options.settings, options.catalog.catalogVersion);
         migratedFromV2 = rawOnDisk.schemaVersion === 2 && matchesSupplied;
+        if (!migratedFromV2 && matchesSupplied && typeof rawOnDisk.schemaVersion === "number" && rawOnDisk.schemaVersion >= 3 && rawOnDisk.schemaVersion < options.settings.schemaVersion) {
+          migratedFromSchema = rawOnDisk.schemaVersion;
+        }
         restored = !matchesSupplied;
       } catch {
         restored = true;
@@ -136,13 +140,29 @@ export class SettingsStore {
       if (migratedFromV2) {
         const revisionBackup = path.join(options.revisionsPath, `operational-r${String(options.settings.revision).padStart(6, "0")}-pre-v3-${timestamp}.json`);
         await copyFile(options.operationalPath, revisionBackup);
+      } else if (migratedFromSchema !== undefined) {
+        const revisionBackup = path.join(options.revisionsPath, `operational-r${String(options.settings.revision).padStart(6, "0")}-pre-v${options.settings.schemaVersion}-${timestamp}.json`);
+        await copyFile(options.operationalPath, revisionBackup);
       } else if (restored) {
         await copyFile(options.operationalPath, `${options.operationalPath}.invalid-${timestamp}.bak`);
         await pruneQuarantinedProfiles(options.operationalPath);
       }
     }
-    if (!operationalExists || restored || migratedFromV2) await writeAtomic(options.operationalPath, options.settings);
-    if (migratedFromV2) {
+    if (!operationalExists || restored || migratedFromV2 || migratedFromSchema !== undefined) await writeAtomic(options.operationalPath, options.settings);
+    if (migratedFromSchema !== undefined) {
+      const hash = operationalConfigurationHash(options.settings, options.catalog.catalogVersion);
+      await store.appendAudit({
+        timestamp: new Date().toISOString(),
+        revision: options.settings.revision,
+        actor: "service-migration",
+        clientAddress: "local",
+        changedFields: ["schemaVersion", "alerting", "reportIdentity"],
+        outcome: "applied",
+        previousConfigurationHash: hash,
+        configurationHash: hash,
+        reason: `Structurally migrated the active operational profile from schema v${migratedFromSchema} to v${options.settings.schemaVersion}: alert sensitivity now separate from the unchanged signal-learning rules`,
+      });
+    } else if (migratedFromV2) {
       const hash = operationalConfigurationHash(options.settings, options.catalog.catalogVersion);
       await store.appendAudit({
         timestamp: new Date().toISOString(),

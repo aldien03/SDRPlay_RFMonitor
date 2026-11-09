@@ -1,4 +1,5 @@
-import { Copy, Download, Eye, FolderArchive, Pause, Play, RefreshCw, RotateCcw, X } from "lucide-react";
+import { Copy, Download, Eye, FileText, FolderArchive, Pause, Play, RefreshCw, RotateCcw, X } from "lucide-react";
+import { disturbedSummary } from "./incidentPresentation";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { DetectionEvent, EvidenceArchiveEventPage, EvidenceArchivePage, EvidenceArchiveSession, EvidenceLifecycle, EvidenceReplayBatch, EvidenceReplayFrame, MonitorSnapshot, MonitorStatus, SignalMetricSample, SpectrumFrame } from "../shared/types";
 import { dateTime, formatBytes, formatDuration, formatRange, timeOnly } from "./format";
@@ -12,43 +13,6 @@ export interface DisplayOptions {
   engineer: boolean;
   audioAlerts: boolean;
   popupAlerts: boolean;
-}
-
-export function RecentIncidents({ snapshot, selectedEventId, onSelect }: { snapshot: MonitorSnapshot; selectedEventId?: string; onSelect: (id: string) => void }) {
-  return (
-    <section className="panel incident-history-panel" aria-labelledby="recent-incidents-title">
-      <div className="panel-heading-line">
-        <div><h2 id="recent-incidents-title" className="panel-title">Recent incidents</h2><p>Recorded signal changes and operator actions.</p></div>
-        <span>{snapshot.events.length} recorded</span>
-      </div>
-      {snapshot.events.length ? (
-        <div className="incident-history-list">
-          {snapshot.events.slice(0, 6).map((event) => {
-            const active = event.id === snapshot.activeEvent?.id;
-            const service = snapshot.services.find((candidate) => candidate.service === event.service)?.label ?? event.bandLabel;
-            const state = active ? "Happening now" : event.acknowledgedAt ? "Reviewed" : "Ended";
-            const evidence = event.evidenceStrength;
-            return (
-              <article key={event.id} className={`incident-history-item ${active ? "active" : ""} ${selectedEventId === event.id ? "selected" : ""}`}>
-                <header>
-                  <div className="incident-history-state"><StatusDot status={event.status} /><strong>{state}</strong><span>{statusLabel(event.status)}</span></div>
-                  <time dateTime={event.startedAt}>{timeOnly(event.startedAt, snapshot.displayTimeZone)} · {formatDuration(event.startedAt, event.lastSeenAt)}</time>
-                </header>
-                <button className="incident-row-select" type="button" onClick={() => onSelect(event.id)} aria-pressed={selectedEventId === event.id}>
-                  <span><small>Affected signal</small><strong>{event.affectedLabel ?? service}</strong><em>{formatRange(...event.affectedRangeHz)}</em></span>
-                  <span><small>Observed</small><strong>{event.observed}</strong></span>
-                  <span><small>Evidence</small><strong>{evidence}</strong><em>Peak {event.metrics.peakLevel.toFixed(0)} / 255</em></span>
-                  <b>View details</b>
-                </button>
-              </article>
-            );
-          })}
-        </div>
-      ) : (
-        <div className="incident-history-empty"><strong>No incidents recorded</strong><span>Recent scans look normal.</span></div>
-      )}
-    </section>
-  );
 }
 
 function statusLabel(status: MonitorStatus): string {
@@ -383,13 +347,13 @@ export function EvidenceArchive({
                       <article className="evidence-event" key={event.id}>
                         <header><span className={`evidence-status event-${incidentStatus(event).toLowerCase()}`}>{incidentStatus(event)}</span><time dateTime={event.startedAt}>{dateTime(event.startedAt, snapshot.displayTimeZone)}</time></header>
                         <strong>{event.affectedLabel ?? event.bandLabel}</strong>
-                        <small>{formatRange(...event.affectedRangeHz)}</small>
+                        <small>{disturbedSummary(event)}</small>
                         <p>{event.observed}</p>
                         <footer>
                           <button type="button" onClick={() => onOpenIncident(event)}><Eye size={15} />View incident</button>
                           <button type="button" disabled={!snapshot.evidenceHealthy || Boolean(downloadingId)} onClick={() => void download(event.id, () => onExportEvent(event))}><Download size={15} />{downloadingId === event.id ? "Preparing…" : "Download"}</button>
                           {event.figureAvailable ? <a className="text-button" href={`/api/events/${encodeURIComponent(event.id)}/figure.svg`} target="_blank" rel="noopener noreferrer" aria-label="Open the saved incident image in a new tab"><Eye size={15} />Image</a> : null}
-                          {event.figureAvailable ? <a className="text-button" href={`/api/events/${encodeURIComponent(event.id)}/analysis.svg`} target="_blank" rel="noopener noreferrer" aria-label="Open the saved incident analysis charts in a new tab"><Eye size={15} />Analysis</a> : null}
+                          {!event.syntheticExercise ? <a className="text-button" href={`/api/events/${encodeURIComponent(event.id)}/report.html`} target="_blank" rel="noopener noreferrer" aria-label="Open the incident report in a new tab"><FileText size={15} />Report</a> : null}
                         </footer>
                       </article>
                     ))}

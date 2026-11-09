@@ -53,7 +53,8 @@ describe("isolated synthetic qualification runner", () => {
     expect(report.score.eventScores).toEqual([
       expect.objectContaining({ kind: "wideband", expectedOutcome: "alert", verdict: "detected" }),
     ]);
-    expect(report.score.eventScores[0].observedExposureToAlertMs).toBeGreaterThanOrEqual(2_000);
+    // Standard alert sensitivity needs 3 raised checks with at least 1 s observed in total.
+    expect(report.score.eventScores[0].observedExposureToAlertMs).toBeGreaterThanOrEqual(1_000);
     expect(report.truth).toMatchObject({ disclosedAfterRun: false, verified: true });
     expect(report.passed).toBe(true);
   });

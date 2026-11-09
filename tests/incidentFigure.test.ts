@@ -106,8 +106,10 @@ describe("incident figure", () => {
     const png = decodePng(result.waterfallPng);
     expect(png.width).toBe(1024);
     const spikeColumn = Math.floor((1501 * 1024) / 2048);
-    const matching = Array.from({ length: png.height }, (_, row) => pixelAt(png, spikeColumn, row)).filter((pixel) => pixel === palette.plain[250]);
+    // Contrast is stretched to the recorded range, so the spike is drawn at full brightness.
+    const matching = Array.from({ length: png.height }, (_, row) => pixelAt(png, spikeColumn, row)).filter((pixel) => pixel === palette.plain[255]);
     expect(matching.length).toBeGreaterThan(0);
+    expect(result.data.waterfallLevelRange[0]).toBe(20);
     expect(result.summary).toMatchObject({ derived: true, framesUsed: 6, framesDuring: 6, widthPx: 1024, levelScale: "relative-uncalibrated-uint8" });
     expect(result.svg).toContain("RF data can show interference, not intent.");
   });

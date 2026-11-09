@@ -3,6 +3,7 @@ import { CLIENT_DATA_LATE_AFTER_MS, decodeSpectrumEnvelope } from "../shared/liv
 import { detectorAnomalyRanges } from "./detectorPresentation";
 import { buildWaterfallPalette, composeWaterfall, rasterizeRow } from "../shared/waterfallRaster";
 import { liveSubscriptionSignature, MAX_VISIBLE_TARGETS, normalizeLiveSubscription, sameStringSet } from "../shared/liveSubscription";
+import { incidentPackageBaseName } from "../shared/incidentNaming";
 import {
   MAX_OPERATOR_AFFECTED_TARGETS,
   OPERATOR_ACTION_CODES,
@@ -12,7 +13,7 @@ import {
   type OperatorActionCode,
   type OperatorSummaryV1,
 } from "../shared/operatorSummary";
-import type { BaselineDescriptor, ChannelMonitorState, DataDomain, EvidenceArchiveEventPage, EvidenceArchivePage, EvidenceReplayBatch, FocusSession, LiveSubscription, MonitorSnapshot, MonitorStateDelta, OperationalSettings, RecordingDeletionResult, RecoveryOperationHealth, ServiceMessage, SettingsRevision, SignalMetricSample, SpectrumFrame, SyntheticExerciseState } from "../shared/types";
+import type { AlertPreview, BaselineDescriptor, DetectionEvent, ReportLogo, ChannelMonitorState, DataDomain, EvidenceArchiveEventPage, EvidenceArchivePage, EvidenceReplayBatch, FocusSession, LiveSubscription, MonitorSnapshot, MonitorStateDelta, OperationalSettings, RecordingDeletionResult, RecoveryOperationHealth, ServiceMessage, SettingsRevision, SignalMetricSample, SpectrumFrame, SyntheticExerciseState } from "../shared/types";
 
 const loadingGeneratedAt = new Date().toISOString();
 const emptySnapshot: MonitorSnapshot = {
@@ -615,7 +616,7 @@ export function appendWaterfallFrame(history: SpectrumFrame[], frame: SpectrumFr
 }
 
 export class ApiError extends Error {
-  constructor(message: string, readonly status: number, readonly fields?: Record<string, string>) {
+  constructor(message: string, readonly status: number, readonly fields?: Record<string, string>, readonly code?: string) {
     super(message);
     this.name = "ApiError";
   }
@@ -751,8 +752,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     },
   });
   if (!response.ok) {
-    const payload = await response.json().catch(() => ({})) as { error?: string; fields?: Record<string, string> };
-    throw new ApiError(payload.error ?? response.statusText, response.status, payload.fields);
+    const payload = await response.json().catch(() => ({})) as { error?: string; fields?: Record<string, string>; code?: string };
+    throw new ApiError(payload.error ?? response.statusText, response.status, payload.fields, payload.code);
   }
   return response.json() as Promise<T>;
 }
@@ -771,12 +772,18 @@ interface ExportJobResponse {
   id: string;
   state: "queued" | "running" | "ready" | "failed";
   error?: string;
+  sha256?: string;
   statusUrl: string;
   downloadUrl: string;
   parts?: Array<{ number: number; sizeBytes: number; sha256: string; downloadUrl: string }>;
 }
 
-async function queueExportDownload(body: object, fallbackFilename: string): Promise<void> {
+export interface ExportDownloadResult {
+  /** SHA-256 of each downloaded file, as computed by the server while building it. */
+  files: Array<{ filename: string; sha256?: string }>;
+}
+
+async function queueExportDownload(body: object, fallbackFilename: string): Promise<ExportDownloadResult> {
   let job = await request<ExportJobResponse>("/api/exports", { method: "POST", body: JSON.stringify(body) });
   const deadline = Date.now() + 10 * 60_000;
   while (job.state === "queued" || job.state === "running") {
@@ -785,13 +792,16 @@ async function queueExportDownload(body: object, fallbackFilename: string): Prom
     job = await request<ExportJobResponse>(job.statusUrl);
   }
   if (job.state !== "ready") throw new Error(job.error ?? "Evidence export failed");
-  const parts = job.parts?.length ? job.parts : [{ number: 1, downloadUrl: job.downloadUrl }];
+  const parts: Array<{ number: number; downloadUrl: string; sha256?: string }> = job.parts?.length ? job.parts : [{ number: 1, downloadUrl: job.downloadUrl, sha256: job.sha256 }];
+  const files: ExportDownloadResult["files"] = [];
   for (const part of parts) {
     const filename = parts.length === 1
       ? fallbackFilename
       : fallbackFilename.replace(/\.zip$/i, `-part-${String(part.number).padStart(3, "0")}.zip`);
     await downloadArchive(part.downloadUrl, filename, "Evidence export failed");
+    files.push({ filename, sha256: part.sha256 });
   }
+  return { files };
 }
 
 /**
@@ -1172,8 +1182,26 @@ export function useMonitor() {
     await request(`/api/events/${eventId}/notes`, { method: "POST", body: JSON.stringify({ text }) });
   }, []);
 
-  const exportIncident = useCallback(async (eventId: string, sessionId?: string) => {
-    await queueExportDownload({ kind: "incident", eventId, sessionId }, `rf-incident-${eventId}.zip`);
+  const exportIncident = useCallback(async (eventId: string, sessionId?: string, event?: Pick<DetectionEvent, "id" | "startedAt" | "targetId" | "bandId">) => (
+    queueExportDownload({ kind: "incident", eventId, sessionId }, `${event ? incidentPackageBaseName(event) : `rf-incident-${eventId}`}.zip`)
+  ), []);
+
+  const getEvent = useCallback((eventId: string, sessionId?: string) => (
+    request<DetectionEvent>(`/api/events/${encodeURIComponent(eventId)}${sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : ""}`)
+  ), []);
+
+  const getAlertPreview = useCallback(() => request<AlertPreview>("/api/alert-preview"), []);
+
+  const uploadReportLogo = useCallback(async (file: File): Promise<ReportLogo> => {
+    const response = await fetch("/api/settings/report-logo", {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "content-type": file.type || "application/octet-stream", "x-rf-monitor-csrf": "settings-v1" },
+      body: file,
+    });
+    const payload = await response.json().catch(() => ({})) as { error?: string } & Partial<ReportLogo>;
+    if (!response.ok) throw new ApiError(payload.error ?? response.statusText, response.status);
+    return payload as ReportLogo;
   }, []);
 
   const getEvidenceArchive = useCallback((offset = 0, limit = 20) => (
@@ -1190,9 +1218,9 @@ export function useMonitor() {
     return request<EvidenceReplayBatch>(`/api/evidence/sessions/${encodeURIComponent(sessionId)}/replay?${parameters}`);
   }, []);
 
-  const exportSession = useCallback(async (sessionId: string) => {
-    await queueExportDownload({ kind: "session", sessionId }, `${sessionId}.zip`);
-  }, []);
+  const exportSession = useCallback(async (sessionId: string) => (
+    queueExportDownload({ kind: "session", sessionId }, `${sessionId}.zip`)
+  ), []);
 
   const captureScreenshot = useCallback(async (eventId: string) => {
     const blob = await createEvidenceScreenshot(snapshot, eventId);
@@ -1216,10 +1244,10 @@ export function useMonitor() {
 
   const lockSettings = useCallback(() => request<{ unlocked: false }>("/api/admin/lock", { method: "POST", body: "{}" }), []);
 
-  const applySettings = useCallback((settings: OperationalSettings, expectedRevision: number) => request<SettingsRevision>("/api/settings", {
+  const applySettings = useCallback((settings: OperationalSettings, expectedRevision: number, options?: { confirmSignalLearningRestart?: boolean }) => request<SettingsRevision>("/api/settings", {
     method: "PUT",
     headers: { "x-rf-monitor-csrf": "settings-v1" },
-    body: JSON.stringify({ settings, expectedRevision }),
+    body: JSON.stringify({ settings, expectedRevision, ...(options?.confirmSignalLearningRestart ? { confirmSignalLearningRestart: true } : {}) }),
   }), []);
 
   const baselineRequest = useCallback(<T,>(action: "approve" | "restart", baseline: BaselineDescriptor, expectedConfigurationRevision: number, options?: { endActiveObservation?: boolean }) => (
@@ -1296,6 +1324,9 @@ export function useMonitor() {
     addNote,
     captureScreenshot,
     exportIncident,
+    getEvent,
+    getAlertPreview,
+    uploadReportLogo,
     getEvidenceArchive,
     getEvidenceSessionEvents,
     getEvidenceReplayBatch,
