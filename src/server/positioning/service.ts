@@ -49,6 +49,8 @@ const MAX_SET_TEXT_BYTES = 256 * 1024 * 1024;
 const UPLOAD_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_REPORTS = 200;
 const ID = /^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$/;
+/** CSV data written next to the report and packaged under data/. */
+const DATA_FILES = ["dgps-statistics.csv", "events.csv", "rf-coverage.csv", "sbs-files.csv"];
 
 export class DgnssUserError extends Error {
   constructor(message: string, readonly status = 422, readonly fields?: Record<string, string>) {
@@ -636,6 +638,7 @@ export class DgnssReportService {
     const result = await buildDgnssReport({ ...input, dataset, onStage: stage, isCancelled: () => job.cancelled });
     await writeFile(path.join(input.outDir, "report.pdf"), result.pdf, { mode: 0o640 });
     await writeFile(path.join(input.outDir, "report.html"), result.html, { mode: 0o640 });
+    for (const file of result.model.dataFiles) await writeFile(path.join(input.outDir, file.name), file.content, { mode: 0o640 });
     return { status: result.status, verdict: result.verdict, facts: result.facts, windowStartMs: result.window.startMs, rfSource: result.model.tables.evidence.rows.find((row) => row[0] === "RF evidence source")?.[1] };
   }
 
@@ -681,11 +684,13 @@ export class DgnssReportService {
     this.jobs.delete(job.summary.id);
   }
 
-  /** PDF + HTML + every SBS input + manifest + SHA256SUMS. The SBS files are read from the uploads, not copied. */
+  /** PDF + HTML + data CSVs + every SBS input + manifest + SHA256SUMS. The SBS files are read from the uploads, not copied. */
   private async writePackage(dir: string, files: { pdf: string; html: string; package: string }, sbs: Array<{ source: string; name: string }>, manifest: Record<string, unknown>): Promise<void> {
+    const data = (await readdir(dir).catch(() => [] as string[])).filter((name) => DATA_FILES.includes(name)).sort();
     const entries: Array<[string, string]> = [
       [path.join(dir, "report.pdf"), files.pdf],
       [path.join(dir, "report.html"), files.html],
+      ...data.map((name): [string, string] => [path.join(dir, name), `data/${name}`]),
       ...sbs.map((entry): [string, string] => [entry.source, entry.name]),
     ];
     const sums: string[] = [];

@@ -94,4 +94,5 @@ await mkdir(values.out, { recursive: true });
 const stem = `DGNSS-verification-${(dataset.lineNames[0] ?? "line").replace(/[^A-Za-z0-9.-]+/g, "_")}-${values.window}`;
 await writeFile(join(values.out, `${stem}.html`), result.html);
 await writeFile(join(values.out, `${stem}.pdf`), result.pdf);
+for (const file of result.model.dataFiles) await writeFile(join(values.out, `${stem}.${file.name}`), file.content);
 console.log(JSON.stringify({ out: join(values.out, stem), status: result.status, verdict: result.verdict, facts: result.facts }, null, 2));

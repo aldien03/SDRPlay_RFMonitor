@@ -20,7 +20,6 @@ const STATE = {
   normal: { color: REPORT_COLORS.usual, opacity: 0.3, label: "Normal" },
   anomaly: { color: REPORT_COLORS.anomaly, opacity: 0.9, label: "RF anomaly" },
   flag: { color: REPORT_COLORS.alertLevel, opacity: 0.9, label: "Navigation flag" },
-  timing: { color: REPORT_COLORS.simulation, opacity: 0.55, label: "Shot timing (under way)" },
   none: { color: REPORT_COLORS.before, opacity: 0.22, label: "Not monitored / no data" },
 } as const;
 type StateKey = keyof typeof STATE;
@@ -244,12 +243,12 @@ interface LaneSpan {
   state: StateKey;
 }
 
-const LANE_PRIORITY: Record<StateKey, number> = { none: 0, normal: 1, timing: 2, flag: 3, anomaly: 4 };
+const LANE_PRIORITY: Record<StateKey, number> = { none: 0, normal: 1, flag: 2, anomaly: 3 };
 
 /**
  * A lane is about 700 px wide: merge its spans into at most `slots` time
  * slots, each showing the most important state in it (RF anomaly, then
- * navigation flag, shot timing, normal, no data). Keeps a full day of
+ * navigation flag, normal, no data). Keeps a full day of
  * shot-by-shot flags to a few hundred bands instead of tens of thousands.
  */
 function simplifySpans(spans: LaneSpan[], startMs: number, endMs: number, slots = 600): LaneSpan[] {
@@ -284,7 +283,7 @@ export function laneChart(analysis: PositioningAnalysis, input: { id: string; ti
     const bottom = count - index - 0.84;
     for (const span of simplifySpans(lane.spans, analysis.window.startMs, analysis.window.endMs)) {
       let { fromMs, toMs } = span;
-      if ((span.state === "anomaly" || span.state === "flag" || span.state === "timing") && toMs - fromMs < minimumWidth) {
+      if ((span.state === "anomaly" || span.state === "flag") && toMs - fromMs < minimumWidth) {
         const middle = (fromMs + toMs) / 2;
         fromMs = middle - minimumWidth / 2;
         toMs = middle + minimumWidth / 2;
@@ -295,7 +294,7 @@ export function laneChart(analysis: PositioningAnalysis, input: { id: string; ti
       bands.set(span.state, entry);
     }
   });
-  const order: StateKey[] = ["none", "normal", "timing", "flag", "anomaly"];
+  const order: StateKey[] = ["none", "normal", "flag", "anomaly"];
   const events = input.events ? analysis.events : [];
   return {
     id: input.id,
@@ -327,9 +326,7 @@ function navSpans(analysis: PositioningAnalysis, system: SystemAnalysis): LaneSp
   const interval = analysis.dataset.intervalMs;
   const spans: LaneSpan[] = analysis.positioningCoverage.missing.map(([fromMs, toMs]) => ({ fromMs, toMs, state: "none" }));
   const stateOf = (time: number): StateKey => {
-    const set = system.flags.get(time);
-    if (!set?.size) return "normal";
-    return [...set].some((indicator) => indicator !== "timing") ? "flag" : "timing";
+    return system.flags.get(time)?.size ? "flag" : "normal";
   };
   spans.push(...runLength(system.shots.filter((shot) => shot.timeMs >= analysis.window.startMs && shot.timeMs < analysis.window.endMs).map((shot) => ({ fromMs: shot.timeMs, toMs: shot.timeMs + interval, state: stateOf(shot.timeMs) }))));
   return spans.sort((left, right) => left.fromMs - right.fromMs);
@@ -384,7 +381,7 @@ function systemPanels(analysis: PositioningAnalysis, system: SystemAnalysis): Ch
       id: `sys-${system.id}-rf`,
       title: "RF (rf-monitor)",
       lanes: [{ label: "GNSS bands", spans: gnssCombinedSpans(analysis) }, ...(beamLane ? [{ label: beamLane.shortLabel, spans: beamLane.intervals.map((interval) => ({ fromMs: interval.fromMs, toMs: interval.toMs, state: rfState(interval.state) })) }] : []), { label: "Nav flags", spans: navSpans(analysis, system) }],
-      states: ["normal", "anomaly", "flag", "timing", "none"],
+      states: ["normal", "anomaly", "flag", "none"],
     }),
     panel("sats", "#Sats", (shot) => shot.nsats, { integer: true }),
     panel("age", "Age (s)", (shot) => shot.ageS, { integer: true, floorZero: true }),
@@ -405,7 +402,7 @@ function evidenceTimeline(analysis: PositioningAnalysis): ChartSpec {
       ...analysis.systems.map((system) => ({ label: system.id, spans: navSpans(analysis, system) })),
     ],
     separatorAfter: analysis.rf.lanes.length,
-    states: ["normal", "anomaly", "flag", "timing", "none"],
+    states: ["normal", "anomaly", "flag", "none"],
     events: true,
   });
 }
@@ -430,7 +427,7 @@ function speedChart(analysis: PositioningAnalysis): ChartSpec {
   };
 }
 
-// ---- under way: across/along track and shot timing --------------------------------
+// ---- under way: across track ---------------------------------------------------------
 
 /** Dots for a long series: per time bucket only the lowest and highest value, so extremes stay visible. */
 function bucketExtremes(axis: { min: number; max: number }, samples: Array<[number, number]>, clamp: number, buckets = 300): ChartPoint[] {
@@ -458,18 +455,17 @@ function underWayAxis(analysis: PositioningAnalysis) {
   return { label: "UTC (HH:MM:SS)", min, max, ticks: timeAxisTicks(min, max, 9) };
 }
 
-function underWayChart(analysis: PositioningAnalysis, kind: "cross" | "along"): ChartSpec {
+function underWayChart(analysis: PositioningAnalysis): ChartSpec {
   const systems = comparisons(analysis).filter((system) => system.vsControl?.underWay);
   const limit = analysis.thresholds.agreementM;
   const control = analysis.systems.find((system) => system.isControl)!;
-  const index = kind === "cross" ? 2 : 1;
-  const values = systems.flatMap((system) => system.vsControl!.underWay!.samples.map((sample) => Math.abs(sample[index])));
+  const values = systems.flatMap((system) => system.vsControl!.underWay!.samples.map((sample) => Math.abs(sample[2])));
   const extent = niceCeil(Math.max(limit * 1.3, percentile(values, 0.999) * 1.1 || 0), 0.1);
   const regions = [...noDataRegions(analysis), ...rfAnomalyRegions(analysis)];
-  const label = kind === "cross" ? "Across track (m, + port)" : "Along track (m, + ahead)";
+  const label = "Across track (m, + port)";
   return {
-    id: `uw-${kind}`,
-    title: kind === "cross" ? `Across-Track Offset to ${control.id} Under Way` : `Along-Track Offset to ${control.id} Under Way (shot timing included)`,
+    id: "uw-cross",
+    title: `Across-Track Offset to ${control.id} Under Way`,
     caption: "",
     ariaLabel: `${label} of each comparison system relative to ${control.id} while under way.`,
     width: WIDE,
@@ -477,35 +473,9 @@ function underWayChart(analysis: PositioningAnalysis, kind: "cross" | "along"): 
     x: underWayAxis(analysis),
     y: { label, min: -extent, max: extent, ticks: numericTicks(-extent, extent, 5, (value) => value.toFixed(decimalsFor(2 * extent))) },
     xRegions: regions,
-    series: systems.map((system) => ({ kind: "points" as const, name: system.id, color: colorOf(analysis, system.id), radius: 1.4, points: bucketExtremes(underWayAxis(analysis), system.vsControl!.underWay!.samples.map((sample) => [sample[0], sample[index]] as [number, number]), extent) })),
+    series: systems.map((system) => ({ kind: "points" as const, name: system.id, color: colorOf(analysis, system.id), radius: 1.4, points: bucketExtremes(underWayAxis(analysis), system.vsControl!.underWay!.samples.map((sample) => [sample[0], sample[2]] as [number, number]), extent) })),
     hRules: [{ value: limit, color: REPORT_COLORS.anomaly, dash: [6, 4], label: `±${limitText(limit)}` }, { value: -limit, color: REPORT_COLORS.anomaly, dash: [6, 4] }, { value: 0, color: REPORT_COLORS.ink, dash: [4, 3] }],
     legend: [...systems.map((system) => ({ name: system.id, color: colorOf(analysis, system.id), style: "line" as const })), ...regionLegend(analysis, regions)],
-  };
-}
-
-function timingChart(analysis: PositioningAnalysis): ChartSpec {
-  const common = analysis.commonTiming?.series ?? [];
-  const control = analysis.systems.find((system) => system.isControl)!;
-  const systems = comparisons(analysis).filter((system) => system.vsControl?.underWay);
-  const values = [...common.map(([, seconds]) => Math.abs(seconds)), ...systems.flatMap((system) => system.vsControl!.underWay!.timing.series.map(([, seconds]) => Math.abs(seconds)))];
-  const extent = niceCeil(Math.max(0.5, percentile(values, 0.999) * 1.1 || 0), 0.5);
-  const regions = [...noDataRegions(analysis), ...rfAnomalyRegions(analysis)];
-  return {
-    id: "uw-timing",
-    title: `Shot Timing Under Way (all systems: line; each system relative to ${control.id}: dots)`,
-    caption: "",
-    ariaLabel: "Along-track offset expressed as seconds of travel: all systems together against a smooth track, and each system against the control.",
-    width: WIDE,
-    height: 230,
-    x: underWayAxis(analysis),
-    y: { label: "Time off (s, + ahead)", min: -extent, max: extent, ticks: numericTicks(-extent, extent, 5, (value) => value.toFixed(1)) },
-    xRegions: regions,
-    series: [
-      ...systems.map((system) => ({ kind: "points" as const, name: `${system.id} to ${control.id}`, color: colorOf(analysis, system.id), radius: 1.3, points: bucketExtremes(underWayAxis(analysis), system.vsControl!.underWay!.timing.series, extent) })),
-      { kind: "line" as const, name: "All systems", color: REPORT_COLORS.navy, width: 1.2, points: timeSeries(common, analysis) },
-    ],
-    hRules: [{ value: 0, color: REPORT_COLORS.ink, dash: [4, 3] }],
-    legend: [{ name: "All systems", color: REPORT_COLORS.navy, style: "line" as const }, ...systems.map((system) => ({ name: system.id, color: colorOf(analysis, system.id), style: "line" as const })), ...regionLegend(analysis, regions)],
   };
 }
 
@@ -515,7 +485,7 @@ export function buildPositioningCharts(analysis: PositioningAnalysis): ChartSpec
     deltaChart(analysis, "e"),
     deltaChart(analysis, "n"),
     deltaChart(analysis, "range"),
-    ...(underWay ? [underWayChart(analysis, "cross"), underWayChart(analysis, "along"), timingChart(analysis)] : []),
+    ...(underWay ? [underWayChart(analysis)] : []),
     controlScatter(analysis, "overview"),
     controlScatter(analysis, "detail"),
     ...analysis.systems.flatMap((system) => systemPanels(analysis, system)),

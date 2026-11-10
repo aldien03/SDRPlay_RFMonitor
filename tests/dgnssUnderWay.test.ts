@@ -137,7 +137,7 @@ describe("DGNSS verification under way", () => {
   });
 
   for (const knots of [3, 4, 5]) {
-    it(`passes agreement and reports shot timing for a vessel always under way at ${knots} kn`, () => {
+    it(`passes a vessel always under way at ${knots} kn without raising the logging interval as a finding`, () => {
       const analysis = analyse({ knots, shots: 1_000, age: sampleAndHold });
       expect(analysis.motion.shots.static.n).toBe(0);
       expect(analysis.agreementFailures).toEqual([]);
@@ -147,16 +147,20 @@ describe("DGNSS verification under way", () => {
         expect(system.vsControl!.agreementMax).toBeLessThan(0.2);
       }
       expect(analysis.commonTiming!.p95Seconds).toBeGreaterThan(0.3);
-      expect(analysis.events.filter((event) => event.kind === "position-timing")).toHaveLength(1);
-      expect(analysis.events.some((event) => /degradation/i.test(event.title))).toBe(false);
+      // Gator's logging interval moves positions along track: method only, never an event, check or lane state.
+      expect(analysis.events).toEqual([]);
+      expect(analysis.systems.every((system) => system.flags.size === 0)).toBe(true);
       const report = model(analysis);
-      expect(report.verdictStatus).toBe("CHECK");
+      expect(report.verdictStatus).toBe("PASS");
+      expect(report.verdict).toBe("All within 0.5 m of DGPS1 · No interference affecting positioning");
       const rows = report.tables.result.rows;
       expect(rows.map((row) => row[0])).not.toContain("CRP agreement, static");
-      expect(rows.find((row) => row[0] === "CRP agreement under way")?.[3]).toBe("PASS");
-      expect(rows.find((row) => row[0] === "Position timing under way")?.[3]).toBe("CHECK");
-      expect(report.verdict).toMatch(/^All within 0\.5 m of DGPS1 · Shot positions up to \d\.\d s off the shot time under way/);
-      expect(report.pages.some((page) => page.title.startsWith("Under Way Agreement"))).toBe(true);
+      expect(rows.map((row) => row[0]).some((check) => /timing/i.test(check))).toBe(false);
+      expect(rows.find((row) => row[0] === "CRP agreement under way")?.slice(3)).toEqual(["PASS", "A3"]);
+      expect(report.pages.find((page) => page.title.startsWith("Under Way Agreement"))?.title).toBe("Under Way Agreement Relative to DGPS1");
+      expect(report.charts.map((chart) => chart.id).filter((id) => id.startsWith("uw-"))).toEqual(["uw-cross"]);
+      expect(report.notes.filter((line) => /every 5 s/.test(line))).toHaveLength(1);
+      expect(JSON.stringify(report.tables).match(/timing/i)).toBeNull();
     });
   }
 
@@ -181,20 +185,20 @@ describe("DGNSS verification under way", () => {
     const analysis = analyse({ knots: 4, shots: 600, age: sampleAndHold, crossOffset: { system: 6, from: 200, to: 260, metres: 0.8 } });
     expect(analysis.agreementFailures).toEqual(["DGPS6"]);
     expect(analysis.systems.find((system) => system.id === "DGPS6")!.vsControl!.underWay!.crossMax).toBeGreaterThan(0.7);
-    expect(analysis.events.some((event) => event.systems.includes("DGPS6") && event.kind !== "position-timing")).toBe(true);
+    expect(analysis.events.some((event) => event.systems.includes("DGPS6"))).toBe(true);
     expect(model(analysis).verdictStatus).toBe("FAIL");
   });
 
   it("keeps a long report under way within a bounded chart size", () => {
-    // 11 h at 5 s with timing flags on most shots: lanes are merged to the
-    // drawable resolution, so the PDF stays inside the worker's memory cap.
+    // 11 h at 5 s: lanes are merged to the drawable resolution and dots to
+    // per-bucket extremes, so the PDF stays inside the worker's memory cap.
     const analysis = analyse({ knots: 4, shots: 8_000, age: sampleAndHold });
     const report = model(analysis);
     const points = (id: string) => (report.charts.find((chart) => chart.id === id)?.series ?? [])
       .reduce((sum, series) => sum + ("points" in series ? series.points.length : 0) + ("upper" in series ? series.upper.length + series.lower.length : 0), 0);
     expect(points("evidence-timeline")).toBeLessThan(25_000);
     expect(points("sys-DGPS5-rf")).toBeLessThan(10_000);
-    expect(points("uw-along")).toBeLessThan(4_000);
+    expect(points("uw-cross")).toBeLessThan(4_000);
     const total = report.charts.reduce((sum, chart) => sum + points(chart.id), 0);
     expect(total).toBeLessThan(150_000);
   });
@@ -206,5 +210,39 @@ describe("DGNSS verification under way", () => {
     const report = model(analysis);
     expect(report.tables.result.rows[0][0]).toBe("CRP agreement with control");
     expect(report.verdictStatus).toBe("PASS");
+  });
+
+  it("refers each result row to the appendix and ends with Appendix A", () => {
+    const report = model(analyse({ knots: 4, shots: 400, age: sampleAndHold }));
+    const result = report.tables.result;
+    expect(result.columns.map((column) => column.title)).toEqual(["Check", "Criterion", "Result", "Status", "See"]);
+    expect(result.statusColumn).toBe(3);
+    expect(Object.fromEntries(result.rows.map((row) => [row[0], row[4]]))).toMatchObject({
+      "CRP agreement under way": "A3",
+      "Interference affecting positioning": "A1",
+      "RF anomalies (rf-monitor)": "A1",
+      "Single-chain anomalies": "–",
+      "Data coverage": "A1, A2",
+    });
+    const appendix = report.pages.at(-1)!;
+    expect(appendix.title).toBe("Appendix A · Evidence and Method");
+    expect(appendix.blocks.map((block) => ("heading" in block ? block.heading : undefined))).toEqual(["A1 · Evidence", "A2 · SBS source files", "A3 · Method"]);
+    const headings = report.pages.flatMap((page) => page.blocks.map((block) => ("heading" in block ? block.heading : undefined)));
+    expect(headings).toContain("Events and Actions (rules: A3)");
+    expect(headings).toContain("Distance from Control Summary (method: A3)");
+  });
+
+  it("writes the report tables as CSV data files", () => {
+    const report = model(analyse({ knots: 4, shots: 400, crossOffset: { system: 6, from: 100, to: 160, metres: 0.8 } }));
+    expect(report.dataFiles.map((file) => file.name)).toEqual(["dgps-statistics.csv", "events.csv", "rf-coverage.csv", "sbs-files.csv"]);
+    const statistics = report.dataFiles[0].content.trimEnd().split("\r\n");
+    expect(statistics[0]).toBe("dgps,receiver,service,antenna,beam,role,shots,static_shots,static_max_m,static_p95_m,under_way_shots,across_track_max_m,across_track_p95_m,along_track_steady_m,sats_median,sats_min,hdop_median,hdop_max,age_median_s,age_max_s,pcalc_codes,flagged_shots");
+    expect(statistics).toHaveLength(7);
+    expect(statistics[0]).not.toMatch(/timing/);
+    const events = report.dataFiles[1].content.trimEnd().split("\r\n");
+    expect(events[0]).toBe("id,from_utc,to_utc,kind,level,title,dgps,indicators,rf_lanes,explanation,action");
+    expect(events.length).toBeGreaterThan(1);
+    expect(events[1]).toMatch(/^E1,\d{4}-\d{2}-\d{2}T/);
+    expect(report.dataFiles[3].content).toContain(`line.sbs,1,`);
   });
 });
