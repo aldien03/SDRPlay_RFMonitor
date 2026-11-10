@@ -271,7 +271,7 @@ export interface MonitoringProfile {
 }
 
 export interface OperationalSettings {
-  schemaVersion: 5;
+  schemaVersion: 6;
   revision: number;
   updatedAt: string;
   siteName: string;
@@ -291,9 +291,120 @@ export interface OperationalSettings {
      */
     revisitObjectiveOverridesMs?: Record<string, number>;
   };
+  /**
+   * Signal-learning rules. Hashed into every baseline fingerprint, so changing
+   * them restarts signal learning. They also decide which visits are learned.
+   */
   detection: DetectionRuleSettings;
+  /**
+   * Alert sensitivity. Never part of a baseline fingerprint: it decides which
+   * observations raise alerts and can change without restarting learning.
+   */
+  alerting: AlertingSettings;
+  /** Identity printed on client incident reports. */
+  reportIdentity: ReportIdentity;
   retention: EvidenceRetentionPolicy;
   liveFocusTimeoutMs: number;
+}
+
+export type AlertPresetId = "conservative" | "standard" | "sensitive" | "very-sensitive";
+export type AlertPolicyChoice = AlertPresetId | "custom";
+
+/** Every value used by the alert classifier. Sigma values are robust z-scores ("× normal variation"). */
+export interface AlertPolicyValues {
+  /** A frequency bin counts as raised at or above this many × its normal variation. */
+  segmentSigma: number;
+  /** Raised runs separated by at most this fraction of the window are joined into one segment. */
+  segmentGapRatio: number;
+  /** Fraction of the analysed window that must be raised for a band-wide alert. */
+  widebandOccupancy: number;
+  /** Middle strength a wider-than-narrow segment must reach for a partial-band alert. */
+  partialSigma: number;
+  /** Widest segment, as a fraction of the window, that still counts as a narrow signal. */
+  narrowbandMaxWidthRatio: number;
+  /** Peak strength a narrow segment must reach. */
+  narrowbandPeakSigma: number;
+  /** Narrow segments must span at least this many analysis bins. */
+  narrowbandMinBins: number;
+  /** Raised checks required inside the voting window (k of n). */
+  alertVisits: number;
+  /** Voting window in checks (n). */
+  alertWindow: number;
+  /** Summed observation time of the raised checks. */
+  minExposureMs: number;
+  /** Middle strength of the whole window for a noise-floor rise. */
+  noiseFloorSigma: number;
+  /** Continuous observation time the noise-floor rise must last. */
+  noiseFloorExposureMs: number;
+  /** Only judge noise-floor rises against an approved (protected) baseline. */
+  noiseFloorRequiresProtected: boolean;
+  /** Single-frame burst threshold; 0 turns burst detection off. */
+  burstSigma: number;
+  /** Consecutive clean checks that clear an alert. */
+  clearVisits: number;
+}
+
+export interface AlertPolicySetting {
+  preset: AlertPolicyChoice;
+  values: AlertPolicyValues;
+}
+
+export interface AlertingSettings {
+  presetTableVersion: 1;
+  default: AlertPolicySetting;
+  /** Optional per-capture-target policy, keyed by catalog capture target id. */
+  targetOverrides: Record<string, AlertPolicySetting>;
+}
+
+export interface AlertPresetDefinition {
+  id: AlertPresetId;
+  label: string;
+  effect: string;
+  values: AlertPolicyValues;
+}
+
+export interface AlertPolicyBound {
+  key: keyof AlertPolicyValues;
+  label: string;
+  unit: "x" | "ratio" | "checks" | "ms" | "bins" | "boolean";
+  min: number;
+  max: number;
+  step: number;
+  /** Zero is allowed as "off" even when below min. */
+  zeroMeansOff?: boolean;
+}
+
+export interface AlertPreviewTarget {
+  targetId: string;
+  label: string;
+  /** Hours actually observed in the bounded preview window. */
+  observedHours: number;
+  /** Alert onsets each preset would have raised over that period. */
+  onsets: Record<AlertPresetId, number>;
+  /** Alert onsets raised by the active policy over the same period. */
+  activeOnsets: number;
+}
+
+export interface AlertPreview {
+  generatedAt: string;
+  windowHours: number;
+  targets: AlertPreviewTarget[];
+}
+
+export interface ReportLogo {
+  sha256: string;
+  mediaType: "image/png" | "image/jpeg";
+  widthPx: number;
+  heightPx: number;
+  bytes: number;
+}
+
+export interface ReportIdentity {
+  companyName?: string;
+  clientName?: string;
+  vesselName?: string;
+  projectReference?: string;
+  logo?: ReportLogo;
 }
 
 export interface DetectionRuleSettings {
@@ -318,6 +429,13 @@ export interface DetectionRuleSettings {
 export interface SettingsRevision {
   settings: OperationalSettings;
   catalog: BandCatalog;
+  /** Server-owned alert sensitivity presets and editing bounds. */
+  alertPresets?: AlertPresetDefinition[];
+  alertPolicyBounds?: AlertPolicyBound[];
+  /** Signal-learning rule defaults for the "Reset to defaults" action. */
+  detectionDefaults?: DetectionRuleSettings;
+  /** How the most recent PUT was applied. */
+  applied?: SettingsApplyMode;
   effectiveBands: BandPreset[];
   configurationHash: string;
   estimatedRevisitMs: number;
@@ -331,6 +449,8 @@ export interface SettingsRevision {
     receiverUrls: string[];
     sampleRateHz: number;
     storageRoot: string;
+    /** Folder that also receives incident images and reports for a group of users; absent when not set up. */
+    shareDirectory?: string;
     bindAddress: string;
   };
 }
@@ -468,6 +588,10 @@ export interface DetectorSpectrumAnalysis {
   /** Receiver overload is an acquisition fault, never an RF-anomaly mask. */
   overload: boolean;
   anomalyKind?: Exclude<DetectionKind, "gnss-energy-anomaly" | "overload">;
+  /** The specific alert rule behind the red ranges. */
+  anomalyDetailKind?: AlertDetailKind;
+  /** Identifies the usual-level arrays this observation was compared with. */
+  referenceRevision?: string;
   anomalyBinRanges: DetectorAnomalyBinRange[];
 }
 
@@ -735,11 +859,14 @@ export interface ChannelMonitorState {
   clearedAt?: string;
   eventId?: string;
   kind?: DetectionKind;
+  detailKind?: AlertDetailKind;
   status?: MonitorStatus;
   evidenceStrength?: RfEvidenceStrength;
   baselineLifecycle?: BaselineLifecycle;
   observationDisposition?: ObservationDisposition;
   unknownReason?: TargetVisitUnknownReason;
+  /** Engineer-only live margins against each alert rule. */
+  gauge?: DetectorGauge;
 }
 
 export interface PanoramaSegment {
@@ -796,7 +923,18 @@ export interface DetectionEvent {
   bandLabel: string;
   affectedBandIds?: string[];
   affectedLabel?: string;
+  /** The whole analysed window that was checked (not where the disturbance was). */
   affectedRangeHz: [number, number];
+  /** Where the disturbance actually was: merged raised frequency ranges, at most 16. */
+  disturbedRangesHz?: Array<[number, number]>;
+  /** The specific alert rule; `kind` keeps the legacy GNSS-collapsed value. */
+  detailKind?: AlertDetailKind;
+  /** Immutable record of why the alert was raised. */
+  trigger?: AlertTrigger;
+  /** Largest values seen while the incident was open. */
+  peak?: IncidentPeak;
+  /** Bounded, coded incident history. */
+  timeline?: IncidentTimelineEntry[];
   observed: string;
   recommendedAction: string;
   startedAt: string;
@@ -805,6 +943,8 @@ export interface DetectionEvent {
   clearedAt?: string;
   endedAt?: string;
   endReason?: string;
+  /** Set when history is read: a saved incident image exists. Never stored with the incident. */
+  figureAvailable?: boolean;
   acknowledgedAt?: string;
   notes: Array<{ id: string; timestamp: string; text: string }>;
   metrics: SignalMetricSample;
@@ -914,6 +1054,17 @@ export interface EvidenceArchivePage {
   sessions: EvidenceArchiveSession[];
 }
 
+/** Incidents drawer shortcut: newest incidents and the count still to review. */
+export interface RecentIncidentsPage {
+  generatedAt: string;
+  incidents: DetectionEvent[];
+  /** Field incidents from the last `reviewWindowHours` not yet marked reviewed. */
+  toReview: number;
+  reviewWindowHours: number;
+  /** Incidents this process still follows (notes and review go to the live record). */
+  liveIds: string[];
+}
+
 export interface EvidenceArchiveEventPage {
   generatedAt: string;
   sessionId: string;
@@ -952,6 +1103,10 @@ export interface EvidenceRetentionPolicy {
   storageMaxBytes: number;
   minimumFreeBytes: number;
   maintenanceIntervalMs: number;
+  /** Save a time-stamped picture of each incident automatically. Absent means on. */
+  incidentFiguresEnabled?: boolean;
+  /** How long saved incident pictures are kept before they are deleted. Absent means 30 days. */
+  incidentFigureRetentionMs?: number;
 }
 
 export interface StorageMaintenanceStatus extends EvidenceRetentionPolicy {
@@ -983,6 +1138,8 @@ export interface EvidenceManifest {
   evidenceGap?: boolean;
   /** Added in manifest v2; absent from legacy archives. */
   runtimeIdentity?: RuntimeIdentity;
+  /** What kind of package this manifest describes; absent on sessions and older exports. */
+  packageType?: "incident-evidence" | "session";
   disclaimer: string;
 }
 
@@ -1628,3 +1785,126 @@ export interface HealthSnapshotV2 {
     baselines: BaselineDescriptor[];
   };
 }
+
+export type AlertDetailKind = "wideband" | "partial-band" | "narrowband" | "noise-floor" | "burst" | "overload";
+export type AlertRuleId = "wideband" | "partial-band" | "narrowband" | "noise-floor" | "burst" | "persistence";
+export type AlertRuleUnit = "x" | "ratio" | "checks" | "ms";
+
+export interface AlertRuleComparison {
+  rule: AlertRuleId;
+  /** Short operator label, e.g. "Raised share of window". */
+  label: string;
+  measured: number;
+  threshold: number;
+  unit: AlertRuleUnit;
+  met: boolean;
+}
+
+export interface AlertTrigger {
+  schemaVersion: 1;
+  classifierVersion: string;
+  detailKind: AlertDetailKind;
+  firedAt: string;
+  observationId: string;
+  policy: {
+    choice: AlertPolicyChoice;
+    source: "default" | "window";
+    values: AlertPolicyValues;
+    hash: string;
+  };
+  reference: {
+    lifecycle: BaselineLifecycle;
+    /** "approved" only for a protected baseline; otherwise a local reference. */
+    kind: "approved" | "local";
+    fingerprintId: string;
+    generationId: string;
+    revision?: string;
+  };
+  measured: {
+    peakZ: number;
+    medianZ: number;
+    occupancyRatio: number;
+    widestSegmentRatio: number;
+    widestSegmentMedianZ: number;
+    peakFrequencyHz?: number;
+    peakLevel: number;
+    usualLevelAtPeak: number;
+    levelAboveUsual: number;
+    burstPeakZ?: number;
+  };
+  rules: AlertRuleComparison[];
+  persistence: {
+    votes: number;
+    window: number;
+    required: number;
+    exposureMs: number;
+    requiredExposureMs: number;
+  };
+  disturbedRangesHz: Array<[number, number]>;
+  analyzedRangeHz: [number, number];
+  binWidthHz: number;
+}
+
+export interface IncidentPeak {
+  maxPeakZ: number;
+  maxPeakZAt: string;
+  maxOccupancyRatio: number;
+  maxWidestSegmentRatio: number;
+  maxLevelAboveUsual: number;
+  strongestFrequencyHz?: number;
+  updatedAt: string;
+}
+
+export type IncidentTimelineCode =
+  | "first-seen"
+  | "alert"
+  | "kind-escalated"
+  | "recovering"
+  | "returned"
+  | "cleared"
+  | "ended"
+  | "acknowledged"
+  | "note"
+  | "sensitivity-changed";
+
+export interface IncidentTimelineEntry {
+  at: string;
+  code: IncidentTimelineCode;
+  /** Short plain-language detail, at most 200 characters. */
+  detail?: string;
+}
+
+export interface DetectorGauge {
+  observedAt: string;
+  preset: AlertPolicyChoice;
+  rules: AlertRuleComparison[];
+  votes: number;
+  required: number;
+  window: number;
+  exposureMs: number;
+  requiredExposureMs: number;
+  floorExposureMs: number;
+  floorRequiredMs: number;
+}
+
+/** Exactly what the detector compared when an alert was raised. Hex keeps evidence sanitising lossless. */
+export interface AlertTriggerSnapshot {
+  schemaVersion: 1;
+  eventId: string;
+  dataDomain: DataDomain;
+  targetId: string;
+  observationId: string;
+  observedAt: string;
+  detailKind: AlertDetailKind;
+  policyHash: string;
+  analyzedRangeHz: [number, number];
+  sourceBinCount: number;
+  binCount: number;
+  reduction: "native" | "peak-preserving";
+  levelsHex: string;
+  usualHex: string;
+  alertLevelHex: string;
+  anomalyBinRanges: DetectorAnomalyBinRange[];
+}
+
+export type SettingsApplyMode = "none" | "live" | "rf-restart" | "learning-restart";

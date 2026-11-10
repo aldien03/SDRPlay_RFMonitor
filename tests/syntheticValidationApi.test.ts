@@ -1,6 +1,6 @@
 import { once } from "node:events";
 import { createServer } from "node:http";
-import { mkdtemp, rm } from "node:fs/promises";
+import { copyFile, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -32,6 +32,9 @@ async function unusedPort(): Promise<number> {
 async function startServer(simulation: "on" | "off", exercises = false): Promise<{ port: number; origin: string }> {
   const root = await mkdtemp(path.join(tmpdir(), "rf-monitor-validation-api-"));
   temporaryRoots.push(root);
+  // The server may migrate or rewrite its profile; never let it touch the repository copy.
+  const operationalPath = path.join(root, "operational.json");
+  await copyFile(path.join(repositoryRoot, "config/operational.example.json"), operationalPath);
   const port = await unusedPort();
   const child = spawn(path.join(repositoryRoot, "node_modules/.bin/tsx"), [path.join(repositoryRoot, "src/server/index.ts")], {
     cwd: root,
@@ -44,7 +47,7 @@ async function startServer(simulation: "on" | "off", exercises = false): Promise
       RF_MONITOR_CATALOG_FILE: path.join(repositoryRoot, "config/band-catalog.example.json"),
       // Live-playback coverage in this test deliberately targets all four
       // Tier-1 windows; production defaults remain one-target Continuous Watch.
-      RF_MONITOR_OPERATIONAL_FILE: path.join(repositoryRoot, "config/operational.example.json"),
+      RF_MONITOR_OPERATIONAL_FILE: operationalPath,
       SDRCONNECT_URL: "ws://127.0.0.1:9/",
       RF_MONITOR_RECOVERY_REQUEST: path.join(root, "recover-sdrconnect"),
     },

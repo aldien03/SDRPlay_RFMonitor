@@ -38,15 +38,16 @@
     "test:sites": "node --test tests/sites-worker.test.mjs"
   },
   "dependencies": {
-    "archiver": "^7.0.1",
+    "archiver": "^8.0.0",
     "express": "^5.1.0",
     "lucide-react": "^0.468.0",
+    "pdf-lib": "1.17.1",
     "react": "19.2.0",
     "react-dom": "19.2.0",
     "ws": "^8.18.3"
   },
   "devDependencies": {
-    "@types/archiver": "^6.0.3",
+    "@types/archiver": "^8.0.0",
     "@types/express": "^5.0.3",
     "@types/node": "^22.10.5",
     "@types/react": "^19.0.3",
@@ -62,5 +63,8 @@
     "typescript": "^5.7.2",
     "vite": "6.4.3",
     "vitest": "4.1.11"
+  },
+  "overrides": {
+    "minimatch": "^11.0.5"
   }
 }

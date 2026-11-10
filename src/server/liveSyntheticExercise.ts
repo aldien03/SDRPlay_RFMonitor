@@ -6,6 +6,7 @@ import {
   DetectionEngine,
   type DetectionResult,
   type DetectionThresholds,
+  type ResolvedAlertPolicyWithHash,
 } from "../shared/detection";
 import type {
   BandPreset,
@@ -61,6 +62,8 @@ export interface LiveSyntheticAnalysis {
 export interface LiveSyntheticExerciseOptions {
   scenarioId: string;
   thresholds: DetectionThresholds;
+  /** The operator's alert sensitivity for the exercised window, so a test behaves like a real alert. */
+  alertPolicy?: ResolvedAlertPolicyWithHash;
   /** Exact enabled physical target exercised through the normal scheduler. */
   target?: PhysicalCaptureTarget;
   /** Enabled logical labels attributed to the physical target. */
@@ -272,7 +275,10 @@ export class LiveSyntheticExercise {
   private latestElapsedMs = 0;
   private latestTargetState?: ChannelMonitorState;
 
+  private readonly alertPolicy?: ResolvedAlertPolicyWithHash;
+
   constructor(options: LiveSyntheticExerciseOptions) {
+    this.alertPolicy = options.alertPolicy;
     const targetId = options.target?.id ?? LIVE_SYNTHETIC_TARGET_ID;
     const scenario = suite(targetId, options.target?.revisitObjectiveMs).find((candidate) => candidate.id === options.scenarioId);
     if (!scenario) throw new Error("Unknown synthetic exercise scenario");
@@ -382,6 +388,7 @@ export class LiveSyntheticExercise {
     }
     const result = this.detector.analyzeObservation(outcome.observation, this.targetBand, {
       freezeTraining: overload || configurationOffset !== 0 || this.alertObserved,
+      ...(this.alertPolicy ? { alertPolicy: this.alertPolicy } : {}),
     });
     if (result.event) this.alertObserved = true;
     if (result.disposition === "unknown" && configurationOffset !== 0) this.noteUnknown();

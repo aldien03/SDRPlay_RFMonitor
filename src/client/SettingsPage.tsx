@@ -17,9 +17,10 @@ import { useEffect, useMemo, useState } from "react";
 import { estimateRevisitMs } from "../shared/bands";
 import { captureWindowNaming } from "../shared/monitorGroups";
 import { presentOperatorSummary } from "../shared/operatorSummary";
-import { applyMonitoringMission, compileEffectiveBands, continuousWatchTargetId, evaluateSettingsFeasibility, monitoringMissionForSettings, ROBUST_DETECTION_DEFAULTS, selectedMonitoringTargetIds } from "../shared/settings";
+import { applyMonitoringMission, changedFieldPaths, classifySettingsChange, compileEffectiveBands, continuousWatchTargetId, evaluateSettingsFeasibility, incidentFigurePolicy, monitoringMissionForSettings, ROBUST_DETECTION_DEFAULTS, selectedMonitoringTargetIds } from "../shared/settings";
+import { AlertRulesEditor, AlertSensitivitySection, ReportIdentitySection } from "./AlertSensitivitySettings";
 import { scheduleCapacityCopy, windowSchedule, windowScheduleCopy } from "./schedulePresentation";
-import type { BandCatalog, BandPreset, BaselineApprovalEligibility, BaselineDescriptor, ChannelMonitorState, MonitorSnapshot, MonitoringMission, OperationalSettings, PhysicalCaptureTarget, SettingsRevision } from "../shared/types";
+import type { AlertPreview, BandCatalog, BandPreset, BaselineApprovalEligibility, BaselineDescriptor, ChannelMonitorState, MonitorSnapshot, MonitoringMission, OperationalSettings, PhysicalCaptureTarget, ReportLogo, SettingsApplyMode, SettingsRevision } from "../shared/types";
 import { formatBytes, formatFrequency, formatRange } from "./format";
 import {
   buildSignalLearningPresentation,
@@ -39,6 +40,7 @@ import {
   type SoftwareRestartResponse,
 } from "./useMonitor";
 import { DialogShell } from "./DialogShell";
+import { DgnssSettings } from "./DgnssSettings";
 import { SurfaceAlertBanner } from "./SurfaceAlertBanner";
 
 export type SettingsTab = "monitoring" | "health" | "recording" | "site" | "advanced" | "learning";
@@ -53,15 +55,19 @@ interface SettingsPageProps {
   getSettings: () => Promise<SettingsRevision>;
   unlockSettings: (password: string) => Promise<SettingsRevision>;
   lockSettings: () => Promise<unknown>;
-  applySettings: (settings: OperationalSettings, expectedRevision: number) => Promise<SettingsRevision>;
+  applySettings: (settings: OperationalSettings, expectedRevision: number, options?: { confirmSignalLearningRestart?: boolean }) => Promise<SettingsRevision>;
+  getAlertPreview?: () => Promise<AlertPreview>;
+  uploadReportLogo?: (file: File) => Promise<ReportLogo>;
   approveBaseline: (baseline: BaselineDescriptor, expectedRevision: number) => Promise<BaselineApprovalResponse>;
-  restartBaseline: (baseline: BaselineDescriptor, expectedRevision: number) => Promise<BaselineRestartResponse>;
+  restartBaseline: (baseline: BaselineDescriptor, expectedRevision: number, options?: { endActiveObservation?: boolean }) => Promise<BaselineRestartResponse>;
   clearTestData: (expectedRevision: number) => Promise<ClearTestDataResponse>;
   deleteRecordings: (expectedRevision: number, dataDomain: MonitorSnapshot["dataDomain"]) => Promise<DeleteRecordingsResponse>;
   restartSoftware: (expectedRevision: number) => Promise<SoftwareRestartResponse>;
   startFocus: (bandId: string, centerHz: number | undefined, durationMs: number) => Promise<unknown>;
   stopFocus: () => Promise<unknown>;
   renderSystemHealth?: (controls: { openTab: (tab: SettingsTab) => void }) => React.ReactNode;
+  /** Leave Settings for the DGNSS reports drawer. */
+  onOpenDgnssReports?: () => void;
 }
 
 export type MaintenanceAction = "clear-test-data" | "restart-learning" | "delete-recordings" | "restart-software";
@@ -73,7 +79,12 @@ export const MAINTENANCE_CONFIRMATION: Record<MaintenanceAction, string> = {
   "restart-software": "RESTART SOFTWARE",
 };
 
-export function maintenancePresentation(action: MaintenanceAction, dataDomain: MonitorSnapshot["dataDomain"]): { title: string; changes: string; retained: string; button: string } {
+export function maintenancePresentation(
+  action: MaintenanceAction,
+  dataDomain: MonitorSnapshot["dataDomain"],
+  /** Labels of frequencies with an alert or running check that the restart will end. */
+  activeWindows: readonly string[] = [],
+): { title: string; changes: string; retained: string; button: string } {
   if (action === "clear-test-data") return {
     title: "Clear test data?",
     changes: "Deletes test recordings, test incidents and test signal learning.",
@@ -82,8 +93,8 @@ export function maintenancePresentation(action: MaintenanceAction, dataDomain: M
   };
   if (action === "restart-learning") return {
     title: "Restart signal learning?",
-    changes: `Starts a new learning period for every active ${dataDomain === "field" ? "Field" : "Test"} frequency that has learned data. Frequencies with a check still running are skipped.`,
-    retained: "Recordings, incidents, saved learning records and settings are kept.",
+    changes: `Starts a new learning period for every active ${dataDomain === "field" ? "Field" : "Test"} frequency that has learned data. Alerts are Low evidence until learning is approved.${activeWindows.length ? ` Active alerts on ${activeWindows.join(", ")} will be ended.` : ""}`,
+    retained: `Recordings, saved learning records and settings are kept.${activeWindows.length ? " Ended incidents stay in Evidence History." : " Incidents are kept."}`,
     button: "Restart learning",
   };
   if (action === "delete-recordings") return {
@@ -98,6 +109,25 @@ export function maintenancePresentation(action: MaintenanceAction, dataDomain: M
     retained: "Recordings, signal learning and settings are kept.",
     button: "Restart software",
   };
+}
+
+/** What Apply will do, said before the operator commits. */
+export function applyImpactCopy(mode: SettingsApplyMode): string {
+  switch (mode) {
+    case "live": return "Applies now. Recording and open incidents continue.";
+    case "rf-restart": return "Retunes the receiver. Open incidents end and a new recording session starts.";
+    case "learning-restart": return "Restarts signal learning for every window. Open incidents end.";
+    default: return "";
+  }
+}
+
+export function appliedToastCopy(mode: SettingsApplyMode | undefined): string {
+  switch (mode) {
+    case "live": return "Saved and applied. Recording and open incidents continue.";
+    case "rf-restart": return "Saved. The receiver was retuned and a new recording session started.";
+    case "learning-restart": return "Saved. Signal learning restarted for every window.";
+    default: return "Saved.";
+  }
 }
 
 const TAB_ITEMS: Array<{ id: SettingsTab; label: string; icon: React.ReactNode }> = [
@@ -184,6 +214,7 @@ export function SettingsPage(props: SettingsPageProps) {
   const [pendingMaintenance, setPendingMaintenance] = useState<MaintenanceAction>();
   const [maintenanceConfirmation, setMaintenanceConfirmation] = useState("");
   const [maintenanceBusy, setMaintenanceBusy] = useState(false);
+  const [learningConfirmOpen, setLearningConfirmOpen] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -199,6 +230,7 @@ export function SettingsPage(props: SettingsPageProps) {
 
   const dirty = Boolean(response && draft && JSON.stringify(response.settings) !== JSON.stringify(draft));
   const unlocked = Boolean(response?.admin.unlocked);
+  const applyMode: SettingsApplyMode = response && draft && dirty ? classifySettingsChange(changedFieldPaths(response.settings, draft)) : "none";
 
   useEffect(() => {
     if (!dirty) return;
@@ -232,21 +264,29 @@ export function SettingsPage(props: SettingsPageProps) {
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [closeDialogOpen, maintenanceBusy, pendingBaselineRestart, pendingMaintenance]);
 
-  const apply = async () => {
+  const apply = async (confirmSignalLearningRestart = false) => {
     if (!response || !draft) return;
+    if (applyMode === "learning-restart" && !confirmSignalLearningRestart) {
+      setLearningConfirmOpen(true);
+      return;
+    }
+    setLearningConfirmOpen(false);
     setSaving(true);
     setError(undefined);
     setFieldErrors({});
     try {
-      const next = await props.applySettings(draft, response.settings.revision);
+      const next = await props.applySettings(draft, response.settings.revision, confirmSignalLearningRestart ? { confirmSignalLearningRestart: true } : undefined);
       setResponse(next);
       setDraft(cloneSettings(next.settings));
       setConflict(undefined);
-      props.onToast("Changes saved. RF recording continues.");
+      props.onToast(appliedToastCopy(next.applied));
     } catch (reason) {
       if (reason instanceof ApiError) {
         setFieldErrors(reason.fields ?? {});
-        if (reason.status === 409) {
+        if (reason.status === 428) {
+          setLearningConfirmOpen(true);
+          setError(undefined);
+        } else if (reason.status === 409) {
           try {
             const latest = await props.getSettings();
             setConflict(latest);
@@ -313,7 +353,9 @@ export function SettingsPage(props: SettingsPageProps) {
     setError(undefined);
     try {
       const restartResult = action === "restart"
-        ? await props.restartBaseline(baseline, response.settings.revision)
+        ? await props.restartBaseline(baseline, response.settings.revision, {
+          endActiveObservation: Boolean(restartBlockedReason(props.snapshot.targetStates.find((state) => state.targetId === baseline.targetId))),
+        })
         : undefined;
       if (action === "approve") await props.approveBaseline(baseline, response.settings.revision);
       const recoveryRequired = restartResult ? baselineRestartRequiresRecovery(restartResult) : false;
@@ -353,22 +395,21 @@ export function SettingsPage(props: SettingsPageProps) {
         props.onToast(result.result.previousDataPresent ? "Test data cleared." : "No test data to clear.");
       } else if (pendingMaintenance === "restart-learning") {
         if (!restartableBaselines.length) throw new Error("No learned data to restart yet.");
-        // Split up front so a frequency that is mid-observation never even
-        // gets attempted, and later, ready frequencies are not skipped for it.
-        const ready = restartableBaselines.filter((baseline) => !restartBlockedReason(props.snapshot.targetStates.find((state) => state.targetId === baseline.targetId)));
-        const blocked = restartableBaselines.filter((baseline) => !ready.includes(baseline));
         const total = restartableBaselines.length;
-        if (!ready.length) throw new Error("No frequency is ready to restart. Wait for the current checks to clear.");
         const windowLabel = (targetId: string) => learningTargets.find((target) => target.targetId === targetId)?.label ?? friendlyTargetId(targetId);
         // The server allows one journalled restart at a time, so walk the
         // targets in order and report exactly how far the batch got.
         let current = response;
         let restarted = 0;
         const failures: string[] = [];
-        for (const baseline of ready) {
+        for (const baseline of restartableBaselines) {
           let result: BaselineRestartResponse;
           try {
-            result = await props.restartBaseline(baseline, current.settings.revision);
+            // The dialog listed every frequency with an active alert; confirming it
+            // authorises ending exactly those observations.
+            result = await props.restartBaseline(baseline, current.settings.revision, {
+              endActiveObservation: Boolean(restartBlockedReason(props.snapshot.targetStates.find((state) => state.targetId === baseline.targetId))),
+            });
           } catch (reason) {
             // Any other individual failure is recorded, and the loop carries on.
             failures.push(`${windowLabel(baseline.targetId)} — ${reason instanceof Error ? reason.message : String(reason)}`);
@@ -387,11 +428,10 @@ export function SettingsPage(props: SettingsPageProps) {
         }
         setResponse(current);
         if (!dirty) setDraft(cloneSettings(current.settings));
-        if (restarted === total && !blocked.length && !failures.length) {
+        if (restarted === total && !failures.length) {
           props.onToast(`Signal learning restarted for ${restarted} ${restarted === 1 ? "frequency" : "frequencies"}.`);
         } else {
           const parts = [`Restarted ${restarted} of ${total}.`];
-          if (blocked.length) parts.push(`Not ready: ${blocked.map((baseline) => windowLabel(baseline.targetId)).join(", ")}.`);
           if (failures.length) parts.push(`Failed: ${failures.join("; ")}.`);
           throw new Error(parts.join(" "));
         }
@@ -459,7 +499,12 @@ export function SettingsPage(props: SettingsPageProps) {
     window.requestAnimationFrame(() => document.getElementById(`settings-tab-${nextTab}`)?.focus());
   };
 
-  const maintenanceCopy = pendingMaintenance ? maintenancePresentation(pendingMaintenance, props.snapshot.dataDomain) : undefined;
+  const windowLabelFor = (targetId: string) => learningTargets.find((target) => target.targetId === targetId)?.label
+    ?? response?.catalog.captureTargets.find((target) => target.id === targetId)?.label
+    ?? friendlyTargetId(targetId);
+  const isRestartBlocked = (targetId: string) => Boolean(restartBlockedReason(props.snapshot.targetStates.find((state) => state.targetId === targetId)));
+  const activeRestartWindows = restartableBaselines.filter((baseline) => isRestartBlocked(baseline.targetId)).map((baseline) => windowLabelFor(baseline.targetId));
+  const maintenanceCopy = pendingMaintenance ? maintenancePresentation(pendingMaintenance, props.snapshot.dataDomain, activeRestartWindows) : undefined;
 
   return (
     <div
@@ -503,11 +548,11 @@ export function SettingsPage(props: SettingsPageProps) {
             <>
               {error ? <div className="settings-error" role="alert">{error}</div> : null}
               <div id={`settings-panel-${tab}`} role="tabpanel" aria-labelledby={`settings-tab-${tab}`} tabIndex={0}>
-                {tab === "monitoring" ? <MonitoringSettings response={response} draft={draft} current={response.settings} setDraft={setDraft} errors={fieldErrors} disabled={!unlocked} /> : null}
+                {tab === "monitoring" ? <MonitoringSettings response={response} draft={draft} current={response.settings} setDraft={setDraft} errors={fieldErrors} disabled={!unlocked} getAlertPreview={props.getAlertPreview} /> : null}
                 {tab === "health" ? (props.renderSystemHealth?.({ openTab: setTab }) ?? <SystemHealthPlaceholder />) : null}
                 {tab === "recording" ? <EvidenceSettings draft={draft} setDraft={setDraft} response={response} errors={fieldErrors} disabled={!unlocked} dataDomain={props.snapshot.dataDomain} onMaintenance={openMaintenance} /> : null}
                 {tab === "learning" ? <SignalLearningSettings response={response} unlocked={unlocked} targetStates={props.snapshot.targetStates} onMaintenance={openMaintenance} onBaselineAction={async (action, baseline) => { if (action === "restart") setPendingBaselineRestart(baseline); else await updateBaseline(action, baseline); }} onOpenTab={setTab} /> : null}
-                {tab === "site" ? <SiteSettings draft={draft} setDraft={setDraft} response={response} errors={fieldErrors} disabled={!unlocked} /> : null}
+                {tab === "site" ? <SiteSettings draft={draft} setDraft={setDraft} response={response} errors={fieldErrors} disabled={!unlocked} uploadLogo={props.uploadReportLogo} onToast={props.onToast} onOpenDgnssReports={props.onOpenDgnssReports} /> : null}
                 {tab === "advanced" ? <AdvancedSettings response={response} draft={draft} setDraft={setDraft} errors={fieldErrors} unlocked={unlocked} onMaintenance={openMaintenance} /> : null}
               </div>
             </>
@@ -517,12 +562,21 @@ export function SettingsPage(props: SettingsPageProps) {
 
       {response && draft && (unlocked || dirty) && (tab !== "health" || dirty) ? (
         <footer className="settings-footer">
-          <span>{dirty ? "Unsaved changes" : unlocked ? "No changes" : "View only"}</span>
+          <span>{dirty ? "Unsaved changes" : unlocked ? "No changes" : "View only"}{dirty && applyImpactCopy(applyMode) ? <small className="apply-impact"> · {applyImpactCopy(applyMode)}</small> : null}</span>
           <div>
             <button className="button secondary" type="button" disabled={!dirty || saving} onClick={() => { setDraft(cloneSettings(response.settings)); setFieldErrors({}); }}><RotateCcw size={17} /> Discard</button>
             <button className="button primary" type="button" disabled={!dirty || !unlocked || saving} onClick={() => void apply()}><Save size={17} /> {saving ? "Applying..." : "Apply changes"}</button>
           </div>
         </footer>
+      ) : null}
+
+      {learningConfirmOpen ? (
+        <DialogShell backdropClassName="settings-admin-backdrop" dialogClassName="settings-admin-dialog" labelledBy="learning-confirm-title" describedBy="learning-confirm-description" onClose={() => setLearningConfirmOpen(false)}>
+          <header><strong id="learning-confirm-title">Restart signal learning?</strong><button type="button" onClick={() => setLearningConfirmOpen(false)} aria-label="Close"><X size={19} /></button></header>
+          <p id="learning-confirm-description">Signal-learning rules are part of every learned baseline. Saving restarts learning for every window: alerts stay Low evidence until a new baseline is approved, and open incidents end.</p>
+          <p className="protected-action-hint">To change how easily alerts are raised without restarting learning, use Monitoring › Alert sensitivity instead.</p>
+          <div className="settings-admin-actions"><button className="button secondary" type="button" onClick={() => setLearningConfirmOpen(false)}>Cancel</button><button className="button danger" type="button" disabled={saving} onClick={() => void apply(true)}>Restart learning and save</button></div>
+        </DialogShell>
       ) : null}
 
       {adminDialogOpen && response ? (
@@ -576,7 +630,7 @@ export function SettingsPage(props: SettingsPageProps) {
       {pendingBaselineRestart && response ? (
         <DialogShell backdropClassName="settings-admin-backdrop" dialogClassName="settings-admin-dialog settings-confirm-dialog" labelledBy="restart-baseline-title" describedBy="restart-baseline-description" onClose={() => setPendingBaselineRestart(undefined)}>
           <header><div><RotateCcw size={20} aria-hidden="true" /><strong id="restart-baseline-title">Start learning again?</strong></div><button className="icon-button" type="button" onClick={() => setPendingBaselineRestart(undefined)} aria-label="Cancel signal learning restart"><X size={20} aria-hidden="true" /></button></header>
-          <div className="settings-dialog-body"><p id="restart-baseline-description">Start a new learning period for {learningTargets.find((target) => target.targetId === pendingBaselineRestart.targetId)?.label ?? response.catalog.captureTargets.find((target) => target.id === pendingBaselineRestart.targetId)?.label ?? friendlyTargetId(pendingBaselineRestart.targetId)}. The approved normal level and recorded evidence are kept.</p><div className="settings-admin-actions"><button className="button secondary" type="button" autoFocus onClick={() => setPendingBaselineRestart(undefined)}>Cancel</button><button className="button danger" type="button" onClick={() => { const baseline = pendingBaselineRestart; setPendingBaselineRestart(undefined); void updateBaseline("restart", baseline); }}>Start learning</button></div></div>
+          <div className="settings-dialog-body"><p id="restart-baseline-description">Start a new learning period for {learningTargets.find((target) => target.targetId === pendingBaselineRestart.targetId)?.label ?? response.catalog.captureTargets.find((target) => target.id === pendingBaselineRestart.targetId)?.label ?? friendlyTargetId(pendingBaselineRestart.targetId)}. The approved normal level and recorded evidence are kept. Alerts are Low evidence until learning is approved.</p>{isRestartBlocked(pendingBaselineRestart.targetId) ? <p role="note"><strong>Alert active.</strong> Starting again ends it. The incident stays in Evidence History.</p> : null}<div className="settings-admin-actions"><button className="button secondary" type="button" autoFocus onClick={() => setPendingBaselineRestart(undefined)}>Cancel</button><button className="button danger" type="button" onClick={() => { const baseline = pendingBaselineRestart; setPendingBaselineRestart(undefined); void updateBaseline("restart", baseline); }}>Start learning</button></div></div>
         </DialogShell>
       ) : null}
 
@@ -605,13 +659,14 @@ function SystemHealthPlaceholder() {
   );
 }
 
-function MonitoringSettings({ response, draft, current, setDraft, errors, disabled }: {
+function MonitoringSettings({ response, draft, current, setDraft, errors, disabled, getAlertPreview }: {
   response: SettingsRevision;
   draft: OperationalSettings;
   current: OperationalSettings;
   setDraft: (value: OperationalSettings) => void;
   errors: Record<string, string>;
   disabled: boolean;
+  getAlertPreview?: () => Promise<AlertPreview>;
 }) {
   const [expanded, setExpanded] = useState<Record<string, boolean>>({ startrack: true, "4dx": false });
   const [previewMission, setPreviewMission] = useState<Exclude<MonitoringMission, "custom">>();
@@ -778,6 +833,7 @@ function MonitoringSettings({ response, draft, current, setDraft, errors, disabl
           </ServiceEditor>
         </div>
       ) : null}
+      <AlertSensitivitySection response={response} draft={draft} setDraft={setDraft} disabled={disabled} errors={errors} getAlertPreview={getAlertPreview} />
     </section>
   );
 }
@@ -917,7 +973,7 @@ function StarTrackFrequencies({ band, values, error, disabled, onChange }: { ban
   );
 }
 
-function SiteSettings({ draft, setDraft, response, errors, disabled }: { draft: OperationalSettings; setDraft: (value: OperationalSettings) => void; response: SettingsRevision; errors: Record<string, string>; disabled: boolean }) {
+function SiteSettings({ draft, setDraft, response, errors, disabled, uploadLogo, onToast, onOpenDgnssReports }: { draft: OperationalSettings; setDraft: (value: OperationalSettings) => void; response: SettingsRevision; errors: Record<string, string>; disabled: boolean; uploadLogo?: (file: File) => Promise<ReportLogo>; onToast: (message: string) => void; onOpenDgnssReports?: () => void }) {
   const update = <K extends keyof OperationalSettings>(key: K, value: OperationalSettings[K]) => setDraft({ ...draft, [key]: value });
   return (
     <section className="settings-section narrow-settings" aria-labelledby="site-settings-title">
@@ -927,6 +983,8 @@ function SiteSettings({ draft, setDraft, response, errors, disabled }: { draft: 
       <TextField disabled={disabled} label="Deployment ID" value={draft.deploymentId ?? ""} maxLength={80} error={errors.deploymentId} onChange={(value) => update("deploymentId", value || undefined)} />
       <label className="form-field"><span>Display time zone</span><select disabled={disabled} value={draft.displayTimeZone} onChange={(event) => update("displayTimeZone", event.target.value)}>{timeZones(draft.displayTimeZone).map((zone) => <option key={zone} value={zone}>{zone}</option>)}</select>{errors.displayTimeZone ? <FieldError text={errors.displayTimeZone} /> : null}</label>
       <div className="read-only-grid"><span>Evidence timestamp</span><strong>UTC ISO-8601</strong><span>Dashboard endpoint</span><strong>{location.origin}</strong><span>SDRconnect</span><strong>{response.infrastructure.receiverUrls.join(", ")}</strong></div>
+      <ReportIdentitySection draft={draft} setDraft={setDraft} disabled={disabled} errors={errors} uploadLogo={uploadLogo} onToast={onToast} />
+      <DgnssSettings unlocked={!disabled} onToast={onToast} onOpenReports={onOpenDgnssReports} />
     </section>
   );
 }
@@ -944,8 +1002,14 @@ function EvidenceSettings({ draft, setDraft, response, errors, disabled, dataDom
         <NumberField disabled={disabled} label="Close each session after" suffix="hours" min={1} max={24} value={hours(draft.retention.sessionMaxMs)} onChange={(value) => update("sessionMaxMs", value * 3_600_000)} />
         <NumberField disabled={disabled} label="Maximum session size" suffix="GB" min={0.1} max={2} step={0.1} value={gib(draft.retention.sessionMaxBytes)} onChange={(value) => update("sessionMaxBytes", Math.round(value * 1_073_741_824))} />
       </div>
+      <h3 className="settings-subheading">Incident images</h3>
+      <div className="settings-form-grid">
+<div className="form-field"><span>Save an image of each incident</span>        <label className="switch-control"><input type="checkbox" role="switch" aria-label="Save an image of each incident" disabled={disabled} checked={incidentFigurePolicy(draft.retention).enabled} onChange={(event) => setDraft({ ...draft, retention: { ...draft.retention, incidentFiguresEnabled: event.target.checked } })} /><span aria-hidden="true" /><b className="service-state">{incidentFigurePolicy(draft.retention).enabled ? "Save images" : "Off"}</b></label></div>
+        <NumberField disabled={disabled || !incidentFigurePolicy(draft.retention).enabled} label="Delete images after" suffix="days" min={1} max={365} value={days(incidentFigurePolicy(draft.retention).retentionMs)} onChange={(value) => update("incidentFigureRetentionMs", value * 86_400_000)} />
+      </div>
+      <p className="protected-action-hint">Each image is time stamped and saved when an incident starts, while it lasts, and when it ends. Older images are deleted automatically.</p>
       {Object.entries(errors).filter(([key]) => key.startsWith("retention.")).map(([key, text]) => <FieldError key={key} text={text} />)}
-      <div className="read-only-grid"><span>Archive path</span><strong>{response.infrastructure.storageRoot}</strong><span>Current policy</span><strong>{formatBytes(response.settings.retention.storageMaxBytes)} maximum</strong></div>
+      <div className="read-only-grid"><span>Archive path</span><strong>{response.infrastructure.storageRoot}</strong><span>Current policy</span><strong>{formatBytes(response.settings.retention.storageMaxBytes)} maximum</strong><span>Image share folder</span><strong>{response.infrastructure.shareDirectory ?? "Not set up (sudo rf-monitor share-evidence)"}</strong></div>
       <section className="protected-actions" aria-labelledby="recording-actions-title">
         <header><strong id="recording-actions-title">Protected data actions</strong><span>{disabled ? "Unlock to use" : dataDomain === "field" ? "Field monitoring" : "Simulation / Test"}</span></header>
         <div className="protected-action-row">
@@ -971,9 +1035,10 @@ function AdvancedSettings({ response, draft, setDraft, errors, unlocked, onMaint
 }) {
   const updateDetection = (key: keyof OperationalSettings["detection"], value: number) => setDraft({ ...draft, detection: { ...draft.detection, [key]: value } });
   const updateScan = (kind: "dwellMs" | "priority", service: "startrack" | "4dx" | "gnss" | "fugro", value: number) => setDraft({ ...draft, scan: { ...draft.scan, [kind]: { ...draft.scan[kind], [service]: value } } });
+  const detectionDefaults = response.detectionDefaults ?? ROBUST_DETECTION_DEFAULTS;
   const detectionIsDefault = useMemo(
-    () => JSON.stringify(draft.detection) === JSON.stringify(ROBUST_DETECTION_DEFAULTS),
-    [draft.detection],
+    () => JSON.stringify(draft.detection) === JSON.stringify(detectionDefaults),
+    [detectionDefaults, draft.detection],
   );
   return (
     <section className="settings-section" aria-labelledby="advanced-settings-title">
@@ -994,8 +1059,16 @@ function AdvancedSettings({ response, draft, setDraft, errors, unlocked, onMaint
         </details>
 
         <details className="advanced-settings-group">
-          <summary><span><strong>Detection rules</strong></span><ChevronDown size={18} aria-hidden="true" /></summary>
+          <summary><span><strong>Alert rules</strong><small>Custom alert sensitivity</small></span><ChevronDown size={18} aria-hidden="true" /></summary>
           <div className="advanced-settings-body">
+            <AlertRulesEditor response={response} draft={draft} setDraft={setDraft} disabled={!unlocked} errors={errors} />
+          </div>
+        </details>
+
+        <details className="advanced-settings-group">
+          <summary><span><strong>Signal-learning rules</strong><small>Changing these restarts learning</small></span><ChevronDown size={18} aria-hidden="true" /></summary>
+          <div className="advanced-settings-body">
+            <div className="schedule-capacity attention"><strong>Restarts learning</strong><span>These rules are part of every learned baseline. Saving a change restarts signal learning for every window and ends open incidents. To change when alerts are raised, use Monitoring › Alert sensitivity.</span></div>
             <div className="settings-form-grid detection-grid">
               <NumberField disabled={!unlocked} label="Scale floor" suffix="relative bin" min={0.1} max={32} step={0.1} value={draft.detection.scaleFloorBins} onChange={(value) => updateDetection("scaleFloorBins", value)} />
               <NumberField disabled={!unlocked} label="Wideband observation" suffix="robust scales" min={0.1} max={50} step={0.1} value={draft.detection.widebandObservationSigma} onChange={(value) => updateDetection("widebandObservationSigma", value)} />
@@ -1010,10 +1083,10 @@ function AdvancedSettings({ response, draft, setDraft, errors, unlocked, onMaint
               <NumberField disabled={!unlocked} label="Clear after" suffix="clean visits" min={1} max={100} value={draft.detection.clearObservations} onChange={(value) => updateDetection("clearObservations", value)} />
             </div>
             <div className="protected-action-row">
-              <span><strong>Reset detection rules</strong><small>Returns every value on this screen to the supplied defaults. Nothing is saved until you select Apply changes.</small></span>
-              <button className="button secondary compact" type="button" disabled={!unlocked || detectionIsDefault} onClick={() => setDraft({ ...draft, detection: { ...ROBUST_DETECTION_DEFAULTS } })}>Reset to defaults</button>
+              <span><strong>Reset signal-learning rules</strong><small>Returns these values to the supplied defaults. Nothing is saved until you select Apply changes.</small></span>
+              <button className="button secondary compact" type="button" disabled={!unlocked || detectionIsDefault} onClick={() => setDraft({ ...draft, detection: { ...detectionDefaults } })}>Reset to defaults</button>
             </div>
-            {Object.entries(errors).filter(([key]) => key.startsWith("detection.")).map(([key, text]) => <FieldError key={key} text={text} />)}
+            {Object.entries(errors).filter(([key]) => key.startsWith("detection.")).map(([key, text]) => <FieldError key={key} text={`${DETECTION_FIELD_LABELS[key.slice("detection.".length)] ?? key}: ${text}`} />)}
           </div>
         </details>
 
@@ -1091,7 +1164,7 @@ function SignalLearningSettings({ response, unlocked, targetStates, onBaselineAc
               {unlocked && target.baseline?.lifecycle === "reviewable" ? <button className="button secondary compact" type="button" disabled={!approval?.eligible} aria-describedby={!approval?.eligible && blockedApproval ? "baseline-approval-status" : undefined} onClick={() => void onBaselineAction("approve", target.baseline!)}>Approve</button> : null}
               {/* The control stays visible with its blocking reason so a
                   missing baseline never looks like a missing feature. */}
-              {unlocked ? <button className="button secondary compact" type="button" disabled={!target.baseline || Boolean(blocked)} title={target.baseline ? blocked : "No learned data to restart yet."} onClick={() => { if (target.baseline) void onBaselineAction("restart", target.baseline); }}>Restart learning</button> : null}
+              {unlocked ? <button className="button secondary compact" type="button" disabled={!target.baseline} title={target.baseline ? (blocked ? "An alert is active. Restarting ends it." : undefined) : "No learned data to restart yet."} onClick={() => { if (target.baseline) void onBaselineAction("restart", target.baseline); }}>Restart learning</button> : null}
             </div>
           );
         }) : <div className="selection-summary">No active frequencies.</div>}
@@ -1133,8 +1206,38 @@ function TextField({ label, value, maxLength, error, disabled = false, onChange 
 }
 
 function NumberField({ label, value, min, max, step = 1, suffix, compact = false, disabled = false, onChange }: { label?: string; value: number; min: number; max: number; step?: number; suffix?: string; compact?: boolean; disabled?: boolean; onChange: (value: number) => void }) {
-  return <label className={`form-field number-field ${compact ? "compact" : ""}`}>{label ? <span>{label}</span> : null}<div className="input-suffix"><input type="number" disabled={disabled} value={value} min={min} max={max} step={step} onChange={(event) => onChange(Number(event.target.value))} />{suffix ? <b>{suffix}</b> : null}</div></label>;
+  const [text, setText] = useState(String(value));
+  useEffect(() => {
+    if (Number(text) !== value || text.trim() === "") setText(String(value));
+    // Only follow external value changes; local typing is kept as entered.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value]);
+  const invalid = text.trim() === "" || !Number.isFinite(Number(text));
+  return <label className={`form-field number-field ${compact ? "compact" : ""}`}>{label ? <span>{label}</span> : null}<div className="input-suffix"><input type="number" disabled={disabled} value={text} min={min} max={max} step={step} aria-invalid={invalid} onChange={(event) => {
+    setText(event.target.value);
+    const next = event.target.value.trim() === "" ? Number.NaN : Number(event.target.value);
+    // An empty or partial entry is never saved as 0.
+    if (Number.isFinite(next)) onChange(next);
+  }} />{suffix ? <b>{suffix}</b> : null}</div>{invalid ? <span className="field-error" role="alert">Enter a number</span> : null}</label>;
 }
+
+const DETECTION_FIELD_LABELS: Record<string, string> = {
+  scaleFloorBins: "Scale floor",
+  widebandObservationSigma: "Wideband observation",
+  widebandObservationOccupancy: "Wideband occupancy",
+  interferenceSigma: "Interference threshold",
+  interferenceOccupancy: "Interference occupancy",
+  narrowbandPeakSigma: "Narrowband peak",
+  narrowbandMaxWidthRatio: "Narrowband width maximum",
+  driftSigma: "Slow drift",
+  interferenceHits: "Required visits",
+  interferenceWindow: "Voting window",
+  clearObservations: "Clear after",
+  interferenceExposureMs: "Interference exposure",
+  driftExposureMs: "Drift exposure",
+  reservoirSize: "Reservoir size",
+  minimumLearningMs: "Minimum learning time",
+};
 
 function FieldError({ text }: { text: string }) {
   return <span className="field-error" role="alert">{text}</span>;

@@ -21,18 +21,26 @@ import {
   readdir,
   rename,
   rm,
+  rmdir,
   stat,
   statfs,
+  truncate,
   unlink,
   writeFile,
 } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
-import { assertRfOnlyDetectionClaim } from "../shared/productContract";
+import { assertRfOnlyDetectionClaim, rfVerdictFor } from "../shared/productContract";
+import { incidentPackageBaseName, incidentReference } from "../shared/incidentNaming";
+import { buildIncidentReportModel, type IncidentReportModel } from "./report/reportModel";
+import { renderIncidentReportHtml } from "./report/reportHtml";
+import { renderIncidentReportPdf } from "./report/reportPdf";
 import { createInterface } from "node:readline";
 import { pipeline } from "node:stream/promises";
-import archiver from "archiver";
+import { ZipArchive } from "archiver";
 import type {
+  AlertTriggerSnapshot,
+  ReportIdentity,
   DetectionEvent,
   EvidenceManifest,
   EvidenceManifestEntry,
@@ -49,6 +57,9 @@ import type {
   RecordingDeletionResult,
 } from "../shared/types";
 import { ensureDomainRoot } from "./dataDomains";
+import { IncidentFigureBuilder, type IncidentFigureData, type IncidentFigureSummary } from "./incidentFigure";
+import { IncidentReviewLog } from "./incidentReviews";
+import type { AnalysisChartSet } from "./incidentAnalysis";
 import {
   createEvidenceFinalizationRecord,
   inspectEvidenceCommitMetadata,
@@ -90,6 +101,8 @@ interface RawChunkState {
   relativePath: string;
   absolutePath: string;
   bytes: number;
+  /** A failed rollback left the file longer than `bytes`; the next frame must start a new part. */
+  poisoned?: boolean;
 }
 
 interface IncidentSliceSummary {
@@ -169,6 +182,8 @@ export interface EvidenceStoreOptions {
   incidentPostClearMs?: number;
   /** Production is fixed at 256 MiB; smaller values support bounded tests. */
   exportPartMaxBytes?: number;
+  /** A second folder, readable by a group of users, that also receives each incident's images and report. */
+  shareDirectory?: string;
   /** Test-only fault boundary. Production leaves this unset. */
   finalizationFaultInjector?: (
     point: EvidenceFinalizationFaultPoint,
@@ -196,6 +211,30 @@ export interface IncidentExportContext {
   immutableExportId?: string;
   minimumFreeBytes?: number;
   baselineReference?: object;
+  /** Site identity, report identity and logo for the client report. */
+  report?: IncidentReportContext;
+  /** Who asked for the export (network address), for the export record. */
+  requester?: string;
+}
+
+/** Everything the client report needs that is not stored in the evidence itself. */
+export interface IncidentReportContext {
+  siteName: string;
+  deploymentId?: string;
+  displayTimeZone: string;
+  reportIdentity?: ReportIdentity;
+  logo?: { bytes: Uint8Array; mediaType: "image/png" | "image/jpeg" };
+  serviceLabel?: string;
+  runtimeIdentity?: unknown;
+}
+
+const INCIDENT_LOG_MARGIN_MS = 10 * 60_000;
+const MAX_EXPORT_SCREENSHOTS = 32;
+
+/** Per-request memo for incident lookups across sessions. */
+export interface IncidentLookupCache {
+  sessions?: Promise<EvidenceSession[]>;
+  events: Map<string, Promise<DetectionEvent[]>>;
 }
 
 export class EvidenceCorruptionError extends Error {
@@ -248,6 +287,12 @@ export const MAX_PREHISTORY_FRAMES = 240;
 export const EXPORT_PART_MAX_BYTES = 256 * 1024 * 1024;
 const MAX_WRITER_ITEMS = 64;
 const MAX_WRITER_BYTES = 2 * 1024 * 1024;
+/** Slice of the hard 64-item/2 MiB bound held back for session close and rotation. */
+const WRITER_CRITICAL_RESERVE_ITEMS = 4;
+const WRITER_CRITICAL_RESERVE_BYTES = 64 * 1024;
+/** Ordinary writes are refused at these levels; only close/rotate may use the reserve. */
+export const WRITER_ORDINARY_MAX_ITEMS = MAX_WRITER_ITEMS - WRITER_CRITICAL_RESERVE_ITEMS;
+export const WRITER_ORDINARY_MAX_BYTES = MAX_WRITER_BYTES - WRITER_CRITICAL_RESERVE_BYTES;
 const PREHISTORY_CHUNK_FRAMES = 32;
 const STALE_EXPORT_STAGING_MS = 24 * 60 * 60_000;
 export const MAX_FINALIZER_ITEMS = 8;
@@ -320,6 +365,68 @@ function safeTimestamp(timestamp: string): string {
   return timestamp.replaceAll(":", "-").replaceAll(".", "-");
 }
 
+interface IncidentFigureFiles {
+  svg?: string;
+  png?: Uint8Array;
+  analysis?: AnalysisChartSet;
+  data?: IncidentFigureData;
+  summary: IncidentFigureSummary | { state: "unavailable"; reason: string };
+}
+
+function figureForReport(figure: IncidentFigureFiles) {
+  return figure.analysis && figure.data && !("state" in figure.summary)
+    ? { summary: figure.summary, analysis: figure.analysis, data: figure.data }
+    : undefined;
+}
+
+const VERIFY_README = (reference: string) => `RF Monitor incident evidence package
+${reference}
+
+WHAT IS IN THIS PACKAGE
+  report.pdf / report.html   Client report (same content). Start here.
+  report.json                The report as data.
+  incident.json              The incident record, including why the alert was raised.
+  spectrum/                  The recorded spectrum frames: the evidence itself.
+  evidence/                  Trigger snapshot, screenshots and operator notes.
+  events/history.jsonl       Every stored version of this incident.
+  logs/                      Operations, configuration and receiver logs for the incident window.
+  source-context/            Receiver and configuration snapshots of each recording session.
+  figures/                   Charts and images drawn from the recorded frames.
+  export-record.json         When, where and by which software this package was made.
+  manifest.json, SHA256SUMS.txt  SHA-256 hash of every file.
+
+HOW TO CHECK THAT NOTHING CHANGED
+Extract the ZIP, open a terminal in the extracted folder, then run:
+  Linux:    sha256sum -c SHA256SUMS.txt
+  macOS:    shasum -a 256 -c SHA256SUMS.txt
+  Windows (PowerShell), for any file:
+            Get-FileHash -Algorithm SHA256 .\report.pdf
+            and compare the hash with the line for that file in SHA256SUMS.txt.
+  RF Monitor host:  sudo rf-monitor verify-evidence <extracted folder>
+Every line should report OK. A changed or missing file is reported as FAILED.
+
+SCOPE
+The hashes make any later change detectable. They are not a digital signature
+and this package is not a certified legal chain of custody.
+RF data can show interference, not intent. Levels are relative and uncalibrated.
+`;
+
+/** Automatic incident images: bounded in count and size no matter what retention is configured. */
+const INCIDENT_FIGURE_DIRECTORY = "incident-figures";
+const INCIDENT_FIGURE_MAX_FILES = 400;
+const INCIDENT_FIGURE_MAX_FILE_BYTES = 8 * 1024 * 1024;
+const INCIDENT_FIGURE_NAME = /^(\d{8}T\d{6}Z)-(start|progress|end|final|refresh)(-analysis|-report)?\.(svg|png|html|json)$/;
+export type IncidentFigureReason = "start" | "progress" | "end" | "final" | "refresh";
+
+function figureStamp(ms: number): string {
+  return new Date(ms).toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+}
+
+function figureStampMs(stamp: string): number {
+  const match = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/.exec(stamp);
+  return match ? Date.UTC(+match[1], +match[2] - 1, +match[3], +match[4], +match[5], +match[6]) : Number.NaN;
+}
+
 function safeIdentifier(value: string, label: string): string {
   if (!/^[A-Za-z0-9._-]+$/.test(value)) throw new Error(`Invalid ${label}`);
   return value;
@@ -376,6 +483,13 @@ function detectorAnalysisError(frame: Record<string, unknown>, storedBinCount: n
   if (analysis.anomalyKind !== undefined && !["wideband-noise-rise", "narrowband-spike", "baseline-drift"].includes(String(analysis.anomalyKind))) {
     return "detector anomaly kind is invalid";
   }
+  if (analysis.anomalyDetailKind !== undefined && (
+    !["wideband", "partial-band", "narrowband", "noise-floor", "burst"].includes(String(analysis.anomalyDetailKind))
+    || analysis.anomalyKind === undefined
+  )) return "detector anomaly detail is invalid";
+  if (analysis.referenceRevision !== undefined && (typeof analysis.referenceRevision !== "string" || analysis.referenceRevision.length > 160)) {
+    return "detector reference revision is invalid";
+  }
   for (const range of analysis.anomalyBinRanges) {
     if (!isRecord(range) || !Number.isSafeInteger(range.startBin) || !Number.isSafeInteger(range.endBin)
       || (range.startBin as number) < (startBin as number) || (range.endBin as number) <= (range.startBin as number)
@@ -408,12 +522,24 @@ function validatedRuntimeIdentity(value: unknown): RuntimeIdentity | undefined {
 }
 
 async function runtimeIdentityFromEvidenceRoot(root: string): Promise<RuntimeIdentity | undefined> {
+  const candidates = [path.join(root, "config.json")];
   try {
-    const config = JSON.parse(await readFile(path.join(root, "config.json"), "utf8")) as unknown;
-    return isRecord(config) ? validatedRuntimeIdentity(config.runtimeIdentity) : undefined;
+    // Incident packages keep each session's configuration under source-context/.
+    const index = JSON.parse(await readFile(path.join(root, "source-context", "index.json"), "utf8")) as { sessions?: Array<{ config?: string }> };
+    for (const session of index.sessions ?? []) if (typeof session.config === "string") candidates.push(path.join(root, ...session.config.split("/")));
   } catch {
-    return undefined;
+    // Session packages have no source-context index.
   }
+  for (const candidate of candidates) {
+    try {
+      const config = JSON.parse(await readFile(candidate, "utf8")) as unknown;
+      const identity = isRecord(config) ? validatedRuntimeIdentity(config.runtimeIdentity) : undefined;
+      if (identity) return identity;
+    } catch {
+      // Try the next candidate.
+    }
+  }
+  return undefined;
 }
 
 async function sha256File(filePath: string): Promise<string> {
@@ -492,13 +618,6 @@ function archivePath(filePath: string): string {
   return filePath.replaceAll("\\", "/");
 }
 
-function escapeHtml(value: unknown): string {
-  return String(value ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;");
-}
 
 function safeEvidenceString(value: string): string {
   return value
@@ -527,12 +646,6 @@ function sanitizeEvidence(value: unknown, key = ""): unknown {
   return undefined;
 }
 
-function incidentReport(event: DetectionEvent): string {
-  const evidence = event.evidenceStrength === "Medium" ? "Medium" : "Low";
-  const affected = event.affectedLabel ?? event.bandLabel;
-  const range = `${(event.affectedRangeHz[0] / 1_000_000).toFixed(3)}-${(event.affectedRangeHz[1] / 1_000_000).toFixed(3)} MHz`;
-  return `<!doctype html><html lang="en"><meta charset="utf-8"><title>RF incident ${escapeHtml(event.id)}</title><style>body{max-width:820px;margin:40px auto;padding:0 24px;font:16px/1.55 Arial,sans-serif;color:#142536}h1{font-size:28px}dl{display:grid;grid-template-columns:170px 1fr;border-top:1px solid #ccd5dc}dt,dd{margin:0;padding:10px;border-bottom:1px solid #e1e6ea}dt{font-weight:700;background:#f4f7f9}.limit{margin-top:24px;padding:12px;border-left:4px solid #bd7a00;background:#fff8e7}</style><body><h1>Suspected RF interference</h1><dl><dt>Affected signal</dt><dd>${escapeHtml(safeEvidenceString(affected))}</dd><dt>Frequency</dt><dd>${escapeHtml(range)}</dd><dt>Started</dt><dd>${escapeHtml(event.startedAt)}</dd><dt>Last observed</dt><dd>${escapeHtml(event.lastSeenAt)}</dd><dt>Observation</dt><dd>${escapeHtml(safeEvidenceString(event.observed))}</dd><dt>Action</dt><dd>${escapeHtml(safeEvidenceString(event.recommendedAction))}</dd><dt>Evidence strength</dt><dd>${evidence}</dd><dt>Lifecycle</dt><dd>${escapeHtml(event.lifecycle ?? "active")}</dd></dl><p class="limit">RF data can show interference, not intent. This tamper-evident engineering archive is not a certified legal chain of custody.</p></body></html>`;
-}
 
 async function writeAtomic(filePath: string, contents: string | Uint8Array): Promise<void> {
   await mkdir(path.dirname(filePath), { recursive: true });
@@ -589,6 +702,8 @@ export class EvidenceStore {
   private readonly incidentPrehistoryMs: number;
   private readonly incidentPostClearMs: number;
   private readonly exportPartMaxBytes: number;
+  private readonly shareDirectory?: string;
+  private shareFailureLoggedAt = 0;
   private readonly exportSourceSessionLeases = new Map<string, number>();
   private readonly exportPathLeases = new Map<string, number>();
   private readonly activeExportPrefixes = new Map<string, number>();
@@ -612,13 +727,17 @@ export class EvidenceStore {
   private screenshotQuotaReady = false;
   private screenshotQuotaFailure?: string;
   readonly dataDomain: DataDomain;
+  /** Notes and review marks added after an incident's sessions were finalized. */
+  readonly reviews: IncidentReviewLog;
 
   constructor(readonly root: string, options: EvidenceStoreOptions = {}) {
     this.dataDomain = options.dataDomain ?? "field";
+    this.reviews = new IncidentReviewLog(root, this.dataDomain);
     this.rawChunkMaxBytes = options.rawChunkMaxBytes ?? RAW_CHUNK_MAX_BYTES;
     this.incidentPrehistoryMs = options.incidentPrehistoryMs ?? INCIDENT_PREHISTORY_MS;
     this.incidentPostClearMs = options.incidentPostClearMs ?? INCIDENT_POST_CLEAR_MS;
     this.exportPartMaxBytes = options.exportPartMaxBytes ?? EXPORT_PART_MAX_BYTES;
+    this.shareDirectory = options.shareDirectory;
     this.finalizerMaxItems = options.finalizerMaxItems ?? MAX_FINALIZER_ITEMS;
     this.finalizationFaultInjector = options.finalizationFaultInjector;
     this.recordingDeletionFaultInjector = options.recordingDeletionFaultInjector;
@@ -761,6 +880,7 @@ export class EvidenceStore {
       byteCount: Buffer.byteLength(configContents) + Buffer.byteLength(sdrconnectContents),
     };
     this.rawChunksByHour.clear();
+    this.frameIndexNeedsRepair = false;
     this.lastSessionCheckpointAt = Date.now();
     await Promise.all([
       writeAtomic(path.join(sessionPath, "config.json"), configContents),
@@ -781,7 +901,7 @@ export class EvidenceStore {
       const finalization = this.scheduleFinalization({ ...previous });
       if (!finalization) await this.markFinalizationRejected(previous);
       return { next };
-    }, 16 * 1024, "high");
+    }, 16 * 1024, "high", true);
     return rotation.next;
   }
 
@@ -796,7 +916,7 @@ export class EvidenceStore {
         return { session: { ...session } };
       }
       return { session: { ...session }, finalization };
-    }, 16 * 1024, "high");
+    }, 16 * 1024, "high", true);
     return transition.finalization ?? transition.session;
   }
 
@@ -871,6 +991,48 @@ export class EvidenceStore {
       await this.checkpointSession(session, true);
       this.refreshActive(session);
     }, 16 * 1024, "high");
+  }
+
+  /**
+   * Store exactly what the detector compared when an incident was first
+   * raised. Written once per incident; hex arrays survive evidence sanitising.
+   */
+  recordTriggerSnapshot(sessionId: string, snapshot: AlertTriggerSnapshot): Promise<void> {
+    if (snapshot.dataDomain !== this.dataDomain) {
+      return Promise.reject(new Error(`Trigger snapshot belongs to ${snapshot.dataDomain} data, not ${this.dataDomain}`));
+    }
+    const stored = structuredClone(snapshot);
+    return this.enqueue(async () => {
+      let session = await this.sessionForId(sessionId);
+      if (session.lifecycle !== "Active" && session.status !== "recording") {
+        if (!this.active) throw new Error(`Evidence session ${session.id} is immutable after finalization starts`);
+        session = { ...this.active };
+      }
+      const snapshotPath = path.join(session.path, "events", "triggers", `${safeIdentifier(stored.eventId, "event id")}.json`);
+      session.byteCount += await this.writeImmutableJson(snapshotPath, stored, `Trigger snapshot for ${stored.eventId}`);
+      await this.checkpointSession(session, true);
+      this.refreshActive(session);
+    }, 32 * 1024, "high");
+  }
+
+  /** The stored trigger snapshot for an incident, searched across its sessions. */
+  async readTriggerSnapshot(eventId: string, sessionIds: string[]): Promise<AlertTriggerSnapshot | undefined> {
+    const fileName = `${safeIdentifier(eventId, "event id")}.json`;
+    for (const sessionId of [...new Set(sessionIds)]) {
+      let session;
+      try {
+        session = await this.sessionForId(sessionId);
+      } catch {
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(await readFile(path.join(session.path, "events", "triggers", fileName), "utf8")) as AlertTriggerSnapshot;
+        if (parsed?.schemaVersion === 1 && parsed.eventId === eventId && parsed.dataDomain === this.dataDomain) return parsed;
+      } catch {
+        // Older incidents have no trigger snapshot.
+      }
+    }
+    return undefined;
   }
 
   private async writeImmutableJson(filePath: string, value: object, label: string): Promise<number> {
@@ -1039,7 +1201,8 @@ export class EvidenceStore {
     this.activeExportOperations += 1;
     try {
       const storedEvent = await this.findIncidentEvent(event.id, event.sessionId);
-      const exportEvent = storedEvent ?? event;
+      // Notes and review added after the session closed travel with the package and report.
+      const exportEvent = await this.reviews.apply(storedEvent ?? event);
       const requestedSessionIds = [...new Set([exportEvent.sessionId, ...(exportEvent.sessionIds ?? [])])];
       for (const sessionId of requestedSessionIds) this.updateLease(this.exportSourceSessionLeases, sessionId, 1);
       let stagingPath: string | undefined;
@@ -1074,7 +1237,8 @@ export class EvidenceStore {
         ...incompleteSourceSessionIds.map((sessionId) => `${sessionId}:recovery-gap`),
         ...(missingBaselineReference ? [`baseline:${exportEvent.baselineFingerprintId}`] : []),
       ];
-      const packageId = `${session.id}-${eventId}`;
+      // A readable name for people: when, which window, and a short incident id.
+      const packageId = incidentPackageBaseName(exportEvent);
       const exportsPath = path.join(this.root, "exports");
       stagingPath = path.join(exportsPath, `.${packageId}.partial-${randomUUID().slice(0, 8)}`);
       this.assertContained(stagingPath);
@@ -1082,6 +1246,16 @@ export class EvidenceStore {
       await mkdir(path.join(stagingPath, "spectrum", "raw"), { recursive: true });
       const slice = await this.writeIncidentFrameSlice(sessions, exportEvent, stagingPath);
       if (slice.legacyFrameCount > 0) missingParts.push(`legacy-frame-provenance:${slice.legacyFrameCount}`);
+      // A derived picture of the slice above. It can never make the evidence incomplete or fail the export.
+      const overheadReserve = Math.min(1024 * 1024, Math.floor(this.exportPartMaxBytes * 0.35));
+      const maxFigureFileBytes = Math.floor((this.exportPartMaxBytes - overheadReserve) / 4);
+      const figure = await this.renderIncidentFigure(stagingPath, exportEvent, slice, baselineReference, {
+        generatedAtMs: Date.now(),
+        // One figure file may never crowd out the evidence in a size-bounded part.
+        maxFileBytes: maxFigureFileBytes,
+      });
+      // The report embeds the charts so it opens on its own, but only while it stays well inside one part.
+      const maxInlineBytes = Math.floor(maxFigureFileBytes / 2);
       const completeness = {
         dataDomain: this.dataDomain,
         complete: missingParts.length === 0,
@@ -1093,9 +1267,13 @@ export class EvidenceStore {
         missingParts,
         evidenceGap: missingParts.length > 0,
       };
+      void maxInlineBytes;
+      const triggerSnapshot = await this.readTriggerSnapshot(exportEvent.id, requestedSessionIds);
       await Promise.all([
         writeAtomic(path.join(stagingPath, "incident.json"), JSON.stringify(sanitizeEvidence({ ...exportEvent, exportCompleteness: completeness }), null, 2)),
-        writeAtomic(path.join(stagingPath, "report.html"), incidentReport(exportEvent)),
+        this.writeIncidentFigureFiles(stagingPath, figure),
+        ...(triggerSnapshot ? [writeAtomic(path.join(stagingPath, "evidence", "trigger-snapshot.json"), JSON.stringify(sanitizeEvidence(triggerSnapshot), null, 2))] : []),
+        this.writeIncidentAttachments(sessions, exportEvent, stagingPath, Date.parse(slice.startedAt), Date.parse(slice.endedAt)),
         writeAtomic(path.join(stagingPath, "completeness.json"), JSON.stringify(completeness, null, 2)),
         writeAtomic(path.join(stagingPath, "slice.json"), JSON.stringify({
           schemaVersion: 2,
@@ -1117,11 +1295,60 @@ export class EvidenceStore {
         this.writeIncidentSourceContexts(sessions, stagingPath),
         this.writeIncidentEventHistory(sessions, eventId, stagingPath),
       ]);
+      // Key evidence files and their hashes, quoted in the report. The manifest
+      // (written last) then covers every file, including the report itself.
+      const keyFiles = (await walkFiles(stagingPath))
+        .map(archivePath)
+        .filter((relative) => relative === "spectrum/frames.jsonl"
+          || relative.startsWith("spectrum/raw/")
+          || relative === "incident.json"
+          || relative === "baseline-reference.json"
+          || relative === "events/history.jsonl"
+          || relative === "evidence/trigger-snapshot.json")
+        .sort();
+      const evidenceFiles = await Promise.all(keyFiles.map(async (relative) => {
+        const absolute = path.join(stagingPath!, ...relative.split("/"));
+        return { path: relative, bytes: (await stat(absolute)).size, sha256: await sha256File(absolute) };
+      }));
+      const generatedAtMs = Date.now();
+      const report = await this.buildIncidentReport(exportEvent, figure, {
+        scope: "evidence-package",
+        generatedAtMs,
+        sessions,
+        baselineReference,
+        triggerSnapshot,
+        completeness,
+        evidenceFiles,
+        report: context.report,
+      });
+      await Promise.all([
+        writeAtomic(path.join(stagingPath, "report.json"), `${JSON.stringify(report.model)}\n`),
+        writeAtomic(path.join(stagingPath, "report.html"), report.html),
+        ...(report.pdf ? [writeAtomic(path.join(stagingPath, "report.pdf"), report.pdf)] : []),
+        writeAtomic(path.join(stagingPath, "README-VERIFY.txt"), VERIFY_README(report.model.reference)),
+        writeAtomic(path.join(stagingPath, "export-record.json"), JSON.stringify(sanitizeEvidence({
+          schemaVersion: 1,
+          packageType: "incident-evidence",
+          reference: report.model.reference,
+          incidentId: exportEvent.id,
+          exportedAt: new Date(generatedAtMs).toISOString(),
+          exportId: context.immutableExportId,
+          requestedFrom: context.requester,
+          host: os.hostname(),
+          dataDomain: this.dataDomain,
+          software: context.report?.runtimeIdentity,
+          window: { startedAt: slice.startedAt, endedAt: slice.endedAt },
+          sourceSessionIds: requestedSessionIds,
+          complete: completeness.complete,
+          missingParts,
+          reportFiles: ["report.pdf", "report.html", "report.json"].filter((name) => name !== "report.pdf" || Boolean(report.pdf)),
+        }), null, 2)),
+      ]);
       const exportSuffix = context.immutableExportId ? `-${safeIdentifier(context.immutableExportId, "export id")}` : "";
       const zipPath = path.join(exportsPath, `${packageId}${exportSuffix}.zip`);
       outputPrefix = zipPath.toLowerCase().endsWith(".zip") ? zipPath.slice(0, -4) : zipPath;
       this.updateLease(this.activeExportPrefixes, outputPrefix, 1);
-      return await this.writeBoundedArchives(stagingPath, packageId, zipPath, session.id, completeness);
+      return await this.writeBoundedArchives(stagingPath, packageId, zipPath, session.id, completeness, "incident-evidence");
       } finally {
         if (stagingPath) {
           this.updateLease(this.exportPathLeases, stagingPath, -1);
@@ -1235,15 +1462,28 @@ export class EvidenceStore {
     }
   }
 
-  async findIncidentEvent(eventId: string, hintedSessionId?: string): Promise<DetectionEvent | undefined> {
+  /**
+   * The newest record of an incident across every session it was written to.
+   * `cache` lets one request look up several incidents with one read per session.
+   */
+  async findIncidentEvent(eventId: string, hintedSessionId?: string, cache?: IncidentLookupCache): Promise<DetectionEvent | undefined> {
     const safeEventId = safeIdentifier(eventId, "event id");
-    const sessions = await this.listSessions();
+    const sessions = await (cache ? (cache.sessions ??= this.listSessions()) : this.listSessions());
     const ordered = hintedSessionId
       ? [...sessions.filter((session) => session.id === hintedSessionId), ...sessions.filter((session) => session.id !== hintedSessionId)]
       : sessions;
+    const sessionEvents = (sessionId: string) => {
+      if (!cache) return this.listSessionEvents(sessionId);
+      let pending = cache.events.get(sessionId);
+      if (!pending) {
+        pending = this.listSessionEvents(sessionId).catch(() => []);
+        cache.events.set(sessionId, pending);
+      }
+      return pending;
+    };
     const candidates: DetectionEvent[] = [];
     for (const session of ordered) {
-      const candidate = (await this.listSessionEvents(session.id)).find((event) => event.id === safeEventId);
+      const candidate = (await sessionEvents(session.id)).find((event) => event.id === safeEventId);
       if (candidate) candidates.push(candidate);
     }
     if (!candidates.length) return undefined;
@@ -1860,6 +2100,7 @@ export class EvidenceStore {
     sessionId: string,
     completeness: { complete: boolean; missingSessionIds?: readonly string[]; missingParts?: readonly string[] } = { complete: true },
     additionallyExcluded: ReadonlySet<string> = new Set(),
+    packageType?: EvidenceManifest["packageType"],
   ): Promise<EvidenceManifest> {
     this.assertContained(root);
     const excluded = new Set(["manifest.json", "SHA256SUMS.txt", ...additionallyExcluded]);
@@ -1888,6 +2129,7 @@ export class EvidenceStore {
       missingParts: [...(completeness.missingParts ?? completeness.missingSessionIds ?? [])],
       evidenceGap: !completeness.complete,
       ...(runtimeIdentity ? { runtimeIdentity } : {}),
+      ...(packageType ? { packageType } : {}),
       disclaimer: "Tamper-evident engineering archive; not a certified legal chain of custody.",
     };
     const manifestPath = path.join(root, "manifest.json");
@@ -1909,7 +2151,7 @@ export class EvidenceStore {
     try {
       await new Promise<void>((resolve, reject) => {
         const output = createWriteStream(partialPath, { flags: "wx", mode: 0o640 });
-        const archive = archiver("zip", { store: true });
+        const archive = new ZipArchive({ store: true });
         let settled = false;
         const fail = (error: Error) => {
           if (settled) return;
@@ -1950,6 +2192,7 @@ export class EvidenceStore {
     zipPath: string,
     sessionId: string,
     completeness: { complete: boolean; missingSessionIds?: readonly string[]; missingParts?: readonly string[] } = { complete: true },
+    packageType?: EvidenceManifest["packageType"],
   ): Promise<string | string[]> {
     const overheadReserve = Math.min(1024 * 1024, Math.floor(this.exportPartMaxBytes * 0.35));
     const contentBudget = this.exportPartMaxBytes - overheadReserve;
@@ -1983,7 +2226,7 @@ export class EvidenceStore {
     }
     if (current.length || !groups.length) groups.push(current);
     if (groups.length === 1) {
-      await this.createManifestForRoot(sourcePath, sessionId, completeness);
+      await this.createManifestForRoot(sourcePath, sessionId, completeness, new Set(), packageType);
       await this.writeArchive(sourcePath, archiveRoot, zipPath);
       if ((await stat(zipPath)).size > this.exportPartMaxBytes) throw new Error("Export ZIP exceeded the 256 MiB part bound");
       return zipPath;
@@ -2024,7 +2267,7 @@ export class EvidenceStore {
           files: digestedGroups[index].map((file) => ({ path: file.relativePath, bytes: file.bytes, sha256: file.sha256 })),
           noTruncation: true,
         }, null, 2));
-        await this.createManifestForRoot(partRoot, sessionId, completeness);
+        await this.createManifestForRoot(partRoot, sessionId, completeness, new Set(), packageType);
         const partPath = `${basePath}-part-${String(partNumber).padStart(3, "0")}.zip`;
         await this.writeArchive(partRoot, archiveRoot, partPath);
         if ((await stat(partPath)).size > this.exportPartMaxBytes) throw new Error(`Export part ${partNumber} exceeded its resource bound`);
@@ -2071,6 +2314,7 @@ export class EvidenceStore {
   private async appendFrame(frame: PersistedSpectrumFrame, summary: object): Promise<void> {
     const session = this.requireActive();
     this.validatePersistedFrame(frame);
+    await this.ensureFrameIndexClean(session);
     const raw = Buffer.from(frame.bins.buffer, frame.bins.byteOffset, frame.bins.byteLength);
     if (raw.byteLength > this.rawChunkMaxBytes) throw new Error(`Evidence frame exceeds the ${this.rawChunkMaxBytes}-byte raw chunk bound`);
     const chunk = this.rawChunkForFrame(session, frame.timestamp, raw.byteLength);
@@ -2084,10 +2328,22 @@ export class EvidenceStore {
       rawLength: raw.byteLength,
       rawEncoding: "uint8",
     })}\n`;
-    await appendFile(chunk.absolutePath, raw);
+    try {
+      await appendFile(chunk.absolutePath, raw);
+    } catch (error) {
+      // A short write (ENOSPC) leaves the file longer than chunk.bytes; the next frame's offset would
+      // then point into the middle of this one.
+      await this.rollbackRawAppends([{ chunk, bytes: rawOffset }]);
+      throw error;
+    }
     chunk.bytes += raw.byteLength;
     this.injectProcessKillFault("frame-after-raw-append", session.id);
-    await appendFile(path.join(session.path, "spectrum", "frames.jsonl"), jsonLine);
+    try {
+      await appendFile(path.join(session.path, "spectrum", "frames.jsonl"), jsonLine);
+    } catch (error) {
+      await this.repairFrameIndexTail(session);
+      throw error;
+    }
     this.injectProcessKillFault("frame-after-index-append", session.id);
     session.frameCount += 1;
     session.byteCount += raw.byteLength + Buffer.byteLength(jsonLine);
@@ -2106,7 +2362,10 @@ export class EvidenceStore {
       throw new Error(`Prehistory writer chunk must contain 1-${PREHISTORY_CHUNK_FRAMES} frames`);
     }
     const session = this.requireActive();
+    await this.ensureFrameIndexClean(session);
     const rawWrites = new Map<string, { absolutePath: string; buffers: Buffer[] }>();
+    // Length of every touched chunk before this batch, so a failed write can be undone exactly.
+    const priorBytes = new Map<RawChunkState, number>();
     const indexLines: string[] = [];
     let addedBytes = 0;
 
@@ -2118,6 +2377,7 @@ export class EvidenceStore {
       }
       const chunk = this.rawChunkForFrame(session, frame.timestamp, raw.byteLength);
       const rawOffset = chunk.bytes;
+      if (!priorBytes.has(chunk)) priorBytes.set(chunk, chunk.bytes);
       chunk.bytes += raw.byteLength;
       const write = rawWrites.get(chunk.relativePath) ?? { absolutePath: chunk.absolutePath, buffers: [] };
       write.buffers.push(raw);
@@ -2135,15 +2395,66 @@ export class EvidenceStore {
       addedBytes += raw.byteLength + Buffer.byteLength(jsonLine);
     }
 
-    for (const write of rawWrites.values()) {
-      await appendFile(write.absolutePath, Buffer.concat(write.buffers));
+    try {
+      for (const write of rawWrites.values()) {
+        await appendFile(write.absolutePath, Buffer.concat(write.buffers));
+      }
+    } catch (error) {
+      // chunk.bytes was advanced before the write; without this the recorded offsets of every later
+      // frame would run ahead of the real file.
+      await this.rollbackRawAppends([...priorBytes].map(([chunk, bytes]) => ({ chunk, bytes })));
+      throw error;
     }
     this.injectProcessKillFault("frame-after-raw-append", session.id);
-    await appendFile(path.join(session.path, "spectrum", "frames.jsonl"), indexLines.join(""));
+    try {
+      await appendFile(path.join(session.path, "spectrum", "frames.jsonl"), indexLines.join(""));
+    } catch (error) {
+      await this.repairFrameIndexTail(session);
+      throw error;
+    }
     this.injectProcessKillFault("frame-after-index-append", session.id);
     session.frameCount += items.length;
     session.byteCount += addedBytes;
     await this.checkpointSession(session);
+  }
+
+  /**
+   * Undo raw appends whose index lines were never written: restore each chunk's logical length and
+   * cut the file back to it. If the file cannot be cut, retire the chunk so no offset is ever
+   * computed from a length that disagrees with the file.
+   */
+  private async rollbackRawAppends(items: ReadonlyArray<{ chunk: RawChunkState; bytes: number }>): Promise<void> {
+    for (const { chunk, bytes } of items) {
+      chunk.bytes = bytes;
+      try {
+        await truncate(chunk.absolutePath, bytes);
+      } catch (error) {
+        // A chunk that was never created has nothing to cut.
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") chunk.poisoned = true;
+      }
+    }
+  }
+
+  private frameIndexNeedsRepair = false;
+
+  /**
+   * A failed index append can leave a torn line; the next append would join onto it. Preserve and cut
+   * the torn bytes now, using the same reconciliation as crash recovery. If that fails too, refuse
+   * further frames until a later repair succeeds.
+   */
+  private async repairFrameIndexTail(session: EvidenceSession): Promise<void> {
+    try {
+      await this.reconcileInterruptedJsonlTail(session, "spectrum/frames.jsonl", new Date().toISOString());
+      this.frameIndexNeedsRepair = false;
+    } catch {
+      this.frameIndexNeedsRepair = true;
+    }
+  }
+
+  private async ensureFrameIndexClean(session: EvidenceSession): Promise<void> {
+    if (!this.frameIndexNeedsRepair) return;
+    await this.repairFrameIndexTail(session);
+    if (this.frameIndexNeedsRepair) throw new Error("Evidence frame index has an unrepaired torn tail; frames are refused until it is repaired");
   }
 
   private validatePersistedFrame(frame: SpectrumFrame): asserts frame is PersistedSpectrumFrame {
@@ -2207,7 +2518,7 @@ export class EvidenceStore {
     if (!Number.isFinite(at)) throw new Error("Evidence frame timestamp is invalid");
     const hour = new Date(at).toISOString().slice(0, 13);
     let chunk = this.rawChunksByHour.get(hour);
-    if (!chunk || chunk.bytes + rawLength > this.rawChunkMaxBytes) {
+    if (!chunk || chunk.poisoned || chunk.bytes + rawLength > this.rawChunkMaxBytes) {
       const part = (chunk?.part ?? 0) + 1;
       const rawName = `frames-${safeTimestamp(hour)}-part-${String(part).padStart(3, "0")}.bin`;
       const relativePath = path.posix.join("spectrum", "raw", rawName);
@@ -2486,6 +2797,463 @@ export class EvidenceStore {
       startedAt: new Date(startedAtMs).toISOString(),
       endedAt: new Date(endedAtMs).toISOString(),
     };
+  }
+
+  /**
+   * Saves a time-stamped picture of one incident under `incident-figures/<incident>/`. It reads only
+   * the recorded frames (staged first, exactly like an export) and never changes evidence. Returns
+   * undefined when there is nothing to draw from.
+   */
+  async saveIncidentFigureSnapshot(
+    event: DetectionEvent,
+    options: { reason: IncidentFigureReason; baselineReference?: object; now?: number; report?: IncidentReportContext },
+  ): Promise<{ stamp: string; svgPath: string; pngPath: string; analysisPath: string; reportPath: string } | undefined> {
+    if (event.syntheticExercise) return undefined;
+    if (this.recordingDeletionActive) return undefined;
+    const incidentId = safeIdentifier(event.id, "event id");
+    const now = options.now ?? Date.now();
+    const sessions: EvidenceSession[] = [];
+    for (const sessionId of new Set([event.sessionId, ...(event.sessionIds ?? [])])) {
+      try {
+        const candidate = await this.sessionForId(sessionId);
+        if (candidate.lifecycle !== "Corrupt" && candidate.status !== "storage-error") sessions.push(candidate);
+      } catch {
+        // A session that was removed or cannot be read simply contributes no frames.
+      }
+    }
+    if (!sessions.length) return undefined;
+    const exportsPath = path.join(this.root, "exports");
+    const stagingPath = path.join(exportsPath, `.figure-${incidentId}.partial-${randomUUID().slice(0, 8)}`);
+    this.assertContained(stagingPath);
+    this.updateLease(this.exportPathLeases, stagingPath, 1);
+    try {
+      await mkdir(path.join(stagingPath, "spectrum", "raw"), { recursive: true });
+      const slice = await this.writeIncidentFrameSlice(sessions, event, stagingPath);
+      if (slice.frameCount === 0) return undefined;
+      const figure = await this.renderIncidentFigure(stagingPath, event, slice, options.baselineReference, {
+        generatedAtMs: now,
+        maxFileBytes: INCIDENT_FIGURE_MAX_FILE_BYTES,
+      });
+      if (!figure.svg || !figure.png || !figure.analysis) return undefined;
+      const directory = path.join(this.root, INCIDENT_FIGURE_DIRECTORY, incidentId);
+      this.assertContained(directory);
+      const stamp = figureStamp(now);
+      const svgPath = path.join(directory, `${stamp}-${options.reason}.svg`);
+      const pngPath = path.join(directory, `${stamp}-${options.reason}.png`);
+      const analysisPath = path.join(directory, `${stamp}-${options.reason}-analysis.svg`);
+      const reportPath = path.join(directory, `${stamp}-${options.reason}-report.html`);
+      const reportJsonPath = path.join(directory, `${stamp}-${options.reason}-report.json`);
+      const triggerSnapshot = await this.readTriggerSnapshot(event.id, sessions.map((candidate) => candidate.id));
+      const report = await this.buildIncidentReport(event, figure, {
+        scope: "live-snapshot",
+        generatedAtMs: now,
+        sessions,
+        baselineReference: options.baselineReference,
+        triggerSnapshot,
+        report: options.report,
+        withPdf: false,
+      });
+      const reportJson = `${JSON.stringify(report.model)}\n`;
+      await writeAtomic(pngPath, figure.png);
+      await writeAtomic(analysisPath, figure.analysis.sheetSvg);
+      if (Buffer.byteLength(reportJson) <= INCIDENT_FIGURE_MAX_FILE_BYTES) await writeAtomic(reportJsonPath, reportJson);
+      if (Buffer.byteLength(report.html) <= INCIDENT_FIGURE_MAX_FILE_BYTES) await writeAtomic(reportPath, report.html);
+      // The overview goes last, so a reader that finds it can rely on its companions being there.
+      await writeAtomic(svgPath, figure.svg);
+      await this.copyToShare(incidentId, stamp, options.reason, figure, report.html);
+      return { stamp, svgPath, pngPath, analysisPath, reportPath };
+    } finally {
+      this.updateLease(this.exportPathLeases, stagingPath, -1);
+      await rm(stagingPath, { recursive: true, force: true });
+    }
+  }
+
+  /**
+   * Best effort copy for people who open files from a folder instead of the dashboard. A share that is
+   * missing or not writable never affects the picture saved in the evidence store.
+   */
+  private async copyToShare(incidentId: string, stamp: string, reason: IncidentFigureReason, figure: IncidentFigureFiles, report: string): Promise<void> {
+    if (!this.shareDirectory || !figure.svg || !figure.png || !figure.analysis) return;
+    try {
+      const details = await lstat(this.shareDirectory);
+      if (!details.isDirectory() || details.isSymbolicLink()) return;
+      const directory = path.join(this.shareDirectory, incidentId);
+      await mkdir(directory, { recursive: true, mode: 0o750 });
+      const base = path.join(directory, `${stamp}-${reason}`);
+      await writeAtomicUnflushed(`${base}.png`, figure.png);
+      await writeAtomicUnflushed(`${base}-analysis.svg`, figure.analysis.sheetSvg);
+      await writeAtomicUnflushed(`${base}.svg`, figure.svg);
+      await writeAtomicUnflushed(`${base}-report.html`, report);
+    } catch (error) {
+      const now = Date.now();
+      if (now - this.shareFailureLoggedAt > 10 * 60_000) {
+        this.shareFailureLoggedAt = now;
+        console.warn(`Incident images could not be copied to the share folder: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
+
+  /** Newest saved picture for an incident, or undefined. Only names this store wrote are served. */
+  async readIncidentFigure(incidentId: string, kind: "svg" | "png" | "analysis" | "report-html" | "report-json"): Promise<{ bytes: Buffer; stamp: string; reason: IncidentFigureReason } | undefined> {
+    const directory = path.join(this.root, INCIDENT_FIGURE_DIRECTORY, safeIdentifier(incidentId, "event id"));
+    this.assertContained(directory);
+    let names: string[];
+    try {
+      names = await readdir(directory);
+    } catch {
+      return undefined;
+    }
+    const candidates = names
+      .map((name) => ({ name, match: INCIDENT_FIGURE_NAME.exec(name) }))
+      .filter((entry): entry is { name: string; match: RegExpExecArray } => entry.match !== null && (kind === "analysis"
+        ? entry.match[3] === "-analysis" && entry.match[4] === "svg"
+        : kind === "report-html"
+          ? entry.match[3] === "-report" && entry.match[4] === "html"
+          : kind === "report-json"
+            ? entry.match[3] === "-report" && entry.match[4] === "json"
+            : entry.match[3] === undefined && entry.match[4] === kind))
+      .sort((left, right) => right.name.localeCompare(left.name));
+    const newest = candidates[0];
+    if (!newest) return undefined;
+    const file = path.join(directory, newest.name);
+    const details = await lstat(file);
+    if (!details.isFile() || details.size > INCIDENT_FIGURE_MAX_FILE_BYTES) return undefined;
+    return { bytes: await readFile(file), stamp: newest.match[1], reason: newest.match[2] as IncidentFigureReason };
+  }
+
+  /** Incident ids that currently have a saved picture, for the history list. */
+  async listIncidentFigureIds(): Promise<Set<string>> {
+    try {
+      const entries = await readdir(path.join(this.root, INCIDENT_FIGURE_DIRECTORY), { withFileTypes: true });
+      return new Set(entries.filter((entry) => entry.isDirectory() && /^[A-Za-z0-9._-]+$/.test(entry.name)).map((entry) => entry.name));
+    } catch {
+      return new Set();
+    }
+  }
+
+  /**
+   * Deletes saved pictures older than the retention period, then the oldest ones beyond the hard file
+   * cap. Only files this store names are touched, and symbolic links are never followed.
+   */
+  async pruneIncidentFigures(retentionMs: number, now = Date.now(), maxFiles = INCIDENT_FIGURE_MAX_FILES): Promise<{ removedFiles: number; keptFiles: number }> {
+    if (!Number.isSafeInteger(retentionMs) || retentionMs <= 0) return { removedFiles: 0, keptFiles: 0 };
+    const roots = [path.join(this.root, INCIDENT_FIGURE_DIRECTORY), ...(this.shareDirectory ? [this.shareDirectory] : [])];
+    let removedFiles = 0;
+    let keptFiles = 0;
+    for (const base of roots) {
+      const result = await this.pruneFigureRoot(base, retentionMs, now, maxFiles);
+      removedFiles += result.removedFiles;
+      keptFiles += result.keptFiles;
+    }
+    return { removedFiles, keptFiles };
+  }
+
+  private async pruneFigureRoot(base: string, retentionMs: number, now: number, maxFiles: number): Promise<{ removedFiles: number; keptFiles: number }> {
+    let incidents;
+    try {
+      incidents = await readdir(base, { withFileTypes: true });
+    } catch {
+      return { removedFiles: 0, keptFiles: 0 };
+    }
+    const files: Array<{ file: string; at: number; directory: string }> = [];
+    for (const incident of incidents) {
+      if (!incident.isDirectory() || !/^[A-Za-z0-9._-]+$/.test(incident.name)) continue;
+      const directory = path.join(base, incident.name);
+      for (const entry of await readdir(directory, { withFileTypes: true }).catch(() => [])) {
+        const match = entry.isFile() ? INCIDENT_FIGURE_NAME.exec(entry.name) : null;
+        if (!match) continue;
+        const at = figureStampMs(match[1]);
+        files.push({ file: path.join(directory, entry.name), at: Number.isFinite(at) ? at : 0, directory });
+      }
+    }
+    files.sort((left, right) => left.at - right.at);
+    const expired = new Set(files.filter((entry) => now - entry.at > retentionMs).map((entry) => entry.file));
+    const remaining = files.filter((entry) => !expired.has(entry.file));
+    for (const entry of remaining.slice(0, Math.max(0, remaining.length - maxFiles))) expired.add(entry.file);
+    let removed = 0;
+    for (const entry of files) {
+      if (!expired.has(entry.file)) continue;
+      await unlink(entry.file).then(() => { removed += 1; }, () => undefined);
+    }
+    for (const incident of incidents) {
+      // rmdir only removes an empty directory, so an incident that still has pictures is untouched.
+      if (incident.isDirectory() && /^[A-Za-z0-9._-]+$/.test(incident.name)) await rmdir(path.join(base, incident.name)).catch(() => undefined);
+    }
+    return { removedFiles: removed, keptFiles: files.length - removed };
+  }
+
+  private async writeIncidentFigureFiles(destination: string, figure: IncidentFigureFiles): Promise<void> {
+    const directory = path.join(destination, "figures");
+    await mkdir(directory, { recursive: true });
+    const writes = [writeAtomic(path.join(directory, "figure.json"), `${JSON.stringify(figure.summary, null, 2)}\n`)];
+    if (figure.svg && figure.png) {
+      writes.push(writeAtomic(path.join(directory, "incident-overview.svg"), figure.svg));
+      writes.push(writeAtomic(path.join(directory, "waterfall.png"), figure.png));
+    }
+    if (figure.analysis) {
+      writes.push(writeAtomic(path.join(directory, "incident-analysis.svg"), figure.analysis.sheetSvg));
+      for (const chart of figure.analysis.charts) writes.push(writeAtomic(path.join(destination, ...chart.file.split("/")), chart.svg));
+    }
+    await Promise.all(writes);
+  }
+
+  /**
+   * Draws the incident overview from the already-staged frame slice (never from live sources), so the
+   * picture is reproducible from exactly the bytes that are hashed into the package.
+   */
+  private async renderIncidentFigure(
+    stagingPath: string,
+    event: DetectionEvent,
+    slice: IncidentSliceSummary,
+    baselineReference: object | undefined,
+    options: { generatedAtMs: number; maxFileBytes: number },
+  ): Promise<IncidentFigureFiles> {
+    const handles = new Map<string, Awaited<ReturnType<typeof open>>>();
+    try {
+      const indexPath = path.join(stagingPath, "spectrum", "frames.jsonl");
+      const timestamps: number[] = [];
+      for await (const indexed of boundedJsonlRecords<Record<string, unknown>>(indexPath, "Incident figure index", false)) {
+        const frame = isRecord(indexed.frame) ? indexed.frame : undefined;
+        const at = typeof frame?.timestamp === "string" ? Date.parse(frame.timestamp) : Number.NaN;
+        if (Number.isFinite(at)) timestamps.push(at);
+      }
+      timestamps.sort((left, right) => left - right);
+      const incidentStartMs = Date.parse(event.startedAt);
+      const incidentEndMs = Date.parse(event.clearedAt ?? event.endedAt ?? event.lastSeenAt);
+      let baseline: { median: Uint8Array; mad: Uint8Array } | undefined;
+      const arrays = isRecord(baselineReference) && isRecord((baselineReference as Record<string, unknown>).arrays)
+        ? (baselineReference as { arrays: Record<string, unknown> }).arrays
+        : undefined;
+      if (arrays && typeof arrays.medianBase64 === "string" && typeof arrays.madBase64 === "string") {
+        const median = Uint8Array.from(Buffer.from(arrays.medianBase64, "base64"));
+        const mad = Uint8Array.from(Buffer.from(arrays.madBase64, "base64"));
+        if (median.length > 0 && median.length === mad.length) baseline = { median, mad };
+      }
+      const builder = new IncidentFigureBuilder({
+        incidentId: event.id,
+        label: event.affectedLabel ?? event.bandLabel,
+        rangeHz: event.affectedRangeHz,
+        evidenceStrength: event.evidenceStrength === "Medium" ? "Medium" : "Low",
+        lifecycle: event.lifecycle ?? "active",
+        observed: event.observed,
+        windowStartMs: Date.parse(slice.startedAt),
+        windowEndMs: Date.parse(slice.endedAt),
+        incidentStartMs,
+        incidentEndMs,
+        baseline,
+        sourceFramesSha256: await sha256File(indexPath),
+        frameTimestampsMs: timestamps,
+        generatedAtMs: options.generatedAtMs,
+        verdict: rfVerdictFor(event),
+        alertSigma: event.trigger?.policy.values.segmentSigma ?? 6,
+      });
+      for await (const indexed of boundedJsonlRecords<Record<string, unknown>>(indexPath, "Incident figure frames", false)) {
+        const decoded = this.decodeIndexedFrameRecord(indexed, "Incident figure frames");
+        const frame = decoded.frame;
+        let handle = handles.get(decoded.rawFile);
+        if (!handle) {
+          handle = await open(this.resolveWithin(stagingPath, decoded.rawFile), "r");
+          handles.set(decoded.rawFile, handle);
+        }
+        const bins = Buffer.alloc(decoded.rawLength);
+        const { bytesRead } = await handle.read(bins, 0, decoded.rawLength, decoded.rawOffset);
+        if (bytesRead !== decoded.rawLength) throw new Error("Incident figure frame is shorter than its index");
+        const analysisStartBin = Number.isSafeInteger(frame.analysisStartBin) ? (frame.analysisStartBin as number) : 0;
+        const analysisEndBin = Number.isSafeInteger(frame.analysisEndBin) ? (frame.analysisEndBin as number) : decoded.rawLength;
+        const detector = isRecord(frame.detectorAnalysis) ? frame.detectorAnalysis : undefined;
+        const anomalyBinRanges = Array.isArray(detector?.anomalyBinRanges)
+          ? (detector!.anomalyBinRanges as unknown[]).filter((range): range is { startBin: number; endBin: number } => isRecord(range)
+            && Number.isSafeInteger(range.startBin) && Number.isSafeInteger(range.endBin) && (range.endBin as number) > (range.startBin as number)).slice(0, 64)
+          : undefined;
+        builder.add({
+          timestampMs: Date.parse(frame.timestamp as string),
+          bins: new Uint8Array(bins.buffer, bins.byteOffset, bins.byteLength),
+          startHz: frame.startHz as number,
+          endHz: frame.endHz as number,
+          analysisStartBin,
+          analysisEndBin,
+          ...(anomalyBinRanges?.length ? { anomalyBinRanges } : {}),
+        });
+      }
+      const result = builder.finish();
+      const largest = Math.max(
+        Buffer.byteLength(result.svg),
+        result.waterfallPng.byteLength,
+        Buffer.byteLength(result.analysis.sheetSvg),
+        ...result.analysis.charts.map((chart) => Buffer.byteLength(chart.svg)),
+      );
+      if (largest > options.maxFileBytes) {
+        return { summary: { state: "unavailable", reason: "figure is larger than this archive part size allows" } };
+      }
+      return { svg: result.svg, png: result.waterfallPng, analysis: result.analysis, data: result.data, summary: result.summary };
+    } catch (error) {
+      return { summary: { state: "unavailable", reason: error instanceof Error ? error.message.slice(0, 200) : "figure could not be drawn" } };
+    } finally {
+      await Promise.all([...handles.values()].map((handle) => handle.close().catch(() => undefined)));
+    }
+  }
+
+  /**
+   * Builds the client report from evidence already staged for this incident.
+   * The PDF is optional so a failure there never blocks the evidence.
+   */
+  private async buildIncidentReport(
+    event: DetectionEvent,
+    figure: IncidentFigureFiles,
+    options: {
+      scope: IncidentReportModel["scope"];
+      generatedAtMs: number;
+      sessions: readonly EvidenceSession[];
+      baselineReference?: object;
+      triggerSnapshot?: AlertTriggerSnapshot;
+      completeness?: { complete: boolean; missingParts: string[] };
+      evidenceFiles?: Array<{ path: string; bytes: number; sha256: string }>;
+      report?: IncidentReportContext;
+      withPdf?: boolean;
+    },
+  ): Promise<{ model: IncidentReportModel; html: string; pdf?: Uint8Array }> {
+    const firstSession = options.sessions[0];
+    const readJson = async (name: string) => {
+      if (!firstSession) return undefined;
+      try {
+        return await this.readBoundedJsonObject(path.join(firstSession.path, name), `${name} for the report`);
+      } catch {
+        return undefined;
+      }
+    };
+    const [sessionConfig, sdrconnect] = await Promise.all([readJson("config.json"), readJson("sdrconnect.json")]);
+    const context = options.report;
+    const logoDataUri = context?.logo ? `data:${context.logo.mediaType};base64,${Buffer.from(context.logo.bytes).toString("base64")}` : undefined;
+    // The same wording rules as every other evidence file apply to the report.
+    const reportEvent = sanitizeEvidence(structuredClone(event)) as DetectionEvent;
+    const model = buildIncidentReportModel({
+      event: reportEvent,
+      generatedAtMs: options.generatedAtMs,
+      scope: options.scope,
+      dataDomain: this.dataDomain,
+      siteName: context?.siteName ?? (typeof sessionConfig?.siteName === "string" ? sessionConfig.siteName : "RF Monitor site"),
+      deploymentId: context?.deploymentId ?? (typeof sessionConfig?.deploymentId === "string" ? sessionConfig.deploymentId : undefined),
+      displayTimeZone: context?.displayTimeZone ?? "UTC",
+      reportIdentity: context?.reportIdentity,
+      logoDataUri,
+      serviceLabel: context?.serviceLabel,
+      runtimeIdentity: context?.runtimeIdentity ?? sessionConfig?.runtimeIdentity,
+      figure: figureForReport(figure),
+      triggerSnapshot: options.triggerSnapshot,
+      baselineReference: options.baselineReference,
+      sessionConfig,
+      sdrconnect,
+      completeness: options.completeness,
+      evidenceFiles: options.evidenceFiles,
+    });
+    const html = renderIncidentReportHtml(model);
+    let pdf: Uint8Array | undefined;
+    if (options.withPdf !== false) {
+      try {
+        pdf = await renderIncidentReportPdf(model);
+      } catch (error) {
+        console.warn(`Incident report PDF could not be drawn: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    return { model, html, pdf };
+  }
+
+  /** Render the PDF for a saved report model (used for the in-app report). */
+  async renderReportPdf(model: IncidentReportModel): Promise<Uint8Array> {
+    return renderIncidentReportPdf(model);
+  }
+
+  /**
+   * Everything an operator added or the system logged about this incident:
+   * screenshots, note files, and the operations, configuration-audit and
+   * receiver logs that fall inside the incident window (plus a margin).
+   */
+  private async writeIncidentAttachments(
+    sessions: readonly EvidenceSession[],
+    event: DetectionEvent,
+    destination: string,
+    windowStartMs: number,
+    windowEndMs: number,
+  ): Promise<void> {
+    const safeEventId = safeIdentifier(event.id, "event id");
+    const from = (Number.isFinite(windowStartMs) ? windowStartMs : Date.parse(event.startedAt)) - INCIDENT_LOG_MARGIN_MS;
+    const to = (Number.isFinite(windowEndMs) ? windowEndMs : Date.now()) + INCIDENT_LOG_MARGIN_MS;
+    let screenshots = 0;
+    const logLines: Record<"operations" | "configuration-audit" | "sdrconnect-events", string[]> = { operations: [], "configuration-audit": [], "sdrconnect-events": [] };
+    for (const session of sessions) {
+      const safeSessionId = safeIdentifier(session.id, "session id");
+      try {
+        for (const name of (await readdir(path.join(session.path, "screenshots", safeEventId))).sort()) {
+          if (!/^[A-Za-z0-9._-]+\.png$/.test(name) || screenshots >= MAX_EXPORT_SCREENSHOTS) continue;
+          const source = path.join(session.path, "screenshots", safeEventId, name);
+          const details = await lstat(source);
+          if (!details.isFile() || details.size > 8 * 1024 * 1024) continue;
+          await mkdir(path.join(destination, "evidence", "screenshots", safeSessionId), { recursive: true });
+          await copyFile(source, path.join(destination, "evidence", "screenshots", safeSessionId, name));
+          screenshots += 1;
+        }
+      } catch {
+        // No screenshots for this incident in this session.
+      }
+      try {
+        for (const name of (await readdir(path.join(session.path, "notes"))).sort()) {
+          if (!name.endsWith(`-${safeEventId}.json`)) continue;
+          const source = path.join(session.path, "notes", name);
+          const details = await lstat(source);
+          if (!details.isFile() || details.size > 64 * 1024) continue;
+          await mkdir(path.join(destination, "evidence", "notes"), { recursive: true });
+          await copyFile(source, path.join(destination, "evidence", "notes", name));
+        }
+      } catch {
+        // No notes directory.
+      }
+      for (const log of Object.keys(logLines) as Array<keyof typeof logLines>) {
+        const source = path.join(session.path, `${log}.jsonl`);
+        let anchor: string | undefined;
+        try {
+          for await (const entry of boundedJsonlRecords<Record<string, unknown>>(source, `${log} for ${safeSessionId}`, session.status === "recording")) {
+            const at = typeof entry.timestamp === "string" ? Date.parse(entry.timestamp) : Number.NaN;
+            const line = JSON.stringify(sanitizeEvidence({ ...entry, sourceSessionId: safeSessionId }));
+            if (Number.isFinite(at) && at >= from && at <= to) {
+              // The configuration audit is hash-chained: keep the entry before
+              // the window so the first in-window entry can be checked.
+              if (log === "configuration-audit" && anchor && !logLines[log].length) logLines[log].push(anchor);
+              logLines[log].push(line);
+            } else if (Number.isFinite(at) && at < from) anchor = line;
+            if (logLines[log].length >= 2_000) break;
+          }
+        } catch {
+          // A session without this log contributes nothing.
+        }
+      }
+    }
+    // Added after the source sessions were finalized: kept in the review log, not in a session.
+    for (const entry of await this.reviews.entriesFor(event.id)) {
+      if (entry.type !== "note") continue;
+      await writeAtomic(
+        path.join(destination, "evidence", "notes", `${safeTimestamp(entry.at)}-${safeEventId}-review.json`),
+        JSON.stringify(sanitizeEvidence({ eventId: safeEventId, timestamp: entry.at, text: entry.text, source: "incident-review-log" }), null, 2),
+      );
+    }
+    for (const [log, lines] of Object.entries(logLines)) {
+      await mkdir(path.join(destination, "logs"), { recursive: true });
+      await writeAtomic(path.join(destination, "logs", `${log}.jsonl`), lines.length ? `${lines.join("\n")}\n` : "");
+    }
+    // Link back to each source session's own integrity record, when it has one.
+    for (const session of sessions) {
+      const safeSessionId = safeIdentifier(session.id, "session id");
+      const integrity: Record<string, unknown> = { schemaVersion: 1, sessionId: safeSessionId, lifecycle: session.lifecycle ?? session.status };
+      for (const name of ["manifest.json", "finalization.json", "SHA256SUMS.txt"]) {
+        try {
+          const file = path.join(session.path, name);
+          const details = await stat(file);
+          integrity[name] = { bytes: details.size, sha256: await sha256File(file) };
+        } catch {
+          // Not finalized yet.
+        }
+      }
+      await writeAtomic(path.join(destination, "source-context", safeSessionId, "integrity.json"), JSON.stringify(integrity, null, 2));
+    }
   }
 
   private async writeIncidentEventHistory(sessions: readonly EvidenceSession[], eventId: string, destination: string): Promise<void> {
@@ -3316,12 +4084,18 @@ export class EvidenceStore {
     await appendFile(logPath, line);
   }
 
-  private enqueue<T>(operation: () => Promise<T>, estimatedBytes = 4 * 1024, priority: WriterPriority = "normal"): Promise<T> {
+  /**
+   * `critical` jobs (closing or rotating the session) may use the reserved slice of the bound, so a
+   * saturated queue cannot stop the service from closing its evidence. The overall bound is unchanged.
+   */
+  private enqueue<T>(operation: () => Promise<T>, estimatedBytes = 4 * 1024, priority: WriterPriority = "normal", critical = false): Promise<T> {
     if (!Number.isSafeInteger(estimatedBytes) || estimatedBytes <= 0 || estimatedBytes > MAX_WRITER_BYTES) {
       return Promise.reject(new Error(`Evidence writer job must be between 1 byte and ${MAX_WRITER_BYTES} bytes`));
     }
     const health = this.getWriterHealth();
-    if (health.queueItems >= MAX_WRITER_ITEMS || health.queueBytes + estimatedBytes > MAX_WRITER_BYTES) {
+    const itemLimit = critical ? MAX_WRITER_ITEMS : WRITER_ORDINARY_MAX_ITEMS;
+    const byteLimit = critical ? MAX_WRITER_BYTES : WRITER_ORDINARY_MAX_BYTES;
+    if (health.queueItems >= itemLimit || health.queueBytes + estimatedBytes > byteLimit) {
       return Promise.reject(new Error("Evidence writer queue reached its 64-item/2 MiB resource bound"));
     }
     return new Promise<T>((resolve, reject) => {

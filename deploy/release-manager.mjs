@@ -99,6 +99,30 @@ function releaseIdentity(value, label = "Release metadata") {
   };
 }
 
+const SHARE_FORBIDDEN_PREFIXES = ["/home", "/root", "/run/user", "/tmp", "/var/tmp", "/proc", "/sys", "/dev", "/etc", "/usr", "/boot", "/bin", "/sbin", "/lib", "/opt"];
+
+/**
+ * The optional user-readable evidence share. The service runs with ProtectHome and a strict file
+ * system, so it must be an ordinary space-free folder outside the evidence store, home folders and
+ * system directories. This mirrors src/server/sharePath.ts, which the service applies as well.
+ */
+export function shareFolder(value, protectedRoots) {
+  const candidate = String(value);
+  if (!/^\/[A-Za-z0-9._@/+-]+$/.test(candidate) || candidate.split("/").includes("..") || path.posix.normalize(candidate) !== candidate.replace(/\/+$/, "")) {
+    throw new Error("Evidence share folder must be a clean absolute path of letters, digits and . _ @ + - /");
+  }
+  const normalized = path.posix.normalize(candidate);
+  for (const prefix of SHARE_FORBIDDEN_PREFIXES) {
+    if (normalized === prefix || normalized.startsWith(`${prefix}/`)) throw new Error(`Evidence share folder must not be inside ${prefix}`);
+  }
+  for (const root of protectedRoots) {
+    if (normalized === root || inside(root, normalized) || inside(normalized, root)) {
+      throw new Error("Evidence share folder must be separate from the evidence store, runtime configuration and install root");
+    }
+  }
+  return normalized;
+}
+
 export function normalizeDeploymentLayout(input) {
   const installRoot = absolutePath(input.installRoot, "Install root");
   const releasesDirectory = absolutePath(input.releasesDirectory ?? path.join(installRoot, "releases"), "Releases directory");
@@ -109,6 +133,7 @@ export function normalizeDeploymentLayout(input) {
   const storageDirectory = absolutePath(input.storageDirectory, "Evidence storage directory");
   const runtimeConfigDirectory = absolutePath(input.runtimeConfigDirectory, "Runtime configuration directory");
   const nodeBinary = absolutePath(input.nodeBinary ?? "/usr/bin/node", "Node executable");
+  const shareDirectory = input.shareDirectory ? shareFolder(input.shareDirectory, [storageDirectory, runtimeConfigDirectory, installRoot]) : undefined;
   const serviceUser = serviceAccount(input.serviceUser ?? "rfmonitor", "Service user");
   const serviceGroup = serviceAccount(input.serviceGroup ?? "rfmonitor", "Service group");
   if (!inside(installRoot, releasesDirectory) || !inside(installRoot, activeLink) || !inside(installRoot, recordsDirectory)) {
@@ -126,6 +151,7 @@ export function normalizeDeploymentLayout(input) {
     configFile,
     storageDirectory,
     runtimeConfigDirectory,
+    ...(shareDirectory ? { shareDirectory } : {}),
     nodeBinary,
     serviceUser,
     serviceGroup,
@@ -482,6 +508,15 @@ export function renderApplicationUnit(template, layout) {
   let rendered = template;
   for (const [marker, value] of Object.entries(replacements)) rendered = rendered.replaceAll(marker, value);
   if (/@@[A-Z0-9_]+@@/.test(rendered)) throw new Error("Application unit has unresolved placeholders");
+  if (layout.shareDirectory) {
+    // Added here, not as a template placeholder, so a release that is staged by older deploy code
+    // still renders. The leading "-" keeps the service starting if the folder is ever missing.
+    const lines = rendered.split("\n");
+    const index = lines.findIndex((line) => line.startsWith("ReadWritePaths="));
+    if (index < 0 || lines.filter((line) => line.startsWith("ReadWritePaths=")).length !== 1) throw new Error("Application unit must contain exactly one ReadWritePaths line");
+    lines[index] = `${lines[index]} -${layout.shareDirectory}`;
+    rendered = lines.join("\n");
+  }
   const requiredLines = [
     `User=${layout.serviceUser}`,
     `Group=${layout.serviceGroup}`,

@@ -811,7 +811,7 @@ describe("bounded monitor runtime", () => {
     await monitor.stop();
   });
 
-  it("keeps quarantined learning observations out of the persisted baseline", async () => {
+  it("accepts non-alerting candidates into the learning baseline", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-20T12:00:00.000Z"));
     const config = enableSingleRadioTarget(await temporaryConfig("baseline-quarantine"));
@@ -835,26 +835,17 @@ describe("bounded monitor runtime", () => {
     for (let index = 0; index < 8; index += 1) await completeVisit(quiet);
     expect(monitor.getBaselineStates()[0]).toMatchObject({ lifecycle: "learning", observationCount: 8 });
 
+    // Unprotected learning treats a pending, non-alerting candidate as local
+    // site conditions, so these visits train instead of being quarantined.
     for (let index = 0; index < 12; index += 1) await completeVisit(elevated);
     expect(monitor.getBaselineStates()[0]).toMatchObject({
       lifecycle: "learning",
-      observationCount: 8,
-      learningExclusions: {
-        rejectedVisits: 12,
-        rejectedByReason: { "anomaly-candidate": 12 },
-        disqualifiedHours: 0,
-      },
+      observationCount: 20,
+      learningExclusions: { rejectedVisits: 0, disqualifiedHours: 0 },
     });
 
     await completeVisit(quiet);
-    // The first quiet visit releases the candidate freeze but is not allowed
-    // to train retroactively while that freeze was active.
-    expect(monitor.getBaselineStates()[0]).toMatchObject({
-      observationCount: 8,
-      learningExclusions: { rejectedVisits: 13, disqualifiedHours: 0 },
-    });
-    await completeVisit(quiet);
-    expect(monitor.getBaselineStates()[0].observationCount).toBe(9);
+    expect(monitor.getBaselineStates()[0].observationCount).toBeGreaterThan(20);
     await monitor.stop();
   });
 
@@ -954,6 +945,156 @@ describe("bounded monitor runtime", () => {
     });
     expect(monitor.getBaselineStates().filter((baseline) => baseline.targetId === before.targetId).at(-1)).toMatchObject({ learningGenerationId: "2" });
     await monitor.stop();
+  });
+
+  it("blocks a learning restart during an active alert unless the operator confirms ending it", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-20T12:00:00.000Z"));
+    const config = enableSingleRadioTarget(await temporaryConfig("restart-during-alert"));
+    const monitor = new MonitorService(config);
+    await monitor.start();
+    const internal = monitor as unknown as {
+      stopSimulation(): void;
+      handleSpectrum(receiverId: number, bins: Uint8Array, source: "simulation"): void;
+      targetStates: Map<string, Record<string, unknown>>;
+      activeEventsByTarget: Map<string, Record<string, unknown>>;
+      events: Array<Record<string, unknown>>;
+      clearTargetState(targetId: string): Record<string, unknown>;
+      refreshActiveEvent(): void;
+    };
+    internal.stopSimulation();
+    const quiet = new Uint8Array(640).fill(30);
+    internal.handleSpectrum(0, quiet, "simulation");
+    internal.handleSpectrum(0, quiet, "simulation");
+    internal.handleSpectrum(0, quiet, "simulation");
+    const before = monitor.getBaselineStates()[0];
+
+    // Put the target into the same state a persistent false alarm leaves it in.
+    const event: Record<string, unknown> = {
+      id: "event-under-restart", dataDomain: "test", sessionId: "s", kind: "gnss-energy-anomaly", status: "interference-likely",
+      severity: "medium", evidenceStrength: "Medium", evidenceBasis: "test", baselineFingerprintId: before.fingerprintId, ruleSetId: "r",
+      observationId: "o", service: "gnss", bandId: "b", targetId: before.targetId, bandLabel: "b", affectedRangeHz: [1, 2],
+      observed: "x", recommendedAction: "y", startedAt: "2026-08-20T11:59:00.000Z", lastSeenAt: "2026-08-20T11:59:30.000Z",
+      lifecycle: "active", notes: [], metrics: {},
+    };
+    internal.events = [event, ...internal.events];
+    internal.activeEventsByTarget.set(before.targetId, event);
+    internal.targetStates.set(before.targetId, { ...internal.clearTargetState(before.targetId), lifecycle: "active", candidateCount: 3, eventId: event.id });
+    internal.refreshActiveEvent();
+
+    const request = { targetId: before.targetId, expectedFingerprintId: before.fingerprintId, expectedGeneration: 1, restartedBy: "settings-admin" };
+    await expect(monitor.restartBaseline(request)).rejects.toThrow("Wait for the active or recovering observation to clear");
+    await expect(monitor.restartBaseline({ ...request, endActiveObservation: false })).rejects.toThrow("Wait for the active or recovering");
+    expect(event.lifecycle).toBe("active");
+
+    const restarted = await monitor.restartBaseline({ ...request, endActiveObservation: true });
+    expect(restarted).toMatchObject({ committed: true, state: "complete", auditDurable: true });
+    expect(restarted.baseline).toMatchObject({ lifecycle: "learning", learningGenerationId: "2", observationCount: 0 });
+    expect(event).toMatchObject({ lifecycle: "ended-unknown", endReason: expect.stringContaining("restarted by the operator") });
+    expect(typeof event.endedAt).toBe("string");
+    expect(internal.activeEventsByTarget.has(before.targetId)).toBe(false);
+    expect(monitor.getSnapshot().targetStates.find((state) => state.targetId === before.targetId)).toMatchObject({ lifecycle: "clear", candidateCount: 0 });
+    expect(monitor.getSnapshot().activeEvent).toBeUndefined();
+
+    const audit = await readFile(path.join(config.dataRoots.baseRoot, "domain-maintenance-audit.jsonl"), "utf8");
+    const entries = audit.trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(entries.find((entry) => entry.type === "baseline-learning-restarted")).toMatchObject({ endedEventIds: ["event-under-restart"] });
+    await monitor.stop();
+  });
+
+  it("saves a time-stamped incident image when an incident ends, only while the option is on, and prunes old ones", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-20T12:00:00.000Z"));
+    const config = enableSingleRadioTarget(await temporaryConfig("incident-figure"));
+    const monitor = new MonitorService(config);
+    await monitor.start();
+    const internal = monitor as unknown as {
+      stopSimulation(): void;
+      handleSpectrum(receiverId: number, bins: Uint8Array, source: "simulation"): void;
+      figureScheduler: { eventEnded(event: Record<string, unknown>): void };
+      figureQueue: Promise<void>;
+      evidence: { currentSession?: { id: string }; flush(): Promise<void> };
+      config: { retentionPolicy: Record<string, unknown> };
+      runStorageMaintenance(): Promise<unknown>;
+    };
+    internal.stopSimulation();
+    const quiet = new Uint8Array(640).fill(30);
+    for (let index = 0; index < 4; index += 1) {
+      vi.setSystemTime(new Date(Date.parse("2026-08-20T12:00:00.000Z") + index * 2_500));
+      internal.handleSpectrum(0, quiet, "simulation");
+    }
+    await internal.evidence.flush();
+    const sessionId = internal.evidence.currentSession!.id;
+    const target = monitor.getBaselineStates()[0];
+    const incident = {
+      id: "incident-image-1", dataDomain: "test", sessionId, sessionIds: [sessionId], kind: "gnss-energy-anomaly", status: "interference-likely",
+      severity: "medium", evidenceStrength: "Medium", evidenceBasis: "test", baselineFingerprintId: target.fingerprintId, ruleSetId: "r",
+      observationId: "o", service: "gnss", bandId: "b", targetId: target.targetId, bandLabel: "Test window", affectedRangeHz: [1, 2],
+      observed: "Narrowband energy stayed above its usual level.", recommendedAction: "Keep recording.",
+      startedAt: "2026-08-20T11:59:00.000Z", lastSeenAt: "2026-08-20T12:00:10.000Z", clearedAt: "2026-08-20T12:00:10.000Z",
+      lifecycle: "cleared", notes: [], metrics: {},
+    };
+    const imageDirectory = path.join(config.dataRoots.test.evidenceRoot, "incident-figures", incident.id);
+    const savedNames = async () => (await readdir(imageDirectory).catch(() => [])).sort();
+
+    internal.config.retentionPolicy.incidentFiguresEnabled = false;
+    internal.figureScheduler.eventEnded(incident);
+    await internal.figureQueue;
+    expect(await savedNames()).toEqual([]);
+
+    internal.config.retentionPolicy.incidentFiguresEnabled = true;
+    internal.figureScheduler.eventEnded(incident);
+    await internal.figureQueue;
+    const names = await savedNames();
+    expect(names).toHaveLength(5);
+    expect(names.every((name) => /^20260820T\d{6}Z-end(-analysis|-report)?\.(svg|png|html|json)$/.test(name))).toBe(true);
+    expect(await readFile(path.join(imageDirectory, names.find((name) => name.endsWith("-end.svg"))!), "utf8")).toContain("Figure generated (UTC) 2026-08-20");
+    expect((await monitor.getIncidentFigure(incident.id, "svg"))?.reason).toBe("end");
+
+    // The user's retention choice deletes it: 1 day kept, 2 days later.
+    internal.config.retentionPolicy.incidentFigureRetentionMs = 86_400_000;
+    vi.setSystemTime(new Date("2026-08-22T12:00:00.000Z"));
+    await internal.runStorageMaintenance();
+    expect(await savedNames()).toEqual([]);
+    await monitor.stop();
+  });
+
+  it("ignores frames and does not report a storage fault once a clean shutdown has begun", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-20T12:00:00.000Z"));
+    const config = enableSingleRadioTarget(await temporaryConfig("clean-shutdown"));
+    const monitor = new MonitorService(config);
+    await monitor.start();
+    const internal = monitor as unknown as {
+      stopSimulation(): void;
+      handleSpectrum(receiverId: number, bins: Uint8Array, source: "simulation"): void;
+      markStorageError(error?: unknown): void;
+      detector: { analyzeObservation(...arguments_: unknown[]): unknown };
+      evidence: { closeActive(): Promise<unknown> };
+      evidenceHealthy: boolean;
+      storageReprobeTimer?: unknown;
+    };
+    internal.stopSimulation();
+    const quiet = new Uint8Array(640).fill(30);
+    for (let index = 0; index < 3; index += 1) internal.handleSpectrum(0, quiet, "simulation");
+    const analyze = vi.spyOn(internal.detector, "analyzeObservation");
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    // While the session is being closed, a late receiver frame and a late write failure both arrive.
+    const closeActive = internal.evidence.closeActive.bind(internal.evidence);
+    internal.evidence.closeActive = async () => {
+      const result = await closeActive();
+      vi.setSystemTime(new Date("2026-08-20T12:00:10.000Z"));
+      internal.handleSpectrum(0, quiet, "simulation");
+      internal.markStorageError(new Error("Evidence session is not initialized"));
+      return result;
+    };
+    await monitor.stop();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(analyze).not.toHaveBeenCalled();
+    expect(errors.mock.calls.filter((call) => String(call[0]).includes("Evidence write failed"))).toEqual([]);
+    expect(internal.evidenceHealthy).toBe(true);
+    expect(internal.storageReprobeTimer).toBeUndefined();
+    errors.mockRestore();
   });
 
   it("restarts signal learning for the Fugro L-band capture target", async () => {
@@ -1322,5 +1463,201 @@ describe("bounded monitor runtime", () => {
       ready: false,
       faults: [],
     });
+  });
+});
+
+describe("alert sensitivity applies live and incidents explain themselves", () => {
+  type Internal = {
+    stopSimulation(): void;
+    handleSpectrum(receiverId: number, bins: Uint8Array, source: "simulation"): void;
+    activeEventsByTarget: Map<string, DetectionEvent>;
+    events: DetectionEvent[];
+    configurationEpoch: number;
+    detector: unknown;
+    evidence: { currentSession?: { id: string }; flush(): Promise<void> };
+    upsertEvent(receiverId: number, targetId: string, candidate: Omit<DetectionEvent, "id" | "sessionId" | "notes">): DetectionEvent;
+  };
+
+  function candidate(targetId: string, overrides: Partial<DetectionEvent> = {}): Omit<DetectionEvent, "id" | "sessionId" | "notes"> {
+    return {
+      dataDomain: "test", kind: "narrowband-spike", detailKind: "narrowband", status: "interference-likely", severity: "low", evidenceStrength: "Low",
+      evidenceBasis: "Relative RF anomaly from an unapproved or provisional baseline.", baselineFingerprintId: "f".repeat(64), ruleSetId: "rf-relative-mad-v1",
+      observationId: "observation-1", service: "startrack", bandId: "startrack-410-470", targetId, bandLabel: "StarTrack", affectedRangeHz: [406_000_000, 414_000_000],
+      disturbedRangesHz: [[409_000_000, 409_100_000]], observed: "Raised narrowband energy stayed above its usual level.", recommendedAction: "Keep recording.",
+      startedAt: "2026-08-20T12:00:00.000Z", lastSeenAt: "2026-08-20T12:00:00.000Z", lifecycle: "active",
+      metrics: { timestamp: "2026-08-20T12:00:00.000Z", bandId: "startrack-410-470", meanLevel: 30, peakLevel: 90, baselineLevel: 30, baselineDelta: 0, occupiedRatio: 0.01, overload: false },
+      ...overrides,
+    };
+  }
+
+  it("keeps an open incident when sensitivity changes, records why, and never retunes", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-20T12:00:00.000Z"));
+    const config = enableSingleRadioTarget(await temporaryConfig("live-sensitivity"));
+    const monitor = new MonitorService(config);
+    await monitor.start();
+    const internal = monitor as unknown as Internal;
+    internal.stopSimulation();
+    const targetId = "startrack-target";
+    const event = internal.upsertEvent(0, targetId, candidate(targetId));
+    await internal.evidence.flush();
+    const firstSession = internal.evidence.currentSession!.id;
+    const epoch = internal.configurationEpoch;
+    const detector = internal.detector;
+
+    const settings = structuredClone(config.operationalSettings);
+    settings.revision += 1;
+    settings.alerting.default = { preset: "sensitive", values: { ...settings.alerting.default.values } };
+    await monitor.applyLiveSettings(withOperationalSettings(config, settings), ["alerting.default.preset"]);
+
+    expect(event.lifecycle).toBe("active");
+    expect(internal.activeEventsByTarget.get(targetId)).toBe(event);
+    expect(event.timeline?.map((entry) => entry.code)).toContain("sensitivity-changed");
+    expect(event.timeline?.at(-1)?.detail).toContain("Sensitive");
+    expect(internal.configurationEpoch).toBe(epoch);
+    expect(internal.detector).toBe(detector);
+    expect(internal.evidence.currentSession!.id).not.toBe(firstSession);
+    expect(event.sessionIds).toEqual(expect.arrayContaining([firstSession, internal.evidence.currentSession!.id]));
+    expect(monitor.alertPolicyFor(targetId).choice).toBe("sensitive");
+
+    const retune = structuredClone(settings);
+    retune.scan.dwellMs.startrack += 1_000;
+    await expect(monitor.applyLiveSettings(withOperationalSettings(config, retune), ["scan.dwellMs.startrack"])).rejects.toThrow(/receiver restart/);
+    await monitor.stop();
+  });
+
+  it("keeps one incident when the raised energy changes shape, preserving the first trigger; overload starts its own", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-20T12:00:00.000Z"));
+    const config = enableSingleRadioTarget(await temporaryConfig("incident-merge"));
+    const monitor = new MonitorService(config);
+    await monitor.start();
+    const internal = monitor as unknown as Internal;
+    internal.stopSimulation();
+    const targetId = "startrack-target";
+    const firstTrigger = {
+      schemaVersion: 1, detailKind: "narrowband", firedAt: "2026-08-20T12:00:00.000Z",
+      measured: { peakZ: 12, medianZ: 0, occupancyRatio: 0.01, widestSegmentRatio: 0.01, widestSegmentMedianZ: 12, peakLevel: 90, usualLevelAtPeak: 30, levelAboveUsual: 60 },
+    } as unknown as DetectionEvent["trigger"];
+    const first = internal.upsertEvent(0, targetId, candidate(targetId, { trigger: firstTrigger }));
+    const second = internal.upsertEvent(0, targetId, candidate(targetId, {
+      kind: "wideband-noise-rise",
+      detailKind: "partial-band",
+      trigger: { ...firstTrigger!, detailKind: "partial-band", measured: { ...firstTrigger!.measured, peakZ: 20, widestSegmentRatio: 0.25 } },
+      lastSeenAt: "2026-08-20T12:00:06.000Z",
+      disturbedRangesHz: [[408_000_000, 410_000_000]],
+      observed: "Raised RF energy over 2.0 MHz.",
+    }));
+    expect(second).toBe(first);
+    expect(first).toMatchObject({ detailKind: "partial-band", kind: "wideband-noise-rise", startedAt: "2026-08-20T12:00:00.000Z", trigger: firstTrigger });
+    expect(first.disturbedRangesHz).toEqual([[408_000_000, 410_000_000]]);
+    expect(first.timeline?.map((entry) => entry.code)).toEqual(["alert", "kind-escalated"]);
+    expect(first.peak).toMatchObject({ maxPeakZ: 20, maxWidestSegmentRatio: 0.25, maxLevelAboveUsual: 60 });
+
+    const overload = internal.upsertEvent(0, targetId, candidate(targetId, { kind: "overload", detailKind: "overload", status: "suspicious", observed: "Receiver input is overloaded. Readings may be wrong." }));
+    expect(overload.id).not.toBe(first.id);
+    expect(first.lifecycle).toBe("cleared");
+    await monitor.stop();
+  });
+});
+
+describe("incident records that outlive their process", () => {
+  function openEvent(id: string, sessionId: string, dataDomain: string, targetId: string): DetectionEvent {
+    return {
+      id, dataDomain, sessionId, sessionIds: [sessionId], kind: "gnss-energy-anomaly", status: "interference-likely",
+      severity: "medium", evidenceStrength: "Low", evidenceBasis: "Relative RF energy", baselineFingerprintId: "f", ruleSetId: "r",
+      observationId: "o", service: "startrack", bandId: "b", targetId, bandLabel: "StarTrack", affectedRangeHz: [1, 2],
+      observed: "Raised energy", recommendedAction: "Check the antenna", startedAt: "2026-08-20T11:59:00.000Z", lastSeenAt: "2026-08-20T11:59:30.000Z",
+      lifecycle: "active", notes: [], metrics: {},
+    } as unknown as DetectionEvent;
+  }
+
+  it("ends an open incident in the record when the service stops", async () => {
+    const config = enableSingleRadioTarget(await temporaryConfig("stop-open-incident"));
+    const monitor = new MonitorService(config);
+    await monitor.start();
+    const internal = monitor as unknown as {
+      stopSimulation(): void;
+      activeEventsByTarget: Map<string, DetectionEvent>;
+      events: DetectionEvent[];
+      evidence: { currentSession?: { id: string } };
+    };
+    internal.stopSimulation();
+    const sessionId = internal.evidence.currentSession!.id;
+    const event = openEvent("event-open-at-stop", sessionId, config.dataDomain, "target-a");
+    internal.events = [event, ...internal.events];
+    internal.activeEventsByTarget.set("target-a", event);
+    await monitor.stop();
+
+    const restarted = new MonitorService(config);
+    await restarted.start();
+    (restarted as unknown as { stopSimulation(): void }).stopSimulation();
+    const stored = await restarted.getEvent(event.id, sessionId);
+    expect(stored).toMatchObject({ lifecycle: "ended-unknown", endReason: "RF Monitor stopped before the alert cleared" });
+    expect(stored?.timeline?.at(-1)).toMatchObject({ code: "ended" });
+    await restarted.stop();
+  });
+
+  it("shows a stored record that was never closed as ended at its last observation", async () => {
+    const config = enableSingleRadioTarget(await temporaryConfig("untracked-open-incident"));
+    const monitor = new MonitorService(config);
+    await monitor.start();
+    const internal = monitor as unknown as {
+      stopSimulation(): void;
+      evidence: { currentSession?: { id: string }; recordEvent(event: DetectionEvent): Promise<void> };
+    };
+    internal.stopSimulation();
+    const sessionId = internal.evidence.currentSession!.id;
+    // Written as open, then lost by the process (as after a retune or a failed final write).
+    await internal.evidence.recordEvent(openEvent("event-never-closed", sessionId, config.dataDomain, "target-b"));
+
+    const stored = await monitor.getEvent("event-never-closed", sessionId);
+    expect(stored).toMatchObject({ lifecycle: "ended-unknown", endedAt: "2026-08-20T11:59:30.000Z" });
+    const archive = await monitor.getEvidenceArchive();
+    const listed = archive.sessions.flatMap((session) => session.events).find((entry) => entry.id === "event-never-closed");
+    expect(listed).toMatchObject({ lifecycle: "ended-unknown", endedAt: "2026-08-20T11:59:30.000Z" });
+    await monitor.stop();
+  });
+
+  it("takes notes and a review on an incident from an earlier run without changing its session", async () => {
+    const config = enableSingleRadioTarget(await temporaryConfig("review-stored-incident"));
+    const monitor = new MonitorService(config);
+    await monitor.start();
+    const internal = monitor as unknown as {
+      stopSimulation(): void;
+      evidence: { currentSession?: { id: string }; recordEvent(event: DetectionEvent): Promise<void> };
+    };
+    internal.stopSimulation();
+    const sessionId = internal.evidence.currentSession!.id;
+    const startedAt = new Date(Date.now() - 3_600_000).toISOString();
+    const clearedAt = new Date(Date.now() - 3_500_000).toISOString();
+    await internal.evidence.recordEvent({ ...openEvent("event-to-review", sessionId, config.dataDomain, "target-c"), startedAt, lastSeenAt: clearedAt, clearedAt, lifecycle: "cleared" });
+    await monitor.stop();
+
+    const restarted = new MonitorService(config);
+    await restarted.start();
+    const evidence = (restarted as unknown as { stopSimulation(): void; evidence: { root: string; listSessions(): Promise<Array<{ id: string; path: string }>> } });
+    evidence.stopSimulation();
+    const sessionPath = (await evidence.evidence.listSessions()).find((session) => session.id === sessionId)!.path;
+    const eventsBefore = await readFile(path.join(sessionPath, "events", "events.jsonl"), "utf8");
+    expect((await restarted.getRecentIncidents()).toReview).toBe(1);
+
+    const noted = await restarted.addNote("event-to-review", "Checked the antenna; bridge saw no position jump.");
+    expect(noted?.notes.map((note) => note.text)).toEqual(["Checked the antenna; bridge saw no position jump."]);
+    const reviewed = await restarted.acknowledgeEvent("event-to-review");
+    expect(reviewed?.acknowledgedAt).toBeTruthy();
+    expect(await restarted.acknowledgeEvent("event-to-review")).toMatchObject({ acknowledgedAt: reviewed?.acknowledgedAt });
+
+    const stored = await restarted.getEvent("event-to-review", sessionId);
+    expect(stored?.notes).toHaveLength(1);
+    expect(stored?.acknowledgedAt).toBe(reviewed?.acknowledgedAt);
+    expect(stored?.timeline?.map((entry) => entry.code)).toEqual(expect.arrayContaining(["note", "acknowledged"]));
+    const recent = await restarted.getRecentIncidents();
+    expect(recent.toReview).toBe(0);
+    expect(recent.incidents.find((entry) => entry.id === "event-to-review")?.notes).toHaveLength(1);
+    expect(await readFile(path.join(sessionPath, "events", "events.jsonl"), "utf8")).toBe(eventsBefore);
+    expect(await readFile(path.join(evidence.evidence.root, "incident-reviews.jsonl"), "utf8")).toContain("event-to-review");
+    expect(await restarted.addNote("missing-incident", "No such incident")).toBeUndefined();
+    await restarted.stop();
   });
 });

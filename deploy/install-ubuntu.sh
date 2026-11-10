@@ -493,6 +493,7 @@ activation_output="$(privileged env \
   RFMON_TLS_CERTIFICATE="${tls_certificate}" \
   RFMON_TLS_PRIVATE_KEY="${tls_private_key}" \
   RFMON_BACKEND_PORT="${backend_port}" \
+  RFMON_SHARE_DIR="$(read_protected_config_value RF_MONITOR_SHARE_DIR || true)" \
   RFMON_SDRCONNECT_PORTS="$(IFS=,; echo "${local_sdr_ports[*]}")" \
   RFMON_LOCAL_HEALTH_URL="http://127.0.0.1:${backend_port}/api/health" \
   "${NODE_BIN}" "${RELEASE_DIR}/deploy/release-cli.mjs" "${activation_arguments[@]}")" \

@@ -1,4 +1,4 @@
-import type { DetectionEvent, EvidenceStrength } from "./types";
+import type { AlertDetailKind, DetectionEvent, DetectionKind, EvidenceStrength, ServiceGroup } from "./types";
 
 export const RF_PRODUCT_CONTRACT_VERSION = "rf-spectrum-sentinel-v1" as const;
 export const PRODUCTION_SAMPLE_RATE_HZ = 10_000_000;
@@ -46,6 +46,18 @@ export const RF_ONLY_VERDICTS = [
 ] as const;
 
 export type RfOnlyVerdict = typeof RF_ONLY_VERDICTS[number];
+
+/**
+ * The one operator verdict for an RF incident. GNSS incidents always read
+ * "Suspected RF interference" whatever rule fired; the specific rule is shown
+ * separately under "Why this alert". Overload is an acquisition fault.
+ */
+export function rfVerdictFor(event: { kind: DetectionKind; detailKind?: AlertDetailKind; service?: ServiceGroup }): RfOnlyVerdict {
+  if (event.kind === "overload" || event.detailKind === "overload") return "Receiver overloaded";
+  if (event.kind === "gnss-energy-anomaly" || event.service === "gnss") return "Suspected RF interference";
+  if (event.kind === "narrowband-spike" || event.detailKind === "narrowband") return "Narrow RF anomaly";
+  return "Suspected RF interference";
+}
 
 export interface ProductionHardwareConfiguration {
   receiverCount: number;
@@ -113,11 +125,7 @@ function normalizedOperatorCopy(value: string): string {
 
 /** Runtime guard used at the event boundary as well as by type-level claim tests. */
 export function rfOnlyDetectionClaimBlockers(event: RfOnlyDetectionClaim): string[] {
-  const verdict: RfOnlyVerdict = event.kind === "overload"
-    ? "Receiver overloaded"
-    : event.kind === "narrowband-spike"
-      ? "Narrow RF anomaly"
-      : "Suspected RF interference";
+  const verdict = rfVerdictFor(event);
   // The approved scope disclaimer explicitly denies intent attribution. Strip
   // only that exact sentence before looking for unsupported affirmative copy;
   // every other mention of intent, spoofing, jamming, calibration, or

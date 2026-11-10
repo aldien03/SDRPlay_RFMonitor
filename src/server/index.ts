@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { createServer, type IncomingMessage } from "node:http";
 import { createReadStream, existsSync } from "node:fs";
 import path from "node:path";
@@ -10,9 +11,12 @@ import express from "express";
 import { WebSocketServer, WebSocket } from "ws";
 import { estimateRevisitMs } from "../shared/bands";
 import { liveSubscriptionSignature, normalizeLiveSubscription, type NormalizedLiveSubscription } from "../shared/liveSubscription";
-import { evaluateSettingsFeasibility, SettingsValidationError } from "../shared/settings";
+import { changedFieldPaths, classifySettingsChange, evaluateSettingsFeasibility, MAX_REPORT_LOGO_BYTES, MAX_REPORT_LOGO_PIXELS, ROBUST_DETECTION_DEFAULTS, SettingsValidationError } from "../shared/settings";
+import { ALERT_POLICY_BOUNDS, alertPresetDefinitions } from "../shared/alertPolicy";
+import { chartToSvg } from "./report/svgChart";
+import { triggerSnapshotChart } from "./report/triggerChart";
 import type { CurrentMonitoringHealth, DetectionEvent, DiagnosticSummaryState, HealthSnapshotV2, LiveSubscription, MonitorSnapshot, MonitorStateDelta, OperationalSettings, ProductionQualification, ResourceHealth, ServiceMessage, SettingsRevision, StreamingHealth } from "../shared/types";
-import { encodeSpectrumEnvelope, LIVE_HEARTBEAT_INTERVAL_MS } from "../shared/liveProtocol";
+import { compactLiveEvent, encodeSpectrumEnvelope, LIVE_HEARTBEAT_INTERVAL_MS } from "../shared/liveProtocol";
 import { AdminAuth, AdminAuthenticationError } from "./adminAuth";
 import { loadConfig, withOperationalSettings } from "./config";
 import { BaselineApprovalUnavailableError, CommittedBaselineRestartRecoveryError, MonitorService } from "./monitorService";
@@ -21,7 +25,7 @@ import { HostMemoryController } from "./hostMemory";
 import { RevisionConflictError, SettingsStore } from "./settingsStore";
 import { BaselineConflictError, BaselineNotReviewableError } from "./baselineStore";
 import { ExportJobQueue, ExportProtectedBytesError, ExportQueueFullError } from "./exportJobQueue";
-import { EvidenceExportSourceError } from "./evidenceStore";
+import { EvidenceExportSourceError, WRITER_ORDINARY_MAX_BYTES, WRITER_ORDINARY_MAX_ITEMS } from "./evidenceStore";
 import { EvidencePlaybackError, EvidencePlaybackReader } from "./evidencePlayback";
 import {
   MAX_SCREENSHOT_PNG_BYTES,
@@ -49,6 +53,8 @@ import type { SyntheticRunMode } from "../shared/syntheticValidation";
 import { detectorQualificationPlan } from "../shared/detectorQualification";
 import { sha256Canonical } from "./syntheticValidation";
 import { StabilityIncidentStore } from "./stabilityIncidentStore";
+import { createShutdownCoordinator, guardUpgradeSocket, guardWebSocket } from "./processSafety";
+import { DgnssReportService, DgnssUserError, MAX_UPLOAD_BYTES as DGNSS_MAX_UPLOAD_BYTES } from "./positioning/service";
 
 const streamingStartedAt = Date.now();
 const streamingCounters = {
@@ -131,7 +137,7 @@ const productionQualificationStore = await ProductionQualificationStore.open(pat
     ?? "/etc/rf-monitor/qualification-approval-v1.json",
 });
 type ExportRequest =
-  | { kind: "incident"; eventId: string; sessionId?: string }
+  | { kind: "incident"; eventId: string; sessionId?: string; requester?: string }
   | { kind: "session"; sessionId: string };
 const protectedExportByteLimit = () => Math.max(
   1,
@@ -140,7 +146,7 @@ const protectedExportByteLimit = () => Math.max(
 const exportQueue = new ExportJobQueue<ExportRequest>({
   builder: async (request, context) => {
     const outputPath = request.kind === "incident"
-      ? await monitor.exportIncident(request.eventId, request.sessionId, context.jobId)
+      ? await monitor.exportIncident(request.eventId, request.sessionId, context.jobId, request.requester)
       : await monitor.exportSession(request.sessionId, context.jobId);
     if (!outputPath) throw new Error(request.kind === "incident" ? "Incident evidence was not found" : "Evidence session was not found");
     return outputPath;
@@ -150,6 +156,25 @@ const exportQueue = new ExportJobQueue<ExportRequest>({
   onOutputsReleased: (paths) => monitor.protectExportArtifacts(paths, false),
   onOutputsDiscarded: (paths) => monitor.discardExportArtifacts(paths),
   maxProtectedOutputBytes: protectedExportByteLimit,
+});
+const dgnssReports = await DgnssReportService.open({
+  root: path.join(config.dataRoots[config.dataDomain].root, "dgnss-reports"),
+  configPath: path.join(path.dirname(config.settingsPaths.operational), "dgnss-report-v1.json"),
+  evidenceRoot: config.storageRoot,
+  dataDomain: config.dataDomain,
+  retentionMs: config.retentionPolicy.retentionMs,
+  identity: () => {
+    const settings = settingsStore.settings;
+    const identity = settings.reportIdentity ?? {};
+    return { companyName: identity.companyName, vesselName: identity.vesselName ?? settings.siteName, clientName: identity.clientName, survey: identity.projectReference };
+  },
+  targetLabel: (targetId) => config.bandCatalog.captureTargets.find((target) => target.id === targetId)?.label ?? targetId,
+  canStart: () => currentResourceHealth().admitExports !== false,
+  audit: async (action, reason, address) => {
+    await settingsStore.recordOperationalAction(action, "admin", address, reason);
+  },
+  // Bundled build: dist/server-node/dgnss-report-worker.js beside index.js; source run: the .ts module.
+  workerUrl: import.meta.url.endsWith(".ts") ? new URL("./positioning/worker.ts", import.meta.url) : new URL("./dgnss-report-worker.js", import.meta.url),
 });
 const diagnosticsCollector = new DiagnosticsCollector({ runtimeProvider: diagnosticsRuntimeSample });
 const app = express();
@@ -241,11 +266,15 @@ function settingsResponse(request: express.Request): SettingsRevision {
     baselineApprovals: monitor.getBaselineApprovalEligibility(),
     commissioning: monitor.getCommissioningHealth(),
     admin: { available: adminAuth.available, unlocked: session.unlocked, expiresAt: session.expiresAt },
+    alertPresets: alertPresetDefinitions(),
+    alertPolicyBounds: ALERT_POLICY_BOUNDS,
+    detectionDefaults: { ...ROBUST_DETECTION_DEFAULTS },
     infrastructure: {
       dataDomain: config.dataDomain,
       receiverUrls: config.receiverUrls,
       sampleRateHz: config.sampleRateHz,
       storageRoot: config.storageRoot,
+      ...(config.shareDirectory && config.dataDomain === "field" ? { shareDirectory: config.shareDirectory } : {}),
       bindAddress: `${config.host}:${config.port}`,
     },
   };
@@ -442,10 +471,7 @@ function downloadRateLimiter(bytesPerSecond = 5 * 1024 * 1024): Transform {
 }
 
 function compactSnapshot(snapshot: MonitorSnapshot, engineer = false): MonitorSnapshot {
-  const compactEvent = (event: DetectionEvent | undefined) => event ? {
-    ...event,
-    notes: event.notes.slice(-8).map((note) => ({ ...note, text: note.text.slice(0, 512) })),
-  } : undefined;
+  const compactEvent = (event: DetectionEvent | undefined, includeTrigger = false) => event ? compactLiveEvent(event, includeTrigger) : undefined;
   return {
     ...snapshot,
     currentFrame: snapshot.currentFrame ? { ...snapshot.currentFrame, bins: new Uint8Array() } : undefined,
@@ -456,7 +482,7 @@ function compactSnapshot(snapshot: MonitorSnapshot, engineer = false): MonitorSn
       waterfall: [],
     })),
     panorama: engineer ? snapshot.panorama.map((segment) => ({ ...segment, bins: new Uint8Array() })) : [],
-    activeEvent: compactEvent(snapshot.activeEvent),
+    activeEvent: compactEvent(snapshot.activeEvent, true),
     events: snapshot.events.slice(0, 10).map((event) => compactEvent(event)!),
     sessions: snapshot.sessions.slice(0, 6),
   };
@@ -561,8 +587,8 @@ function authoritativeSnapshot(
   const recordingState = !source.evidenceHealthy
     || source.storagePolicy.pressure
     || writer.oldestAgeMs >= 2_000
-    || writer.queueItems >= 64
-    || writer.queueBytes >= 2 * 1024 * 1024
+    || writer.queueItems >= WRITER_ORDINARY_MAX_ITEMS
+    || writer.queueBytes >= WRITER_ORDINARY_MAX_BYTES
     ? "error" as const
     : activeRecording
       ? "recording" as const
@@ -1095,19 +1121,42 @@ app.put("/api/settings", async (request, response) => {
   let prepared;
   try {
     prepared = settingsStore.prepare(incoming, expectedRevision);
+    const changedFields = changedFieldPaths(settingsStore.settings, prepared.settings)
+      .filter((field) => !["revision", "updatedAt"].includes(field));
+    const applied = classifySettingsChange(changedFields);
+    if (applied === "learning-restart" && request.body?.confirmSignalLearningRestart !== true) {
+      response.status(428).json({
+        error: "Changing signal-learning rules restarts signal learning for every window and ends active incidents. Confirm to continue.",
+        code: "SIGNAL_LEARNING_RESTART_CONFIRMATION_REQUIRED",
+        applied,
+      });
+      return;
+    }
     const previousConfig = config;
     const nextConfig = withOperationalSettings(config, prepared.settings);
-    await monitor.reconfigure(nextConfig);
     let auditEntry;
-    try {
-      auditEntry = await settingsStore.commit(prepared, "settings-admin", clientAddress(request));
-    } catch (error) {
-      await monitor.reconfigure(previousConfig).catch(() => undefined);
-      throw error;
+    if (applied === "live" || applied === "none") {
+      // Alert sensitivity, site identity, time zone, retention and report
+      // identity never retune the receiver or end an incident.
+      if (applied === "live") await monitor.applyLiveSettings(nextConfig, changedFields);
+      try {
+        auditEntry = await settingsStore.commit(prepared, "settings-admin", clientAddress(request));
+      } catch (error) {
+        if (applied === "live") await monitor.applyLiveSettings(previousConfig, changedFields).catch(() => undefined);
+        throw error;
+      }
+    } else {
+      await monitor.reconfigure(nextConfig);
+      try {
+        auditEntry = await settingsStore.commit(prepared, "settings-admin", clientAddress(request));
+      } catch (error) {
+        await monitor.reconfigure(previousConfig).catch(() => undefined);
+        throw error;
+      }
     }
     config = nextConfig;
     await monitor.recordConfigurationAudit(auditEntry);
-    response.json(settingsResponse(request));
+    response.json({ ...settingsResponse(request), applied });
   } catch (error) {
     await settingsStore.recordRejected(error instanceof Error ? error.message : String(error), "settings-admin", clientAddress(request), prepared?.configurationHash).catch(() => undefined);
     if (error instanceof RevisionConflictError) {
@@ -1154,7 +1203,11 @@ async function updateBaseline(
       response.json({ configurationRevision: settingsStore.settings.revision, baseline: descriptor });
       return;
     }
-    const result = await monitor.restartBaseline({ ...common, restartedBy: "settings-admin" });
+    const result = await monitor.restartBaseline({
+      ...common,
+      restartedBy: "settings-admin",
+      endActiveObservation: request.body?.endActiveObservation === true,
+    });
     response.status(result.state === "complete" ? 200 : 202).json({
       configurationRevision: settingsStore.settings.revision,
       baseline: result.baseline,
@@ -1428,12 +1481,26 @@ app.post("/api/storage/maintenance", async (_request, response) => {
 });
 
 app.post("/api/events/:eventId/acknowledge", async (request, response) => {
-  const event = await monitor.acknowledgeEvent(request.params.eventId);
-  if (!event) {
-    response.status(404).json({ error: "Event not found" });
-    return;
+  try {
+    const event = await monitor.acknowledgeEvent(request.params.eventId);
+    if (!event) {
+      response.status(404).json({ error: "Event not found" });
+      return;
+    }
+    response.json(event);
+  } catch (error) {
+    response.status(422).json({ error: error instanceof Error ? error.message : String(error) });
   }
-  response.json(event);
+});
+
+app.get("/api/incidents/recent", async (request, response) => {
+  const limit = typeof request.query.limit === "string" ? Number(request.query.limit) : 6;
+  try {
+    response.setHeader("Cache-Control", "no-store");
+    response.json(await monitor.getRecentIncidents(limit));
+  } catch {
+    response.status(503).json({ error: "Recent incidents could not be read. Try again." });
+  }
 });
 
 app.post("/api/events/:eventId/notes", async (request, response) => {
@@ -1559,6 +1626,7 @@ app.post("/api/exports", async (request, response) => {
         kind,
         eventId: boundedIdentifier(request.body?.eventId),
         sessionId: request.body?.sessionId === undefined ? undefined : boundedIdentifier(request.body.sessionId),
+        requester: clientAddress(request),
       }, { estimatedOutputBytes: incidentExportReservationBytes() });
     } else if (kind === "session") {
       job = await submitSessionExport(boundedIdentifier(request.body?.sessionId));
@@ -1620,6 +1688,36 @@ app.get("/api/exports/:jobId/download", async (request, response) => {
   }
 });
 
+async function sendIncidentFigure(request: express.Request, response: express.Response, kind: "svg" | "png" | "analysis"): Promise<void> {
+  const format = kind === "png" ? "png" : "svg";
+  try {
+    const figure = await monitor.getIncidentFigure(boundedIdentifier(request.params.eventId), kind);
+    if (!figure) {
+      response.status(404).json({ error: "No saved image exists for this incident yet" });
+      return;
+    }
+    response.setHeader("Cache-Control", "no-store");
+    response.setHeader("X-Content-Type-Options", "nosniff");
+    // The image is data only. Nothing in it may run script or load anything else.
+    response.setHeader("Content-Security-Policy", "default-src 'none'; img-src data:; style-src 'unsafe-inline'; sandbox");
+    response.setHeader("Content-Disposition", `inline; filename="incident-${boundedIdentifier(request.params.eventId)}-${figure.stamp}${kind === "analysis" ? "-analysis" : ""}.${format}"`);
+    response.type(format === "svg" ? "image/svg+xml" : "image/png").send(figure.bytes);
+  } catch {
+    response.status(400).json({ error: "The incident image could not be read" });
+  }
+}
+
+app.get("/api/events/:eventId/figure.:format", async (request, response) => {
+  const format = request.params.format;
+  if (format !== "svg" && format !== "png") {
+    response.status(404).json({ error: "Unknown image format" });
+    return;
+  }
+  await sendIncidentFigure(request, response, format);
+});
+
+app.get("/api/events/:eventId/analysis.svg", (request, response) => void sendIncidentFigure(request, response, "analysis"));
+
 app.get("/api/events/:eventId/export", (request, response) => {
   if (exportBuildPressure()) {
     response.status(503).setHeader("Retry-After", "10").json({ error: "Exports are paused while RF monitoring resources recover" });
@@ -1636,6 +1734,340 @@ app.get("/api/events/:eventId/export", (request, response) => {
     respondExportSubmissionError(response, error);
   }
 });
+
+app.get("/api/events/:eventId", async (request, response) => {
+  let eventId: string;
+  try {
+    eventId = boundedIdentifier(request.params.eventId);
+  } catch (error) {
+    response.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    return;
+  }
+  const sessionId = typeof request.query.sessionId === "string" ? request.query.sessionId : undefined;
+  const event = await monitor.getEvent(eventId, sessionId).catch(() => undefined);
+  if (!event) {
+    response.status(404).json({ error: "Incident not found" });
+    return;
+  }
+  response.setHeader("Cache-Control", "no-store");
+  response.json(event);
+});
+
+app.get("/api/events/:eventId/trigger.json", async (request, response) => {
+  try {
+    const snapshot = await monitor.getTriggerSnapshot(boundedIdentifier(request.params.eventId));
+    if (!snapshot) {
+      response.status(404).json({ error: "No trigger snapshot exists for this incident" });
+      return;
+    }
+    response.setHeader("Cache-Control", "no-store");
+    response.json(snapshot);
+  } catch {
+    response.status(400).json({ error: "The trigger snapshot could not be read" });
+  }
+});
+
+app.get("/api/events/:eventId/trigger.svg", async (request, response) => {
+  try {
+    const eventId = boundedIdentifier(request.params.eventId);
+    const [snapshot, event] = await Promise.all([monitor.getTriggerSnapshot(eventId), monitor.getEvent(eventId)]);
+    if (!snapshot) {
+      response.status(404).json({ error: "No trigger snapshot exists for this incident" });
+      return;
+    }
+    response.setHeader("Cache-Control", "no-store");
+    response.setHeader("X-Content-Type-Options", "nosniff");
+    response.setHeader("Content-Security-Policy", "default-src 'none'; img-src data:; style-src 'unsafe-inline'; sandbox");
+    // size=compact: the drawer picture (no title or caption inside); range=disturbed: zoom on the raised frequencies.
+    const compact = request.query.size === "compact";
+    const chart = triggerSnapshotChart(snapshot, event, { compact, disturbedOnly: request.query.range === "disturbed" });
+    response.type("image/svg+xml").send(chartToSvg(chart, { standalone: !compact, idPrefix: "trigger" }));
+  } catch {
+    response.status(400).json({ error: "The trigger snapshot could not be drawn" });
+  }
+});
+
+// ---- Client incident report -------------------------------------------------
+// The report is data-only HTML: inline styles and data: images, no script.
+const REPORT_CSP = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'self'";
+
+function reportFailure(response: express.Response, error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  const busy = /paused|busy/i.test(message);
+  response.status(busy ? 503 : 500).setHeader("Retry-After", busy ? "10" : "0").json({ error: busy ? message : "The incident report could not be prepared" });
+}
+
+app.get("/api/events/:eventId/report.html", async (request, response) => {
+  try {
+    const eventId = boundedIdentifier(request.params.eventId);
+    const report = await monitor.getIncidentReport(eventId, "html");
+    if (!report) {
+      response.status(404).json({ error: "No recorded frames are available for this incident yet" });
+      return;
+    }
+    response.setHeader("Cache-Control", "no-store");
+    response.setHeader("X-Content-Type-Options", "nosniff");
+    response.setHeader("Content-Security-Policy", REPORT_CSP);
+    response.type("text/html; charset=utf-8").send(report.bytes);
+  } catch (error) {
+    reportFailure(response, error);
+  }
+});
+
+app.get("/api/events/:eventId/report.json", async (request, response) => {
+  try {
+    const report = await monitor.getIncidentReport(boundedIdentifier(request.params.eventId), "json");
+    if (!report) {
+      response.status(404).json({ error: "No recorded frames are available for this incident yet" });
+      return;
+    }
+    response.setHeader("Cache-Control", "no-store");
+    response.type("application/json").send(report.bytes);
+  } catch (error) {
+    reportFailure(response, error);
+  }
+});
+
+let reportPdfInFlight = false;
+app.get("/api/events/:eventId/report.pdf", async (request, response) => {
+  if (reportPdfInFlight) {
+    response.status(429).setHeader("Retry-After", "3").json({ error: "Another report PDF is being prepared; try again in a moment" });
+    return;
+  }
+  reportPdfInFlight = true;
+  try {
+    const eventId = boundedIdentifier(request.params.eventId);
+    const pdf = await monitor.getIncidentReportPdf(eventId);
+    if (!pdf) {
+      response.status(404).json({ error: "No recorded frames are available for this incident yet" });
+      return;
+    }
+    response.setHeader("Cache-Control", "no-store");
+    response.setHeader("X-Content-Type-Options", "nosniff");
+    response.setHeader("Content-Disposition", `attachment; filename="RF-Incident-Report_${eventId.replace(/[^A-Za-z0-9]/g, "").slice(0, 8)}.pdf"`);
+    response.type("application/pdf").send(Buffer.from(pdf));
+  } catch (error) {
+    reportFailure(response, error);
+  } finally {
+    reportPdfInFlight = false;
+  }
+});
+
+const reportRefreshLimiter = new Map<string, number>();
+app.post("/api/events/:eventId/report/refresh", async (request, response) => {
+  try {
+    const eventId = boundedIdentifier(request.params.eventId);
+    const last = reportRefreshLimiter.get(eventId) ?? 0;
+    if (Date.now() - last < 15_000) {
+      response.status(429).setHeader("Retry-After", "15").json({ error: "The report was updated moments ago" });
+      return;
+    }
+    reportRefreshLimiter.set(eventId, Date.now());
+    if (reportRefreshLimiter.size > 256) reportRefreshLimiter.delete(reportRefreshLimiter.keys().next().value!);
+    const report = await monitor.getIncidentReport(eventId, "html", true);
+    if (!report) {
+      response.status(404).json({ error: "No recorded frames are available for this incident yet" });
+      return;
+    }
+    response.json({ updated: true, stamp: report.stamp });
+  } catch (error) {
+    reportFailure(response, error);
+  }
+});
+
+const reportLogoParser = express.raw({ type: ["image/png", "image/jpeg"], limit: MAX_REPORT_LOGO_BYTES });
+
+/** PNG or JPEG pixel size from the file header, without decoding the image. */
+function imageDimensions(bytes: Buffer, mediaType: "image/png" | "image/jpeg"): { width: number; height: number } | undefined {
+  if (mediaType === "image/png") {
+    if (bytes.length < 24 || bytes.readUInt32BE(0) !== 0x89504e47 || bytes.toString("ascii", 12, 16) !== "IHDR") return undefined;
+    return { width: bytes.readUInt32BE(16), height: bytes.readUInt32BE(20) };
+  }
+  if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return undefined;
+  let offset = 2;
+  while (offset + 9 < bytes.length) {
+    if (bytes[offset] !== 0xff) return undefined;
+    const marker = bytes[offset + 1];
+    const length = bytes.readUInt16BE(offset + 2);
+    if (marker >= 0xc0 && marker <= 0xcf && ![0xc4, 0xc8, 0xcc].includes(marker)) {
+      return { height: bytes.readUInt16BE(offset + 5), width: bytes.readUInt16BE(offset + 7) };
+    }
+    offset += 2 + length;
+  }
+  return undefined;
+}
+
+app.put("/api/settings/report-logo", reportLogoParser, async (request, response) => {
+  if (!requireAdmin(request, response)) return;
+  const mediaType = request.is("image/png") ? "image/png" : request.is("image/jpeg") ? "image/jpeg" : undefined;
+  const bytes = Buffer.isBuffer(request.body) ? request.body : undefined;
+  if (!mediaType || !bytes?.length) {
+    response.status(415).json({ error: "Upload a PNG or JPEG logo" });
+    return;
+  }
+  const size = imageDimensions(bytes, mediaType);
+  if (!size || size.width < 1 || size.height < 1 || size.width > MAX_REPORT_LOGO_PIXELS || size.height > MAX_REPORT_LOGO_PIXELS) {
+    response.status(422).json({ error: `The logo must be a valid PNG or JPEG up to ${MAX_REPORT_LOGO_PIXELS} × ${MAX_REPORT_LOGO_PIXELS} pixels` });
+    return;
+  }
+  const sha256 = createHash("sha256").update(bytes).digest("hex");
+  try {
+    await monitor.storeReportLogo(new Uint8Array(bytes), mediaType, sha256);
+    response.json({ sha256, mediaType, widthPx: size.width, heightPx: size.height, bytes: bytes.length });
+  } catch {
+    response.status(500).json({ error: "The logo could not be saved" });
+  }
+});
+
+app.get("/api/site/report-logo", async (request, response) => {
+  const sha = typeof request.query.sha === "string" ? request.query.sha : undefined;
+  const logo = sha ? await monitor.readReportLogoBySha(sha) : await monitor.readReportLogo();
+  if (!logo) {
+    response.status(404).json({ error: "No report logo is set" });
+    return;
+  }
+  response.setHeader("Cache-Control", "private, max-age=300");
+  response.setHeader("X-Content-Type-Options", "nosniff");
+  response.setHeader("Content-Security-Policy", "default-src 'none'; sandbox");
+  response.type(logo.mediaType).send(Buffer.from(logo.bytes));
+});
+
+app.get("/api/targets/:targetId/reference", (request, response) => {
+  let targetId: string;
+  try {
+    targetId = boundedIdentifier(request.params.targetId);
+  } catch (error) {
+    response.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+    return;
+  }
+  const reference = monitor.getTargetReference(targetId);
+  if (!reference) {
+    response.status(404).json({ error: "No usual level is available for this window yet" });
+    return;
+  }
+  const etag = `"${createHash("sha256").update(`${reference.revision}:${reference.alertSigma}:${reference.frameBinCount}`).digest("hex").slice(0, 32)}"`;
+  response.setHeader("Cache-Control", "no-cache");
+  response.setHeader("ETag", etag);
+  if (request.headers["if-none-match"] === etag) {
+    response.status(304).end();
+    return;
+  }
+  response.json(reference);
+});
+
+app.get("/api/alert-preview", (_request, response) => {
+  response.setHeader("Cache-Control", "no-store");
+  response.json(monitor.getAlertPreview());
+});
+
+// ---- DGNSS report (Gator SBS + rf-monitor RF evidence) --------------------------
+const dgnssUploadParser = express.raw({ type: () => true, limit: DGNSS_MAX_UPLOAD_BYTES });
+
+function dgnssFailure(response: express.Response, error: unknown): void {
+  if (error instanceof DgnssUserError) {
+    response.status(error.status).json({ error: error.message, ...(error.fields ? { fields: error.fields } : {}) });
+    return;
+  }
+  console.error("DGNSS request failed", error);
+  response.status(500).json({ error: "The request could not be completed. Try again." });
+}
+
+function dgnssDownloadName(name: string): string {
+  return `attachment; filename="${name.replace(/[^A-Za-z0-9._-]/g, "_")}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+}
+
+app.get("/api/dgnss/config", (request, response) => {
+  response.json(dgnssReports.configResponse(adminSession(request).unlocked));
+});
+
+app.put("/api/dgnss/config", async (request, response) => {
+  if (!requireAdmin(request, response)) return;
+  try {
+    await dgnssReports.saveConfig(request.body?.config, request.body?.expectedRevision, clientAddress(request));
+    response.json(dgnssReports.configResponse(true));
+  } catch (error) {
+    dgnssFailure(response, error);
+  }
+});
+
+app.post("/api/dgnss/uploads", (request, response, next) => {
+  dgnssUploadParser(request, response, (error?: unknown) => {
+    if (error) {
+      const tooLarge = (error as { type?: string }).type === "entity.too.large";
+      response.status(tooLarge ? 413 : 400).json({ error: tooLarge ? "The file is too large to upload. Export it from Gator in parts and add them all." : "The upload could not be read. Try again." });
+      return;
+    }
+    next();
+  });
+}, async (request, response) => {
+  try {
+    const rawName = typeof request.headers["x-file-name"] === "string" ? request.headers["x-file-name"] : "upload.sbs";
+    let fileName = "upload.sbs";
+    try {
+      fileName = decodeURIComponent(rawName);
+    } catch {
+      fileName = rawName;
+    }
+    if (!Buffer.isBuffer(request.body)) throw new DgnssUserError("Choose an SBS file to upload", 400);
+    response.json(await dgnssReports.upload(request.body, fileName));
+  } catch (error) {
+    dgnssFailure(response, error);
+  }
+});
+
+app.post("/api/dgnss/uploads/preview", async (request, response) => {
+  try {
+    response.json(await dgnssReports.previewSet(request.body?.uploadIds));
+  } catch (error) {
+    dgnssFailure(response, error);
+  }
+});
+
+app.get("/api/dgnss/reports", async (_request, response) => {
+  response.json({ reports: await dgnssReports.list() });
+});
+
+app.post("/api/dgnss/reports", async (request, response) => {
+  try {
+    response.status(202).json(await dgnssReports.generate(request.body?.uploadIds ?? request.body?.uploadId, request.body?.window));
+  } catch (error) {
+    dgnssFailure(response, error);
+  }
+});
+
+app.get("/api/dgnss/reports/:reportId", async (request, response) => {
+  const report = await dgnssReports.get(String(request.params.reportId));
+  if (!report) response.status(404).json({ error: "Report not found" });
+  else response.json(report);
+});
+
+app.post("/api/dgnss/reports/:reportId/cancel", (request, response) => {
+  const report = dgnssReports.cancel(String(request.params.reportId));
+  if (!report) response.status(404).json({ error: "Report not found" });
+  else response.json(report);
+});
+
+for (const [suffix, kind] of [["report.pdf", "pdf"], ["report.html", "html"], ["package.zip", "package"]] as const) {
+  app.get(`/api/dgnss/reports/:reportId/${suffix}`, async (request, response) => {
+    const file = await dgnssReports.file(String(request.params.reportId), kind);
+    if (!file) {
+      response.status(404).json({ error: "Report file not found" });
+      return;
+    }
+    response.setHeader("Content-Type", file.type);
+    if (kind === "html") {
+      response.setHeader("Content-Security-Policy", REPORT_CSP);
+      response.setHeader("X-Frame-Options", "SAMEORIGIN");
+      if (request.query.download === "1") response.setHeader("Content-Disposition", dgnssDownloadName(file.name));
+      else response.setHeader("Content-Disposition", `inline; filename="${file.name.replace(/[^A-Za-z0-9._-]/g, "_")}"`);
+    } else {
+      response.setHeader("Content-Disposition", dgnssDownloadName(file.name));
+    }
+    response.sendFile(file.path, { dotfiles: "deny", headers: { "Cache-Control": "no-store" } }, (error) => {
+      if (error && !response.headersSent) response.status(500).json({ error: "Download failed. Try again." });
+    });
+  });
+}
 
 app.get("/api/evidence/archive", async (request, response) => {
   const offset = typeof request.query.offset === "string" ? Number(request.query.offset) : 0;
@@ -1677,11 +2109,16 @@ app.get("/api/evidence/sessions/:sessionId/replay", async (request, response) =>
     const sessionId = boundedIdentifier(request.params.sessionId);
     const cursor = typeof request.query.cursor === "string" ? request.query.cursor : undefined;
     const requestedLimit = typeof request.query.limit === "string" ? Number(request.query.limit) : 12;
+    const from = typeof request.query.from === "string" ? Date.parse(request.query.from) : Number.NaN;
+    // target/band: replay only one capture window (opened from an incident).
+    const replayId = (value: unknown) => typeof value === "string" && /^[A-Za-z0-9._:-]{1,160}$/.test(value) ? value : undefined;
     response.setHeader("Cache-Control", "no-store");
     response.json(await evidencePlayback.readBatch(
       sessionId,
       cursor,
       Number.isFinite(requestedLimit) ? requestedLimit : 12,
+      Number.isFinite(from) ? from : undefined,
+      { targetId: replayId(request.query.target), bandId: replayId(request.query.band) },
     ));
   } catch (error) {
     if (error instanceof EvidencePlaybackError) {
@@ -1872,15 +2309,26 @@ function sendFrame(socket: WebSocket, state: LiveClientState, message: Extract<S
   }
 }
 
+const pendingFrameByteEstimates = new WeakMap<object, number>();
+
+/**
+ * Bytes a queued frame is charged against the per-client budget. The estimate
+ * is requested at enqueue, dequeue and drop for the same message object, so it
+ * is computed once per message rather than serialising the metadata each time.
+ */
 function estimatePendingFrameBytes(message: Extract<ServiceMessage, { type: "frame" }>): number {
+  const cached = pendingFrameByteEstimates.get(message);
+  if (cached !== undefined) return cached;
   const { bins, ...frame } = message.payload.frame;
-  return bins.byteLength + 6 + Buffer.byteLength(JSON.stringify({
+  const bytes = bins.byteLength + 6 + Buffer.byteLength(JSON.stringify({
     frame,
     metrics: message.payload.metrics,
     event: message.payload.event,
     targetState: message.payload.targetState,
     feedId: message.payload.feedId,
   }));
+  pendingFrameByteEstimates.set(message, bytes);
+  return bytes;
 }
 
 function schedulePendingFrame(socket: WebSocket, state: LiveClientState): void {
@@ -1935,6 +2383,7 @@ function queueFrame(socket: WebSocket, message: Extract<ServiceMessage, { type: 
 }
 
 server.on("upgrade", (request, socket, head) => {
+  guardUpgradeSocket(socket, reportSocketFault);
   const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
   if (url.pathname !== "/live" || !originAllowed(request)) {
     socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
@@ -1957,6 +2406,7 @@ server.on("upgrade", (request, socket, head) => {
 });
 
 liveServer.on("connection", (socket) => {
+  guardWebSocket(socket, reportSocketFault);
   const initialSubscription = normalizeLiveSubscription({ type: "subscribe", protocolVersion: 2, rateHz: 2, engineer: false })!;
   const bootstrap = compactSnapshot(authoritativeSnapshot().snapshot);
   const state: LiveClientState = {
@@ -2105,23 +2555,51 @@ server.listen(config.port, config.host, () => {
   console.log(`Evidence archive: ${config.storageRoot}`);
 });
 
-async function shutdown(): Promise<void> {
-  const forcedExit = setTimeout(() => process.exit(1), 30_000);
-  forcedExit.unref();
-  const serverClosed = new Promise<void>((resolve) => server.close(() => resolve()));
-  clearInterval(heartbeatTimer);
-  clearInterval(eventLoopSampleTimer);
-  clearInterval(recoveryStatusTimer);
-  diagnosticsCollector.stop();
-  eventLoopHistogram.disable();
-  for (const client of liveServer.clients) client.terminate();
-  liveServer.close();
-  await productionQualificationStore.flush();
-  await stabilityIncidents.flush();
-  await monitor.stop();
-  await serverClosed;
-  process.exit(0);
+let lastSocketFaultLogAt = 0;
+function reportSocketFault(error: Error): void {
+  const now = Date.now();
+  if (now - lastSocketFaultLogAt < 10_000) return;
+  lastSocketFaultLogAt = now;
+  console.warn(`Live socket fault closed: ${error.message}`);
 }
 
-process.on("SIGINT", () => void shutdown());
-process.on("SIGTERM", () => void shutdown());
+let serverClosed: Promise<void> = Promise.resolve();
+const shutdown = createShutdownCoordinator({
+  log: (message) => console.log(message),
+  exit: (code) => process.exit(code),
+  steps: [
+    {
+      name: "stop accepting connections",
+      run: () => {
+        serverClosed = new Promise<void>((resolve) => server.close(() => resolve()));
+        clearInterval(heartbeatTimer);
+        clearInterval(eventLoopSampleTimer);
+        clearInterval(recoveryStatusTimer);
+        diagnosticsCollector.stop();
+        eventLoopHistogram.disable();
+        for (const client of liveServer.clients) client.terminate();
+        liveServer.close();
+        server.closeIdleConnections();
+      },
+    },
+    { name: "flush production qualification", run: () => productionQualificationStore.flush() },
+    { name: "flush stability incidents", run: () => stabilityIncidents.flush() },
+    // Closes the evidence session and releases the data-domain lease; must always be reached.
+    { name: "stop monitor", run: () => monitor.stop() },
+    // Evidence is safe by now; anything still open (a long download) is cut rather than waited for.
+    { name: "close remaining connections", run: () => server.closeAllConnections() },
+    { name: "wait for server close", run: () => serverClosed },
+  ],
+});
+
+process.on("SIGINT", () => void shutdown("SIGINT"));
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+// An unexpected fault still ends the process (systemd restarts it), but evidence is closed first.
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught exception:", error);
+  void shutdown("uncaughtException", 1);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("Unhandled rejection:", reason);
+  void shutdown("unhandledRejection", 1);
+});

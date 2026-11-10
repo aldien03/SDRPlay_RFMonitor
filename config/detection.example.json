@@ -1,8 +1,18 @@
 {
-  "widebandDelta": 24,
-  "widebandOccupiedRatio": 0.24,
-  "narrowbandPeakDelta": 66,
-  "narrowbandMaxOccupiedRatio": 0.08,
-  "baselineDriftDelta": 13,
-  "sustainedFrames": 3
+  "ruleSetId": "rf-relative-mad-v1",
+  "scaleFloorBins": 1,
+  "widebandObservationSigma": 6,
+  "widebandObservationOccupancy": 0.35,
+  "interferenceSigma": 8,
+  "interferenceOccupancy": 0.5,
+  "interferenceHits": 3,
+  "interferenceWindow": 5,
+  "interferenceExposureMs": 2000,
+  "narrowbandPeakSigma": 10,
+  "narrowbandMaxWidthRatio": 0.1,
+  "driftSigma": 4,
+  "driftExposureMs": 10000,
+  "clearObservations": 10,
+  "reservoirSize": 256,
+  "minimumLearningMs": 1800000
 }

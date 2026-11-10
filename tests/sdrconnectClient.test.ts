@@ -387,6 +387,39 @@ describe("SDRconnect client", () => {
     await expect(client.connect()).rejects.toThrow("API handshake timed out");
   });
 
+  it("rejects connect() when the socket closes before the API handshake", async () => {
+    const httpServer = createServer();
+    const server = new WebSocketServer({ server: httpServer });
+    httpServer.listen(0, "127.0.0.1");
+    await once(httpServer, "listening");
+    const address = httpServer.address();
+    if (!address || typeof address === "string") throw new Error("Missing test server address");
+    server.on("connection", (socket) => socket.close());
+    const client = new SdrconnectClient({
+      id: 0,
+      url: `ws://127.0.0.1:${address.port}`,
+      timeoutMs: 5_000,
+      sampleRateHz: 10_000_000,
+      tlsRejectUnauthorized: true,
+    });
+    closers.push(() => { client.close(); server.close(); httpServer.close(); });
+    const started = Date.now();
+    await expect(client.connect()).rejects.toThrow("closed before the API handshake");
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  it("keeps the message and reports a local fault when a property listener throws", () => {
+    const client = new SdrconnectClient({ id: 0, url: "ws://127.0.0.1:1", timeoutMs: 50, sampleRateHz: 10_000_000, tlsRejectUnauthorized: true });
+    const errors: string[] = [];
+    client.on("client-error", (error: Error) => errors.push(error.message));
+    client.on("property", () => { throw new Error("listener boom"); });
+    const parse = (text: string) => (client as unknown as { parseText(text: string): unknown }).parseText(text);
+    expect(parse(JSON.stringify({ event_type: "property_changed", property: "api_version", value: "1.0.3" }))).toMatchObject({ property: "api_version" });
+    expect(errors).toEqual(["SDRconnect property handler failed: listener boom"]);
+    parse("not json");
+    expect(errors[1]).toBe("SDRconnect sent invalid JSON");
+  });
+
   it("drops obsolete FFT frames before monitor processing", () => {
     const client = new SdrconnectClient({
       id: 0,

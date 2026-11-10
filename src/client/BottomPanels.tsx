@@ -1,7 +1,9 @@
-import { Copy, Download, Eye, FolderArchive, Pause, Play, RefreshCw, RotateCcw, X } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { Copy, Download, Eye, FileText, FolderArchive, Pause, Play, RefreshCw, RotateCcw, X } from "lucide-react";
+import { disturbedSummary, incidentClock } from "./incidentPresentation";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DetectionEvent, EvidenceArchiveEventPage, EvidenceArchivePage, EvidenceArchiveSession, EvidenceLifecycle, EvidenceReplayBatch, EvidenceReplayFrame, MonitorSnapshot, MonitorStatus, SignalMetricSample, SpectrumFrame } from "../shared/types";
-import { dateTime, formatBytes, formatDuration, formatRange, timeOnly } from "./format";
+import { dateTime, formatBytes, formatDuration, frequencyRangeLabel, timeOnly } from "./format";
+import type { ReplayFocus } from "./useMonitor";
 import { SpectrumView, WaterfallView } from "./SpectrumViews";
 
 export interface DisplayOptions {
@@ -12,43 +14,6 @@ export interface DisplayOptions {
   engineer: boolean;
   audioAlerts: boolean;
   popupAlerts: boolean;
-}
-
-export function RecentIncidents({ snapshot, selectedEventId, onSelect }: { snapshot: MonitorSnapshot; selectedEventId?: string; onSelect: (id: string) => void }) {
-  return (
-    <section className="panel incident-history-panel" aria-labelledby="recent-incidents-title">
-      <div className="panel-heading-line">
-        <div><h2 id="recent-incidents-title" className="panel-title">Recent incidents</h2><p>Recorded signal changes and operator actions.</p></div>
-        <span>{snapshot.events.length} recorded</span>
-      </div>
-      {snapshot.events.length ? (
-        <div className="incident-history-list">
-          {snapshot.events.slice(0, 6).map((event) => {
-            const active = event.id === snapshot.activeEvent?.id;
-            const service = snapshot.services.find((candidate) => candidate.service === event.service)?.label ?? event.bandLabel;
-            const state = active ? "Happening now" : event.acknowledgedAt ? "Reviewed" : "Ended";
-            const evidence = event.evidenceStrength;
-            return (
-              <article key={event.id} className={`incident-history-item ${active ? "active" : ""} ${selectedEventId === event.id ? "selected" : ""}`}>
-                <header>
-                  <div className="incident-history-state"><StatusDot status={event.status} /><strong>{state}</strong><span>{statusLabel(event.status)}</span></div>
-                  <time dateTime={event.startedAt}>{timeOnly(event.startedAt, snapshot.displayTimeZone)} · {formatDuration(event.startedAt, event.lastSeenAt)}</time>
-                </header>
-                <button className="incident-row-select" type="button" onClick={() => onSelect(event.id)} aria-pressed={selectedEventId === event.id}>
-                  <span><small>Affected signal</small><strong>{event.affectedLabel ?? service}</strong><em>{formatRange(...event.affectedRangeHz)}</em></span>
-                  <span><small>Observed</small><strong>{event.observed}</strong></span>
-                  <span><small>Evidence</small><strong>{evidence}</strong><em>Peak {event.metrics.peakLevel.toFixed(0)} / 255</em></span>
-                  <b>View details</b>
-                </button>
-              </article>
-            );
-          })}
-        </div>
-      ) : (
-        <div className="incident-history-empty"><strong>No incidents recorded</strong><span>Recent scans look normal.</span></div>
-      )}
-    </section>
-  );
 }
 
 function statusLabel(status: MonitorStatus): string {
@@ -112,18 +77,50 @@ function replayMetrics(frame: SpectrumFrame | undefined, supplied: SignalMetricS
   };
 }
 
-function EvidenceReplay({
+export interface ForwardReplayState {
+  lastMs: number;
+  ids: Set<string>;
+}
+
+/**
+ * An incident replay plays forward in time. The recording index is only
+ * roughly ordered: when an alert fires, its saved pre-alert history is written
+ * again or late. Frames already shown, and frames older than the last one
+ * shown, are skipped. `state` carries over between batches.
+ */
+export function forwardOnlyFrames(frames: readonly EvidenceReplayFrame[], state: ForwardReplayState): EvidenceReplayFrame[] {
+  const kept: EvidenceReplayFrame[] = [];
+  for (const entry of frames) {
+    const at = Date.parse(entry.frame.timestamp);
+    if (state.ids.has(entry.frame.id) || !Number.isFinite(at) || at < state.lastMs) continue;
+    if (state.ids.size >= 4_096) state.ids.clear();
+    state.ids.add(entry.frame.id);
+    state.lastMs = at;
+    kept.push(entry);
+  }
+  return kept;
+}
+
+export function EvidenceReplay({
   session,
   displayTimeZone,
   getBatch,
   signalLabel,
   onClose,
+  startAt,
+  focusTargetId,
+  focusBandId,
 }: {
-  session: EvidenceArchiveSession;
+  session: Pick<EvidenceArchiveSession, "id" | "lifecycle" | "incompleteReasons">;
   displayTimeZone: string;
-  getBatch: (sessionId: string, cursor?: string, limit?: number) => Promise<EvidenceReplayBatch>;
+  getBatch: (sessionId: string, cursor?: string, limit?: number, from?: string, focus?: ReplayFocus) => Promise<EvidenceReplayBatch>;
   signalLabel: (bandId: string) => string;
   onClose: () => void;
+  /** Start near this time instead of the beginning of the session (opened from an incident). */
+  startAt?: string;
+  /** Only this capture window's frames (opened from an incident). */
+  focusTargetId?: string;
+  focusBandId?: string;
 }) {
   const [entries, setEntries] = useState<EvidenceReplayFrame[]>([]);
   const [index, setIndex] = useState(0);
@@ -134,18 +131,29 @@ function EvidenceReplay({
   const [speed, setSpeed] = useState(4);
   const [error, setError] = useState<string>();
   const [history, setHistory] = useState<SpectrumFrame[]>([]);
+  const forward = useRef<ForwardReplayState>({ lastMs: Number.NEGATIVE_INFINITY, ids: new Set() });
 
   const load = useCallback(async (cursor?: string, restart = false): Promise<boolean> => {
     setLoading(true);
     setError(undefined);
     try {
-      const batch = await getBatch(session.id, cursor, REPLAY_BATCH_SIZE);
-      setEntries(batch.frames);
+      const focus = focusTargetId || focusBandId ? { targetId: focusTargetId, bandId: focusBandId } : undefined;
+      if (restart || !cursor) forward.current = { lastMs: Number.NEGATIVE_INFINITY, ids: new Set() };
+      const keep = (frames: EvidenceReplayFrame[]) => focus ? forwardOnlyFrames(frames, forward.current) : frames;
+      let batch = await getBatch(session.id, cursor, REPLAY_BATCH_SIZE, cursor ? undefined : startAt, focus);
+      let frames = keep(batch.frames);
+      // A window-only replay can meet a stretch of other windows' frames, or of
+      // frames it has already shown; read on a little.
+      for (let hop = 0; focus && !frames.length && batch.nextCursor && hop < 32; hop += 1) {
+        batch = await getBatch(session.id, batch.nextCursor, REPLAY_BATCH_SIZE, undefined, focus);
+        frames = keep(batch.frames);
+      }
+      setEntries(frames);
       setIndex(0);
       setNextCursor(batch.nextCursor);
       setDone(batch.done);
       if (restart) setHistory([]);
-      return batch.frames.length > 0;
+      return frames.length > 0;
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
       setEntries([]);
@@ -154,7 +162,7 @@ function EvidenceReplay({
     } finally {
       setLoading(false);
     }
-  }, [getBatch, session.id]);
+  }, [getBatch, session.id, startAt, focusTargetId, focusBandId]);
 
   useEffect(() => {
     let mounted = true;
@@ -225,9 +233,9 @@ function EvidenceReplay({
         <div className="evidence-replay-waterfall"><WaterfallView frames={history} /></div>
       </div>
       <dl className="evidence-replay-facts">
-        <div><dt>Observed</dt><dd>{frame ? dateTime(frame.timestamp, displayTimeZone) : loading ? "Loading" : "No saved observations"}</dd></div>
+        <div><dt>Observed</dt><dd>{frame ? incidentClock(frame.timestamp, displayTimeZone) : loading ? "Loading" : "No saved observations"}</dd></div>
         <div><dt>Signal</dt><dd>{frame ? signalLabel(frame.bandId) : "—"}</dd></div>
-        <div><dt>Range</dt><dd>{frame ? formatRange(frame.startHz, frame.endHz) : "—"}</dd></div>
+        <div><dt>Range</dt><dd>{frame ? frequencyRangeLabel(frame.startHz, frame.endHz) : "—"}</dd></div>
         <div><dt>Level</dt><dd>{metrics ? `${Math.round(metrics.peakLevel)} / 255 relative` : "—"}</dd></div>
       </dl>
       <div className="evidence-replay-controls">
@@ -238,6 +246,14 @@ function EvidenceReplay({
       </div>
     </section>
   );
+}
+
+/** Band name for a replayed frame; bands outside the current scan fall back to their service name. */
+export function replaySignalLabel(snapshot: Pick<MonitorSnapshot, "bands" | "monitorFeeds" | "services">, bandId: string): string {
+  return snapshot.bands.find((band) => band.id === bandId)?.label
+    ?? snapshot.monitorFeeds.find((feed) => feed.id === bandId)?.label
+    ?? snapshot.services.find((service) => bandId.startsWith(`${service.service}-`) || bandId === service.service)?.label
+    ?? bandId;
 }
 
 export function EvidenceArchive({
@@ -369,9 +385,7 @@ export function EvidenceArchive({
                   session={session}
                   displayTimeZone={snapshot.displayTimeZone}
                   getBatch={getReplayBatch}
-                  signalLabel={(bandId) => snapshot.bands.find((band) => band.id === bandId)?.label
-                    ?? snapshot.monitorFeeds.find((feed) => feed.id === bandId)?.label
-                    ?? bandId}
+                  signalLabel={(bandId) => replaySignalLabel(snapshot, bandId)}
                   onClose={() => setReplaySessionId(undefined)}
                 />
               ) : null}
@@ -383,11 +397,13 @@ export function EvidenceArchive({
                       <article className="evidence-event" key={event.id}>
                         <header><span className={`evidence-status event-${incidentStatus(event).toLowerCase()}`}>{incidentStatus(event)}</span><time dateTime={event.startedAt}>{dateTime(event.startedAt, snapshot.displayTimeZone)}</time></header>
                         <strong>{event.affectedLabel ?? event.bandLabel}</strong>
-                        <small>{formatRange(...event.affectedRangeHz)}</small>
+                        <small>{disturbedSummary(event)}</small>
                         <p>{event.observed}</p>
                         <footer>
                           <button type="button" onClick={() => onOpenIncident(event)}><Eye size={15} />View incident</button>
                           <button type="button" disabled={!snapshot.evidenceHealthy || Boolean(downloadingId)} onClick={() => void download(event.id, () => onExportEvent(event))}><Download size={15} />{downloadingId === event.id ? "Preparing…" : "Download"}</button>
+                          {event.figureAvailable ? <a className="text-button" href={`/api/events/${encodeURIComponent(event.id)}/figure.svg`} target="_blank" rel="noopener noreferrer" aria-label="Open the saved incident image in a new tab"><Eye size={15} />Image</a> : null}
+                          {!event.syntheticExercise ? <a className="text-button" href={`/api/events/${encodeURIComponent(event.id)}/report.html`} target="_blank" rel="noopener noreferrer" aria-label="Open the incident report in a new tab"><FileText size={15} />Report</a> : null}
                         </footer>
                       </article>
                     ))}

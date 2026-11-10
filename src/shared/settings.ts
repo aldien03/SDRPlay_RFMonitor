@@ -1,4 +1,5 @@
 import { estimateRevisitMs, generateChannelCenters } from "./bands";
+import { defaultAlertingSettings, deriveAlertingFromDetection, validateAlertingSettings } from "./alertPolicy";
 import type {
   BandCatalog,
   BandPreset,
@@ -8,9 +9,11 @@ import type {
   MonitoringMission,
   PhysicalCaptureTarget,
   OperationalSettings,
+  ReportIdentity,
   SchedulerHealth,
   ServiceCoverageSummary,
   ServiceGroup,
+  SettingsApplyMode,
   SettingsFeasibility,
 } from "./types";
 
@@ -297,6 +300,17 @@ export class SettingsValidationError extends Error {
   }
 }
 
+export const DEFAULT_INCIDENT_FIGURE_RETENTION_MS = 30 * 86_400_000;
+export const MAX_INCIDENT_FIGURE_RETENTION_MS = 365 * 86_400_000;
+
+/** Effective automatic incident-picture policy. Settings saved before this option existed mean "on, 30 days". */
+export function incidentFigurePolicy(retention: Pick<EvidenceRetentionPolicy, "incidentFiguresEnabled" | "incidentFigureRetentionMs">): { enabled: boolean; retentionMs: number } {
+  return {
+    enabled: retention.incidentFiguresEnabled !== false,
+    retentionMs: retention.incidentFigureRetentionMs ?? DEFAULT_INCIDENT_FIGURE_RETENTION_MS,
+  };
+}
+
 export interface OperationalSettingsSeed {
   siteName: string;
   deploymentId?: string;
@@ -331,7 +345,7 @@ export function createDefaultOperationalSettings(catalog: BandCatalog, seed: Ope
   ])) as OperationalSettings["monitoring"]["gnss"]["constellations"];
   const enabledSystemIds = GNSS_CONSTELLATIONS.filter((constellation) => constellations[constellation].enabled);
   const defaults: OperationalSettings = {
-    schemaVersion: 5,
+    schemaVersion: 6,
     revision: 1,
     updatedAt: seed.updatedAt ?? new Date().toISOString(),
     siteName: seed.siteName,
@@ -352,6 +366,8 @@ export function createDefaultOperationalSettings(catalog: BandCatalog, seed: Ope
       revisitObjectiveOverridesMs: {},
     },
     detection: { ...seed.detection },
+    alerting: deriveAlertingFromDetection(seed.detection, ROBUST_DETECTION_DEFAULTS),
+    reportIdentity: {},
     retention: { ...seed.retention },
     liveFocusTimeoutMs: 2 * 60_000,
   };
@@ -572,7 +588,7 @@ export function validateBandCatalog(input: BandCatalog): BandCatalog {
 export function validateOperationalSettings(input: OperationalSettings, catalog: BandCatalog): OperationalSettings {
   const fields: Record<string, string> = {};
   if (!input || typeof input !== "object") throw new SettingsValidationError({ settings: "Operational settings are required" });
-  const settings = structuredClone(input) as Omit<OperationalSettings, "schemaVersion"> & { schemaVersion: 1 | 2 | 3 | 4 | 5; scan: OperationalSettings["scan"] & { profile?: OperationalSettings["scan"]["profile"]; priorityWindowId?: string; maxPriorityGapMs?: number } };
+  const settings = structuredClone(input) as unknown as Omit<OperationalSettings, "schemaVersion"> & { schemaVersion: 1 | 2 | 3 | 4 | 5 | 6; scan: OperationalSettings["scan"] & { profile?: OperationalSettings["scan"]["profile"]; priorityWindowId?: string; maxPriorityGapMs?: number } };
   if (settings?.schemaVersion === 1) {
     settings.schemaVersion = 2;
     settings.scan.profile = "balanced";
@@ -598,7 +614,14 @@ export function validateOperationalSettings(input: OperationalSettings, catalog:
     settings.schemaVersion = 5;
     settings.scan.revisitObjectiveOverridesMs = {};
   }
-  if (settings?.schemaVersion !== 5) fields.schemaVersion = "Unsupported operational-settings schema";
+  if (settings?.schemaVersion === 5) {
+    // Alert behaviour used to live inside the fingerprinted learning rules.
+    // Preserve it as an explicit alert sensitivity without touching them.
+    settings.schemaVersion = 6;
+    settings.alerting = deriveAlertingFromDetection(settings.detection ?? ROBUST_DETECTION_DEFAULTS, ROBUST_DETECTION_DEFAULTS);
+    settings.reportIdentity = {};
+  }
+  if (settings?.schemaVersion !== 6) fields.schemaVersion = "Unsupported operational-settings schema";
   if (!Number.isInteger(settings?.revision) || settings.revision < 1) fields.revision = "Revision must be a positive integer";
   if (typeof settings?.siteName !== "string" || !settings.siteName.trim() || settings.siteName.length > 80) fields.siteName = "Site name must contain 1 to 80 characters";
   settings.siteName = settings.siteName?.trim();
@@ -720,17 +743,104 @@ export function validateOperationalSettings(input: OperationalSettings, catalog:
   }
   if (settings.detection.interferenceHits > settings.detection.interferenceWindow) fields["detection.interferenceHits"] = "Required hits cannot exceed the voting window";
   if (settings.detection.reservoirSize > 256) fields["detection.reservoirSize"] = "Baseline reservoir cannot exceed 256 observations";
+  const alerting = validateAlertingSettings(settings.alerting ?? defaultAlertingSettings(), new Set(catalog.captureTargets.map((target) => target.id)));
+  Object.assign(fields, alerting.fields);
+  if (alerting.settings) settings.alerting = alerting.settings;
+  const identity = validateReportIdentity(settings.reportIdentity ?? {});
+  Object.assign(fields, identity.fields);
+  settings.reportIdentity = identity.identity;
   const retention = settings.retention;
   for (const key of ["sessionMaxBytes", "sessionMaxMs", "retentionMs", "storageMaxBytes", "maintenanceIntervalMs"] as const) {
     if (!Number.isInteger(retention[key]) || retention[key] <= 0) fields[`retention.${key}`] = "Value must be a positive integer";
   }
   if (!Number.isInteger(retention.minimumFreeBytes) || retention.minimumFreeBytes < 0) fields["retention.minimumFreeBytes"] = "Free-space reserve cannot be negative";
+  if (retention.incidentFiguresEnabled !== undefined && typeof retention.incidentFiguresEnabled !== "boolean") fields["retention.incidentFiguresEnabled"] = "Choose on or off";
+  if (retention.incidentFigureRetentionMs !== undefined
+    && (!Number.isInteger(retention.incidentFigureRetentionMs) || retention.incidentFigureRetentionMs < 86_400_000 || retention.incidentFigureRetentionMs > MAX_INCIDENT_FIGURE_RETENTION_MS)) {
+    fields["retention.incidentFigureRetentionMs"] = "Keep incident images for 1 to 365 days";
+  }
   if (retention.sessionMaxBytes > 2 * 1024 * 1024 * 1024) fields["retention.sessionMaxBytes"] = "Session size cannot exceed the 2 GiB evidence bound";
   if (retention.sessionMaxMs > 24 * 60 * 60 * 1000) fields["retention.sessionMaxMs"] = "Session duration cannot exceed the 24-hour evidence bound";
   if (retention.storageMaxBytes < retention.sessionMaxBytes) fields["retention.storageMaxBytes"] = "Storage limit must be at least as large as one session";
   if (!Number.isInteger(settings.liveFocusTimeoutMs) || settings.liveFocusTimeoutMs < 60_000 || settings.liveFocusTimeoutMs > 3_600_000) fields.liveFocusTimeoutMs = "Single-frequency check must be between 1 and 60 minutes";
   if (Object.keys(fields).length) throw new SettingsValidationError(fields);
-  return settings as OperationalSettings;
+  return settings as unknown as OperationalSettings;
+}
+
+const REPORT_IDENTITY_TEXT_KEYS = ["companyName", "clientName", "vesselName", "projectReference"] as const;
+const REPORT_IDENTITY_LABELS: Record<typeof REPORT_IDENTITY_TEXT_KEYS[number], string> = {
+  companyName: "Company name",
+  clientName: "Client",
+  vesselName: "Vessel or platform",
+  projectReference: "Project or job reference",
+};
+export const MAX_REPORT_LOGO_BYTES = 512 * 1024;
+export const MAX_REPORT_LOGO_PIXELS = 2_000;
+
+export function validateReportIdentity(input: unknown): { identity: ReportIdentity; fields: Record<string, string> } {
+  const fields: Record<string, string> = {};
+  const identity: ReportIdentity = {};
+  if (input === undefined || input === null) return { identity, fields };
+  if (typeof input !== "object" || Array.isArray(input)) return { identity, fields: { reportIdentity: "Report identity is invalid" } };
+  const raw = input as Record<string, unknown>;
+  for (const key of REPORT_IDENTITY_TEXT_KEYS) {
+    const value = raw[key];
+    if (value === undefined || value === null || value === "") continue;
+    if (typeof value !== "string") {
+      fields[`reportIdentity.${key}`] = `${REPORT_IDENTITY_LABELS[key]}: enter text`;
+      continue;
+    }
+    const trimmed = value.trim();
+    if (!trimmed) continue;
+    if (trimmed.length > 120 || /[\u0000-\u001f\u007f]/.test(trimmed)) {
+      fields[`reportIdentity.${key}`] = `${REPORT_IDENTITY_LABELS[key]}: use up to 120 characters on one line`;
+      continue;
+    }
+    identity[key] = trimmed;
+  }
+  if (raw.logo !== undefined && raw.logo !== null) {
+    const logo = raw.logo as Record<string, unknown>;
+    const valid = typeof logo === "object"
+      && typeof logo.sha256 === "string" && /^[a-f0-9]{64}$/.test(logo.sha256)
+      && (logo.mediaType === "image/png" || logo.mediaType === "image/jpeg")
+      && Number.isInteger(logo.widthPx) && (logo.widthPx as number) >= 1 && (logo.widthPx as number) <= MAX_REPORT_LOGO_PIXELS
+      && Number.isInteger(logo.heightPx) && (logo.heightPx as number) >= 1 && (logo.heightPx as number) <= MAX_REPORT_LOGO_PIXELS
+      && Number.isInteger(logo.bytes) && (logo.bytes as number) >= 1 && (logo.bytes as number) <= MAX_REPORT_LOGO_BYTES;
+    if (!valid) fields["reportIdentity.logo"] = "Upload the logo again";
+    else identity.logo = {
+      sha256: logo.sha256 as string,
+      mediaType: logo.mediaType as "image/png" | "image/jpeg",
+      widthPx: logo.widthPx as number,
+      heightPx: logo.heightPx as number,
+      bytes: logo.bytes as number,
+    };
+  }
+  return { identity, fields };
+}
+
+const LIVE_SETTING_ROOTS = new Set(["alerting", "siteName", "deploymentId", "displayTimeZone", "retention", "liveFocusTimeoutMs", "reportIdentity"]);
+const IGNORED_SETTING_ROOTS = new Set(["revision", "updatedAt"]);
+
+/**
+ * How a settings change must be applied. Learning-rule edits restart signal
+ * learning; monitoring or scan edits retune the receiver; everything else
+ * (alert sensitivity, site identity, retention, report identity) applies live
+ * without ending incidents. Unknown paths fail safe to an RF restart.
+ */
+export function classifySettingsChange(changedFields: string[]): SettingsApplyMode {
+  let mode: SettingsApplyMode = "none";
+  const rank: Record<SettingsApplyMode, number> = { none: 0, live: 1, "rf-restart": 2, "learning-restart": 3 };
+  for (const field of changedFields) {
+    const root = field.split(".")[0];
+    if (IGNORED_SETTING_ROOTS.has(root)) continue;
+    const next: SettingsApplyMode = root === "detection"
+      ? "learning-restart"
+      : LIVE_SETTING_ROOTS.has(root)
+        ? "live"
+        : "rf-restart";
+    if (rank[next] > rank[mode]) mode = next;
+  }
+  return mode;
 }
 
 export function compileEffectiveBands(catalog: BandCatalog, settings: OperationalSettings): BandPreset[] {
@@ -864,6 +974,10 @@ export function validFocusFrequencies(band: BandPreset): number[] {
 
 export function changedFieldPaths(previous: unknown, next: unknown, prefix = ""): string[] {
   if (Object.is(previous, next)) return [];
+  if (Array.isArray(previous) && Array.isArray(next)) {
+    // Arrays are compared by content: a cloned, unchanged list is not a change.
+    return JSON.stringify(previous) === JSON.stringify(next) ? [] : [prefix || "settings"];
+  }
   if (!previous || !next || typeof previous !== "object" || typeof next !== "object" || Array.isArray(previous) || Array.isArray(next)) return [prefix || "settings"];
   const left = previous as Record<string, unknown>;
   const right = next as Record<string, unknown>;

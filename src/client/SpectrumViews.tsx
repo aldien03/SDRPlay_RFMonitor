@@ -1,5 +1,7 @@
-import { memo, useEffect, useRef } from "react";
+import type { TargetReferenceView } from "./useTargetReference";
+import { memo, useCallback, useEffect, useLayoutEffect, useRef } from "react";
 import type { SignalMetricSample, SpectrumFrame } from "../shared/types";
+import { buildWaterfallPalette, composeWaterfall, rasterizeRow, waterfallColor } from "../shared/waterfallRaster";
 import { detectorAnalysisForFrame, detectorAnomalyRanges, detectorBaselineAvailable } from "./detectorPresentation";
 
 export interface ViewRange { startHz: number; endHz: number }
@@ -84,6 +86,21 @@ interface SpectrumViewProps {
   showMarkers: boolean;
   frequencyGuides?: ReadonlyArray<{ frequencyHz: number; label: string }>;
   view?: ViewRange;
+  /** Per-bin usual level and alert level from the detector; drawn when it matches this frame's grid. */
+  reference?: TargetReferenceView;
+  showAlertLevel?: boolean;
+}
+
+/** The reference arrays apply only to the exact display grid they were projected for. */
+export function referenceMatchesFrame(reference: TargetReferenceView | undefined, frame: SpectrumFrame | undefined): reference is TargetReferenceView {
+  if (!reference || !frame?.bins.length) return false;
+  const start = frame.analysisStartBin ?? 0;
+  const end = frame.analysisEndBin ?? frame.bins.length;
+  return reference.frameBinCount === frame.bins.length
+    && reference.analysisStartBin === start
+    && reference.analysisEndBin === end
+    && reference.usual.length === end - start
+    && reference.alertLevel.length === end - start;
 }
 
 function guideX(frequencyHz: number, startHz: number, endHz: number, width: number): number {
@@ -107,15 +124,38 @@ function fitCanvas(canvas: HTMLCanvasElement): CanvasRenderingContext2D | undefi
   return context;
 }
 
+/**
+ * One ResizeObserver per canvas for its whole life; the latest draw closure is held in a ref,
+ * and any number of triggers in one animation frame cost a single draw.
+ */
 function useRedraw(canvasRef: React.RefObject<HTMLCanvasElement | null>, draw: () => void): void {
+  const drawRef = useRef(draw);
+  const pendingFrame = useRef(0);
+  useLayoutEffect(() => {
+    drawRef.current = draw;
+  });
+  const schedule = useCallback(() => {
+    if (pendingFrame.current) return;
+    pendingFrame.current = requestAnimationFrame(() => {
+      pendingFrame.current = 0;
+      drawRef.current();
+    });
+  }, []);
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const observer = new ResizeObserver(draw);
+    const observer = new ResizeObserver(schedule);
     observer.observe(canvas);
-    draw();
-    return () => observer.disconnect();
-  }, [canvasRef, draw]);
+    return () => {
+      observer.disconnect();
+      cancelAnimationFrame(pendingFrame.current);
+      pendingFrame.current = 0;
+    };
+  }, [canvasRef, schedule]);
+  // Every render means new props (the components are memoised): redraw once, coalesced.
+  useEffect(() => {
+    schedule();
+  });
 }
 
 export const SpectrumView = memo(function SpectrumView({
@@ -125,6 +165,8 @@ export const SpectrumView = memo(function SpectrumView({
   showMarkers,
   frequencyGuides = [],
   view,
+  reference,
+  showAlertLevel = false,
 }: SpectrumViewProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   // Ref, not state: pointer moves at 4 spectrum updates/sec across up to nine cards must not re-render this memoised component.
@@ -289,7 +331,31 @@ export const SpectrumView = memo(function SpectrumView({
       context.stroke();
     }
 
-    if (showBaseline && detectorBaselineAvailable(frame, metrics)) {
+    const baselineAvailable = detectorBaselineAvailable(frame, metrics);
+    if (showBaseline && baselineAvailable && referenceMatchesFrame(reference, frame)) {
+      // Per-frequency usual level and alert level, exactly as the detector compares.
+      const drawReferenceLine = (values: number[], color: string, dash: number[], lineWidth: number) => {
+        context.setLineDash(dash);
+        context.beginPath();
+        let started = false;
+        for (let offset = 0; offset < values.length; offset += 1) {
+          const index = reference.analysisStartBin + offset;
+          if (index < window.startBin || index >= window.endBin) continue;
+          const x = xFor(index);
+          const y = yFor(values[offset]);
+          if (!started) {
+            context.moveTo(x, y);
+            started = true;
+          } else context.lineTo(x, y);
+        }
+        context.strokeStyle = color;
+        context.lineWidth = lineWidth;
+        context.stroke();
+        context.setLineDash([]);
+      };
+      drawReferenceLine(reference.usual, "#1d7f45", [5, 4], 1.2);
+      if (showAlertLevel) drawReferenceLine(reference.alertLevel, "#a35f00", [3, 3], 1.2);
+    } else if (showBaseline && baselineAvailable) {
       const y = yFor(metrics!.baselineLevel);
       context.setLineDash([5, 5]);
       context.beginPath();
@@ -365,31 +431,7 @@ export const SpectrumView = memo(function SpectrumView({
   );
 });
 
-const WATERFALL_STOPS: ReadonlyArray<{ level: number; rgb: [number, number, number] }> = [
-  { level: 0.00, rgb: [4, 32, 84] },
-  { level: 0.25, rgb: [0, 120, 190] },
-  { level: 0.50, rgb: [0, 180, 130] },
-  { level: 0.70, rgb: [180, 210, 0] },
-  { level: 0.85, rgb: [255, 180, 0] },
-  { level: 1.00, rgb: [255, 60, 30] },
-];
-
-export function waterfallColor(value: number): string {
-  const level = Math.max(0, Math.min(1, value / 255));
-  let lower = WATERFALL_STOPS[0];
-  let upper = WATERFALL_STOPS[WATERFALL_STOPS.length - 1];
-  for (let index = 0; index < WATERFALL_STOPS.length - 1; index += 1) {
-    if (level >= WATERFALL_STOPS[index].level && level <= WATERFALL_STOPS[index + 1].level) {
-      lower = WATERFALL_STOPS[index];
-      upper = WATERFALL_STOPS[index + 1];
-      break;
-    }
-  }
-  const span = upper.level - lower.level || 1;
-  const t = (level - lower.level) / span;
-  const mix = (from: number, to: number) => Math.round(from + (to - from) * t);
-  return `rgb(${mix(lower.rgb[0], upper.rgb[0])}, ${mix(lower.rgb[1], upper.rgb[1])}, ${mix(lower.rgb[2], upper.rgb[2])})`;
-}
+export { waterfallColor };
 
 /** A legend is only drawn where it will not crowd the rows it explains. */
 export function waterfallLegendFits(width: number, height: number): boolean {
@@ -429,8 +471,18 @@ export function waterfallTimeMarkers(input: {
   return markers;
 }
 
+interface WaterfallTexture {
+  surface: HTMLCanvasElement;
+  width: number;
+  rows: number;
+  pixels: Uint32Array;
+  image: ImageData;
+}
+
 export const WaterfallView = memo(function WaterfallView({ frames, frequencyGuides = [], view }: { frames: SpectrumFrame[]; frequencyGuides?: ReadonlyArray<{ frequencyHz: number; label: string }>; view?: ViewRange }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const rowCache = useRef(new WeakMap<SpectrumFrame, { key: string; row: Uint32Array }>());
+  const textureRef = useRef<WaterfallTexture | undefined>(undefined);
   const timeMarkers = waterfallTimeMarkers({ frames, nowMs: Date.now() });
   const draw = () => {
     const canvas = canvasRef.current;
@@ -447,30 +499,54 @@ export const WaterfallView = memo(function WaterfallView({ frames, frequencyGuid
       context.fillText("No scan history", width / 2, height / 2);
       return;
     }
-    const newestFirst = [...frames].reverse();
-    const rowHeight = Math.max(1, height / Math.max(24, newestFirst.length));
-    newestFirst.forEach((frame, row) => {
-      const bins = frame.bins;
-      // History frames can carry a different tune than the current one, so each gets its own window.
-      const frameWindow = visibleBinWindow({ binCount: bins.length, startHz: frame.startHz, endHz: frame.endHz, view });
-      const visibleBins = Math.min(Math.ceil(width), frameWindow.endBin - frameWindow.startBin);
-      for (let column = 0; column < visibleBins; column += 1) {
-        const sourceIndex = frameWindow.startBin + Math.min(frameWindow.endBin - frameWindow.startBin - 1, Math.floor((column / visibleBins) * (frameWindow.endBin - frameWindow.startBin)));
-        const x = (column / visibleBins) * width;
-        context.fillStyle = waterfallColor(bins[sourceIndex]);
-        context.fillRect(x, row * rowHeight, width / visibleBins + 1, rowHeight + 0.5);
+    const rowCapacity = Math.max(24, frames.length);
+    const rowHeight = Math.max(1, height / rowCapacity);
+    // Rows are rasterised once per frame and geometry, then composed into one texture.
+    const textureWidth = Math.max(1, Math.min(canvas.width, 2048));
+    const palette = buildWaterfallPalette();
+    const rows: Uint32Array[] = [];
+    for (let index = frames.length - 1; index >= 0; index -= 1) {
+      const frame = frames[index];
+      const frameWindow = visibleBinWindow({ binCount: frame.bins.length, startHz: frame.startHz, endHz: frame.endHz, view });
+      const key = `${textureWidth}|${frameWindow.startBin}|${frameWindow.endBin}`;
+      let entry = rowCache.current.get(frame);
+      if (!entry || entry.key !== key) {
+        entry = {
+          key,
+          row: rasterizeRow({
+            bins: frame.bins,
+            startBin: frameWindow.startBin,
+            endBin: frameWindow.endBin,
+            widthPx: textureWidth,
+            anomalyRanges: detectorAnomalyRanges(frame),
+            palette,
+            hatch: true,
+          }),
+        };
+        rowCache.current.set(frame, entry);
       }
-      context.fillStyle = "rgba(227, 22, 22, 0.32)";
-      for (const range of detectorAnomalyRanges(frame)) {
-        if (range.endBin <= frameWindow.startBin || range.startBin >= frameWindow.endBin) continue;
-        const clippedStart = Math.max(range.startBin, frameWindow.startBin);
-        const clippedEnd = Math.min(range.endBin, frameWindow.endBin);
-        const startX = ((clippedStart - frameWindow.startBin) / Math.max(1, frameWindow.endBin - frameWindow.startBin)) * width;
-        const endX = ((clippedEnd - frameWindow.startBin) / Math.max(1, frameWindow.endBin - frameWindow.startBin)) * width;
-        context.fillRect(startX, row * rowHeight, Math.max(1, endX - startX), rowHeight + 0.5);
-      }
-    });
-    const guideFrame = newestFirst[0];
+      rows.push(entry.row);
+    }
+    let texture = textureRef.current;
+    if (!texture || texture.width !== textureWidth || texture.rows !== rowCapacity) {
+      const surface = document.createElement("canvas");
+      surface.width = textureWidth;
+      surface.height = rowCapacity;
+      const pixels = new Uint32Array(textureWidth * rowCapacity);
+      texture = {
+        surface,
+        width: textureWidth,
+        rows: rowCapacity,
+        pixels,
+        image: new ImageData(new Uint8ClampedArray(pixels.buffer), textureWidth, rowCapacity),
+      };
+      textureRef.current = texture;
+    }
+    composeWaterfall(rows, textureWidth, rowCapacity, palette, texture.pixels);
+    texture.surface.getContext("2d")?.putImageData(texture.image, 0, 0);
+    context.imageSmoothingEnabled = false;
+    context.drawImage(texture.surface, 0, 0, textureWidth, rowCapacity, 0, 0, width, height);
+    const guideFrame = frames[frames.length - 1];
     if (guideFrame?.bins.length) {
       const guideWindow = visibleBinWindow({ binCount: guideFrame.bins.length, startHz: guideFrame.startHz, endHz: guideFrame.endHz, view });
       const analysisStartRatio = Math.max(0, Math.min(1, ((guideFrame.analysisStartBin ?? 0) - guideWindow.startBin) / Math.max(1, guideWindow.endBin - guideWindow.startBin)));

@@ -483,6 +483,20 @@ describe("bounded robust detector", () => {
     expect(result?.event?.observed.toLowerCase()).not.toContain("chirp");
   });
 
+  it("trains on a pending non-alerting candidate only when learning accepts candidates", () => {
+    const engine = new DetectionEngine();
+    train(engine);
+    const bins = new Uint8Array(BIN_COUNT).fill(30);
+    bins[31] = 220;
+    const rejected = engine.analyzeObservation(observation(STARTRACK_BAND, bins, 80), STARTRACK_BAND);
+    expect(rejected).toMatchObject({ candidate: { kind: "narrowband-spike" }, alertEligible: false, trainingEligible: false });
+    const accepted = engine.analyzeObservation(observation(STARTRACK_BAND, bins, 81), STARTRACK_BAND, { acceptCandidates: true });
+    expect(accepted).toMatchObject({ candidate: { kind: "narrowband-spike" }, alertEligible: false, trainingEligible: true });
+    const alerting = engine.analyzeObservation(observation(STARTRACK_BAND, bins, 82), STARTRACK_BAND, { acceptCandidates: true });
+    expect(alerting.event?.kind).toBe("narrowband-spike");
+    expect(alerting.trainingEligible).toBe(false);
+  });
+
   it("requires accumulated observed exposure for slow drift", () => {
     const engine = new DetectionEngine();
     const drifted = new Uint8Array(BIN_COUNT).fill(35);

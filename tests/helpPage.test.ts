@@ -65,6 +65,14 @@ describe("packaged operator Help", () => {
     expect(markup).not.toMatch(/sudo|systemctl|journalctl/i);
   });
 
+  it("sends the DGNSS report task straight to DGNSS reports", () => {
+    const markup = render("field");
+    const section = markup.slice(markup.indexOf('id="dgnss"'), markup.indexOf('id="learning"'));
+    expect(section).toContain("Select DGNSS in the top bar");
+    expect(section).toContain("drop them anywhere on the dashboard");
+    expect(section).toContain(">Open DGNSS reports</button>");
+  });
+
   it("labels the Field trust domain instead of reusing Simulation copy", () => {
     const markup = render("field");
     expect(markup).toContain('data-rf-data-mode="field"');

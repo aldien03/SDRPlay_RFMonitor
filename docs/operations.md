@@ -105,6 +105,31 @@ Select **Acknowledge** after the incident has been seen and assigned. Acknowledg
 
 Select **Download evidence package**. The queued export contains the incident slice, not the entire session. The browser downloads it directly after the application streams its SHA-256; large incidents are numbered multipart archives without truncation.
 
+Open the incident first. The drawer leads with the verdict, the **disturbed frequencies** and the action, then **Why this alert**: the rule that fired, how strong and how wide the raised energy was against the alert level in force, and how often it repeated. Below that are a picture of exactly what the detector compared when the alert was raised, the timeline, notes and the evidence actions. **Incident report** opens the client report exactly as it is delivered, with **PDF**, **Open to print** and **Evidence package** buttons.
+
+The package file is named `RF-Incident_<start UTC>_<window>_<id>.zip`. After the download, the drawer shows its SHA-256 with a Copy button; record it with the transfer.
+
+Package contents:
+
+| Path | Contents |
+|---|---|
+| `report.pdf`, `report.html` | The client report (same content): cover with company, client, vessel and project; summary; why the alert was raised; spectrum at the alert, before/during spectrum and waterfall; timeline; analysis; receiver and configuration; operator notes; evidence integrity; limitations and terms. |
+| `report.json` | The report as data. |
+| `README-VERIFY.txt` | What is in the package and how to check it on Linux, macOS, Windows and the RF Monitor host. |
+| `incident.json`, `events/history.jsonl` | The incident record (including its stored trigger, peak values and timeline) and every stored version of it. |
+| `spectrum/` | The recorded frames: the evidence itself. |
+| `evidence/trigger-snapshot.json` | The levels, usual level and alert level the detector compared when the alert was raised. |
+| `evidence/screenshots/`, `evidence/notes/` | Screenshots and operator note files for this incident. |
+| `logs/` | Operations, configuration-audit (with the preceding hash-chain entry) and SDRconnect logs for the incident window plus 10 minutes. |
+| `source-context/` | Configuration, receiver snapshot and integrity record of each recording session. |
+| `figures/` | Overview sheet, waterfall image and the four analysis charts as stand-alone, time-stamped files. |
+| `export-record.json` | When, from which address and by which software the package was made. |
+| `manifest.json`, `SHA256SUMS.txt` | SHA-256 of every file, including the report. |
+
+To check a package, extract it and run `sha256sum -c SHA256SUMS.txt` (Linux), `shasum -a 256 -c SHA256SUMS.txt` (macOS), or `Get-FileHash -Algorithm SHA256` per file (Windows), or `sudo rf-monitor verify-evidence <folder>` on the host. Every line must report OK.
+
+The report and charts are derived from the recorded frames. Analysis counts "above the alert level" with the incident's own sensitivity, and also shows the looser "above usual range" (three normal variations) for context. When few frames were recorded before the incident, the report says the comparison is weak. Levels are relative and uncalibrated. RF data can show interference, not intent.
+
 Store the ZIP in the approved incident repository. Do not rename or modify its contents before verification. Record who transferred it and where it was stored according to local procedure.
 
 ### 6. Correlate Independently
@@ -261,7 +286,7 @@ Open **Engineer details** only when the first action asks for it or a support pr
 Unlock Settings before using any maintenance action. Each action has its own confirmation and audit entry:
 
 - **Recording > Clear test data** removes only test recordings, test incidents, and test signal learning. Field data and settings remain.
-- **Advanced > Signal learning > Learning details > Restart learning** starts a new generation for one named signal. The approved normal level and recordings remain.
+- **Advanced > Signal learning > Learning details > Restart learning** starts a new generation for one named signal. The approved normal level and recordings remain. If an alert is active on that signal, the confirmation names it and restarting ends it; the incident stays in Evidence History marked as ended by the operator, and the audit log lists the ended incident IDs. Until learning is approved, alerts from that signal are Low evidence, and until the first 64 observations of that signal are collected (a few minutes) it flags nothing.
 - **Recording > Delete recordings** removes finalized recordings only from the named active Field or Test domain. Active, finalizing, export-leased recordings, exports, learning, and settings remain.
 - **Advanced > Software recovery > Restart software** requests the bounded external application-recovery helper. It does not expose `systemctl`. Recordings, learning, and settings remain.
 
@@ -355,3 +380,37 @@ The service finalizes evidence on controlled shutdown when possible. An abrupt p
 5. Leave monitoring running unless an authorized shutdown is planned.
 
 Select **Exit admin mode** before leaving an operator computer unattended.
+
+## Automatic incident images
+
+When **Settings > Recording > Incident images** is on (the default), RF Monitor saves a time-stamped image of each incident on its own, without anyone starting an export:
+
+- about one minute after the incident starts, so there is something to look at even if it never clears;
+- every 30 minutes while it stays open (at most 12 times);
+- when it ends, and once more about ten minutes later, when the post-clear recording is complete.
+
+Each save writes `incident-figures/<incident>/<UTC time>-<start|progress|end|final>.svg`, `.png` and `-analysis.svg` inside the evidence folder of the active data domain (Field or Test; simulation incidents never produce images). In **Evidence History**, **Image** and **Analysis** links open the newest saved overview and analysis charts of an incident.
+
+Cleanup is automatic. Images older than **Delete images after** (1 to 365 days, default 30) are deleted by the regular storage maintenance, even when saving has been switched off. Independently of that setting, no more than 400 images are kept: the oldest go first. Only files this feature wrote are ever deleted. Images are skipped while the host is under memory or resource pressure, and a failure to draw one never affects monitoring or evidence health. Deleting an image does not touch the recorded evidence, and an incident package exported later still contains its own figure.
+
+### Reading incident images and reports from a folder
+
+The evidence store (`/var/lib/rf-monitor/...`) is private to the `rfmonitor` service account on purpose: the same account can read the protected Settings secret, so nobody should be added to that group. People who only need the incident images and reports use one of these:
+
+- **The dashboard.** Evidence History opens the newest **Image** and **Analysis** of an incident and downloads full evidence packages. No file permissions are involved.
+- **A separate share folder**, for people who work from a file manager. Set it up once:
+
+  ```
+  sudo rf-monitor share-evidence --dry-run                  # show the plan, change nothing
+  sudo rf-monitor share-evidence                            # prepare the default folder
+  sudo rf-monitor share-evidence --folder /ABSOLUTE/PATH    # or choose another place
+  sudo rf-monitor share-evidence --source /ABSOLUTE/BUILT/SOURCE   # also run the deploy that applies it
+  ```
+
+  - The default folder is `/srv/rf-monitor-evidence`. It must be an ordinary folder outside the evidence store, home folders and system directories (`/home`, `/root`, `/tmp`, `/etc`, `/opt`, ...). The service runs with `ProtectHome` and a strict file system, so it cannot write into a home folder, and this command does not weaken that.
+  - The command creates the group `rf-evidence-readers`, adds your user to it (never to `rfmonitor`), creates the folder with mode `2750`, and puts a link named `RF-Monitor-Evidence` in your `~/Documents`. You must log out and back in once for the group to apply.
+  - It records `RF_MONITOR_SHARE_DIR` in `/etc/rf-monitor.env`. A release deploy (`sudo rf-monitor deploy-release /ABSOLUTE/BUILT/SOURCE`) then adds the folder to the service's writable paths and restarts RF Monitor briefly.
+  - For Field incidents the share receives, next to the copy in the evidence store, `<UTC time>-<start|progress|end|final>.svg`, `.png`, `-analysis.svg` and `-report.html` in one folder per incident. Test and simulation data never reach the share. The folder is also cleaned by the **Delete images after** setting and the 400-file cap. Anything else you put in it is never deleted.
+  - A missing or unwritable share never affects monitoring or the evidence store; a warning is logged at most once every ten minutes.
+  - Full evidence packages are not copied automatically: they can only be built from a Complete session, and the open session closes on rotation. Download them from Evidence History when needed.
+  - `sudo rf-monitor share-evidence --stop` switches the copying off and keeps the files already there.

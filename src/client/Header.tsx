@@ -1,4 +1,4 @@
-import { BellOff, BellRing, ChevronDown, CircleHelp, Grid2X2, Pause, Play, Radio, Settings, SlidersHorizontal, Volume2, VolumeX } from "lucide-react";
+import { BellOff, BellRing, ChevronDown, CircleHelp, Grid2X2, Pause, Play, Radio, SatelliteDish, Settings, SlidersHorizontal, Volume2, VolumeX } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { presentOperatorSummary } from "../shared/operatorSummary";
 import type { MonitorSnapshot } from "../shared/types";
@@ -26,6 +26,8 @@ export function Header({
   onSettings,
   onHelp,
   onAlertOption,
+  dgnssOpen = false,
+  onDgnss,
 }: {
   snapshot: MonitorSnapshot;
   layout: SignalWallLayout;
@@ -38,6 +40,9 @@ export function Header({
   onSettings: () => void;
   onHelp: () => void;
   onAlertOption: (key: "audioAlerts" | "popupAlerts") => void;
+  /** DGNSS reports (Gator SBS checked against RF evidence) open from the top bar. */
+  dgnssOpen?: boolean;
+  onDgnss?: () => void;
 }) {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -84,6 +89,7 @@ export function Header({
         <button type="button" className={audioAlerts ? "selected" : ""} onClick={() => onAlertOption("audioAlerts")} aria-pressed={audioAlerts} aria-label={audioAlerts ? "Turn off alert sound" : "Turn on alert sound"}>{audioAlerts ? <Volume2 size={19} aria-hidden="true" /> : <VolumeX size={19} aria-hidden="true" />}<span>Sound</span></button>
         <button type="button" className={popupAlerts ? "selected" : ""} onClick={() => onAlertOption("popupAlerts")} aria-pressed={popupAlerts} aria-label={popupAlerts ? "Turn off alert popups" : "Turn on alert popups"}>{popupAlerts ? <BellRing size={19} aria-hidden="true" /> : <BellOff size={19} aria-hidden="true" />}<span>Popup</span></button>
         <button type="button" className={engineer ? "selected" : ""} onClick={onEngineer} aria-label={engineer ? "Close engineer tools" : "Open engineer tools"} aria-pressed={engineer} aria-expanded={engineer}><SlidersHorizontal size={19} aria-hidden="true" /><span>Engineer</span></button>
+        {onDgnss ? <button type="button" className={dgnssOpen ? "selected" : ""} onClick={onDgnss} aria-label={dgnssOpen ? "Close DGNSS reports" : "Open DGNSS reports"} aria-expanded={dgnssOpen}><SatelliteDish size={19} aria-hidden="true" /><span>DGNSS</span></button> : null}
         <button type="button" onClick={onHelp} aria-label="Open help"><CircleHelp size={20} aria-hidden="true" /><span>Help</span></button>
         <button type="button" onClick={onSettings} aria-label="Open settings"><Settings size={20} aria-hidden="true" /><span>Settings</span></button>
       </nav>

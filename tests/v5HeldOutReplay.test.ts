@@ -73,7 +73,7 @@ function sha256(bytes: string | Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-const operational = validateOperationalSettings(operationalJson as OperationalSettings, TEST_CATALOG);
+const operational = validateOperationalSettings(operationalJson as unknown as OperationalSettings, TEST_CATALOG);
 const candidate: V5CandidateContext = {
   release: RELEASE,
   catalog: TEST_CATALOG,

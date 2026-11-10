@@ -1,4 +1,6 @@
-import { Download, RadioTower, ShieldAlert } from "lucide-react";
+import { Download, Gauge, RadioTower, ShieldAlert } from "lucide-react";
+import { alertPresetLabel } from "../shared/alertPolicy";
+import type { AlertRuleComparison, ChannelMonitorState } from "../shared/types";
 import { useMemo, useState, type ReactNode } from "react";
 import type { MonitorFeed, MonitorSnapshot, SettingsRevision, SpectrumFrame } from "../shared/types";
 import type { SweepFrameState } from "./useMonitor";
@@ -80,6 +82,7 @@ export function EngineerWorkspace({
         </div>
         <small>{simulation ? "Simulation — hardware not tested" : physicalStateUnavailable ? "Mode unknown — hardware state not trusted" : receiver?.deviceName || "Receiver not identified"}{!physicalStateUnavailable && receiver?.apiVersion ? ` - API ${receiver.apiVersion}` : ""}</small>
       </div>
+      <DetectorGaugePanel snapshot={snapshot} />
       {simulation ? <SyntheticValidationPanel activeExercise={snapshot.syntheticExercise} onShowOnDashboard={startSyntheticExercise} onStopExercise={stopSyntheticExercise} /> : null}
       <EngineerFocus snapshot={snapshot} getSettings={getSettings} startFocus={startFocus} stopFocus={stopFocus} onToast={onToast} />
       <p className="engineer-limit">RF only · Navigation impact not assessed</p>
@@ -93,4 +96,48 @@ function Stage({ label, value, state }: { label: string; value: string; state: "
 
 function Metric({ label, value }: { label: string; value: string }) {
   return <div><span>{label}</span><strong>{value}</strong></div>;
+}
+
+function gaugeValue(rule: AlertRuleComparison, value: number): string {
+  switch (rule.unit) {
+    case "ratio": return `${(value * 100).toFixed(1)}%`;
+    case "ms": return `${(value / 1_000).toFixed(1)} s`;
+    case "checks": return String(value);
+    default: return `${value.toFixed(1)}σ`;
+  }
+}
+
+/**
+ * Engineer view of the alert track: for each window, the latest check against
+ * every alert rule (measured vs threshold) and the persistence progress.
+ */
+export function DetectorGaugePanel({ snapshot }: { snapshot: MonitorSnapshot }) {
+  const states = snapshot.targetStates.filter((state): state is ChannelMonitorState & { gauge: NonNullable<ChannelMonitorState["gauge"]> } => Boolean(state.gauge));
+  if (!states.length) return null;
+  return (
+    <section className="engineer-gauge" aria-labelledby="engineer-gauge-title">
+      <header><Gauge size={18} aria-hidden="true" /><strong id="engineer-gauge-title">Alert rules, latest check</strong></header>
+      {states.map((state) => {
+        const target = snapshot.monitorTargets.find((candidate) => candidate.id === state.targetId);
+        return (
+          <div key={state.targetId} className="engineer-gauge-target">
+            <div className="engineer-gauge-title"><strong>{target?.label ?? state.targetId}</strong><span>{alertPresetLabel(state.gauge.preset)} · {state.gauge.votes} of {state.gauge.required} raised checks{state.gauge.floorExposureMs ? ` · floor ${(state.gauge.floorExposureMs / 1_000).toFixed(1)}/${(state.gauge.floorRequiredMs / 1_000).toFixed(0)} s` : ""}</span></div>
+            <table>
+              <thead><tr><th scope="col">Rule</th><th scope="col">Now</th><th scope="col">Alert at</th><th scope="col">Margin</th></tr></thead>
+              <tbody>
+                {state.gauge.rules.map((rule) => (
+                  <tr key={rule.rule} className={rule.met ? "met" : undefined}>
+                    <th scope="row">{rule.label}</th>
+                    <td>{gaugeValue(rule, rule.measured)}</td>
+                    <td>{gaugeValue(rule, rule.threshold)}</td>
+                    <td><span className="gauge-meter" aria-label={`${Math.round((rule.measured / Math.max(1e-9, rule.threshold)) * 100)}% of the alert level`}><i style={{ width: `${Math.min(100, (rule.measured / Math.max(1e-9, rule.threshold)) * 100)}%` }} /></span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        );
+      })}
+    </section>
+  );
 }

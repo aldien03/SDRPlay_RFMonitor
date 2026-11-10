@@ -1,9 +1,14 @@
-import { CalendarDays, Database, Flag, X } from "lucide-react";
+import { CalendarDays, Database, Flag, FolderArchive, SatelliteDish, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Header } from "./client/Header";
-import { EvidenceArchive, OptionsPanel, type DisplayOptions } from "./client/BottomPanels";
-import { IncidentPanel } from "./client/MonitorPanels";
+import { EvidenceArchive, OptionsPanel, replaySignalLabel, type DisplayOptions } from "./client/BottomPanels";
+import { DgnssReports, type IncomingSbsFiles } from "./client/DgnssReports";
+import { IncidentPanel, type IncidentReplaySource, type IncidentStepper, type PackageDownloadInfo } from "./client/MonitorPanels";
+import { recentIncidents } from "./client/incidentPresentation";
+import { IncidentReportDialog } from "./client/IncidentReportDialog";
 import { NoteModal } from "./client/Modals";
+import { Toast } from "./client/Toast";
 import { SettingsPage, type SettingsTab } from "./client/SettingsPage";
 import { EngineerWorkspace } from "./client/EngineerWorkspace";
 import { SystemHealth, SystemHealthIndicator } from "./client/SystemHealth";
@@ -25,7 +30,7 @@ import { useMonitor } from "./client/useMonitor";
 import { DialogShell } from "./client/DialogShell";
 import { HelpPage } from "./client/HelpPage";
 import { presentOperatorSummary } from "./shared/operatorSummary";
-import type { DetectionEvent, EvidenceArchiveSession, MonitorFeed } from "./shared/types";
+import type { DetectionEvent, EvidenceArchiveSession, MonitorFeed, RecentIncidentsPage } from "./shared/types";
 
 type DetailsView = "incident" | "evidence";
 type ActiveDrawer = DetailsView | "engineer";
@@ -105,18 +110,30 @@ function loadSignalWallPreferences(): SignalWallPreferences {
 
 export function App() {
   const monitor = useMonitor();
-  const { snapshot, targetFrames, sweepFrames, error, reloadRequired, pause, acknowledge, addNote, captureScreenshot, exportIncident, exportSession, getEvidenceArchive, getEvidenceSessionEvents, getEvidenceReplayBatch, setEngineerStream, setVisibleTargets } = monitor;
+  const { snapshot, targetFrames, sweepFrames, error, reloadRequired, pause, acknowledge, addNote, captureScreenshot, exportIncident, exportSession, getEvent, getEvidenceArchive, getEvidenceSessionEvents, getEvidenceReplayBatch, getRecentIncidents, setEngineerStream, setVisibleTargets } = monitor;
   const [options, setOptions] = useState<DisplayOptions>(loadOptions);
   const [wallPreferences, setWallPreferences] = useState<SignalWallPreferences>(loadSignalWallPreferences);
   const [feedManagerOpen, setFeedManagerOpen] = useState(false);
   const [focusFeed, setFocusFeed] = useState<MonitorFeed>();
-  const [noteOpen, setNoteOpen] = useState(false);
+  /** The incident a note is being written for, fixed when the note dialog opens. */
+  const [noteEventId, setNoteEventId] = useState<string>();
   const [settingsTab, setSettingsTab] = useState<SettingsTab>();
   const [helpOpen, setHelpOpen] = useState(() => location.pathname === "/help");
   const [toast, setToast] = useState<string>();
   const [selectedEventId, setSelectedEventId] = useState<string>();
   const [archivedEvent, setArchivedEvent] = useState<DetectionEvent>();
-  const [detailsView, setDetailsView] = useState<DetailsView>();
+  // /dgnss opens straight on DGNSS reports (bookmarkable).
+  const [detailsView, setDetailsView] = useState<DetailsView | undefined>(() => location.pathname === "/dgnss" ? "evidence" : undefined);
+  const [incidentFromEvidence, setIncidentFromEvidence] = useState(false);
+  const [incidentFromRecent, setIncidentFromRecent] = useState(false);
+  const [recentPage, setRecentPage] = useState<RecentIncidentsPage>();
+  const [recentError, setRecentError] = useState<string>();
+  const [recentRevision, setRecentRevision] = useState(0);
+  const drawerScroll = useRef<HTMLDivElement>(null);
+  const drawerViewKey = useRef<string | undefined>(undefined);
+  const [packageDownload, setPackageDownload] = useState<PackageDownloadInfo>();
+  const [exportingEventId, setExportingEventId] = useState<string>();
+  const [reportEvent, setReportEvent] = useState<DetectionEvent>();
   const [now, setNow] = useState(() => Date.now());
   const lastAlertId = useRef<string | undefined>(undefined);
   const operator = presentOperatorSummary(snapshot.operatorSummary);
@@ -124,13 +141,23 @@ export function App() {
   const affectedTargetIds = operatorAffectedTargetIds(snapshot.operatorSummary);
   const affectedTargetSignature = affectedTargetIds.join("\u0000");
   const event = currentOperatorEvent(snapshot);
+  // A selected incident stays on screen after it clears; the live list keeps it.
   const selectedEvent = archivedEvent?.id === selectedEventId
     ? archivedEvent
     : event?.id === selectedEventId
       ? event
-      : undefined;
+      : snapshot.events.find((candidate) => candidate.id === selectedEventId);
   const selectedEventArchived = Boolean(selectedEvent && archivedEvent?.id === selectedEvent.id);
   const activeDrawer: ActiveDrawer | undefined = options.engineer ? "engineer" : detailsView;
+  const showingRecent = activeDrawer === "incident" && !selectedEvent;
+  const liveEventIds = new Set([...(event ? [event.id] : []), ...snapshot.events.map((candidate) => candidate.id)]);
+  const otherActive = [...new Map([...(event ? [event] : []), ...snapshot.events]
+    .filter((candidate) => (candidate.lifecycle === "active" || candidate.lifecycle === "recovering") && candidate.id !== selectedEvent?.id)
+    .map((candidate) => [candidate.id, candidate])).values()];
+  const recentLiveIds = new Set([...liveEventIds, ...(recentPage?.liveIds ?? [])]);
+  const recentList = recentPage ? recentIncidents(snapshot.events, recentPage.incidents) : undefined;
+  // Live changes that matter to the recent list: new, cleared, reviewed or annotated incidents.
+  const liveIncidentSignature = snapshot.events.map((candidate) => `${candidate.id}:${candidate.lifecycle ?? ""}:${candidate.acknowledgedAt ?? ""}:${candidate.notes.length}`).join("|");
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 1_000);
@@ -193,8 +220,49 @@ export function App() {
 
   useEffect(() => {
     if (archivedEvent) return;
-    setSelectedEventId(event?.id);
-  }, [archivedEvent, event?.id]);
+    // While the drawer shows an incident it stays on it (other open ones are offered
+    // in the drawer); otherwise follow the current live incident.
+    if (detailsView === "incident" && selectedEventId) return;
+    if (event?.id) setSelectedEventId(event.id);
+    else if (detailsView !== "incident") setSelectedEventId(undefined);
+  }, [archivedEvent, detailsView, event?.id, selectedEventId]);
+
+  // Newest incidents and the "to review" count: for the footer and for the
+  // Incidents drawer when nothing is active. Refreshed when live incidents
+  // change, after a note or review, and once a minute while the tab is visible.
+  useEffect(() => {
+    let cancelled = false;
+    const load = () => {
+      if (document.visibilityState === "hidden") return;
+      getRecentIncidents(6)
+        .then((page) => {
+          if (cancelled) return;
+          setRecentPage(page);
+          setRecentError(undefined);
+        })
+        .catch((reason) => {
+          if (!cancelled) setRecentError(reason instanceof Error ? reason.message : "Recent incidents could not be loaded.");
+        });
+    };
+    load();
+    const timer = window.setInterval(load, 60_000);
+    document.addEventListener("visibilitychange", load);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", load);
+    };
+  }, [getRecentIncidents, liveIncidentSignature, recentRevision, showingRecent]);
+
+  // A new view or incident in the drawer starts at the top, with focus on its title.
+  useEffect(() => {
+    const key = activeDrawer ? `${activeDrawer}:${activeDrawer === "incident" ? selectedEventId ?? "recent" : ""}` : undefined;
+    const previous = drawerViewKey.current;
+    drawerViewKey.current = key;
+    if (!key || !previous || previous === key) return;
+    drawerScroll.current?.scrollTo({ top: 0 });
+    if (activeDrawer === "incident") drawerScroll.current?.querySelector<HTMLElement>("#incident-title")?.focus({ preventScroll: true });
+  }, [activeDrawer, selectedEventId]);
 
   const changeOptions = async (next: DisplayOptions) => {
     if (next.popupAlerts && !options.popupAlerts && "Notification" in window && Notification.permission === "default") {
@@ -210,18 +278,23 @@ export function App() {
   };
 
   const exportEventPackage = async (target: DetectionEvent, captureLiveScreenshot: boolean) => {
+    setExportingEventId(target.id);
     try {
-      if (captureLiveScreenshot) await captureScreenshot(target.id);
-      await exportIncident(target.id, target.sessionId);
-      showTemporaryToast("Incident package downloaded.");
+      if (captureLiveScreenshot) await captureScreenshot(target.id).catch(() => undefined);
+      const result = await exportIncident(target.id, target.sessionId, target);
+      setPackageDownload({ eventId: target.id, files: result.files });
+      showTemporaryToast("Evidence package downloaded. Its SHA-256 is shown with the incident.");
     } catch (reason) {
       showTemporaryToast(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setExportingEventId(undefined);
     }
   };
 
   const handleExport = async () => {
     if (!selectedEvent) return;
-    await exportEventPackage(selectedEvent, !selectedEventArchived);
+    const live = selectedEvent.lifecycle === "active" || selectedEvent.lifecycle === "recovering";
+    await exportEventPackage(selectedEvent, !selectedEventArchived && live);
   };
 
   const handleSessionExport = async (session: EvidenceArchiveSession) => {
@@ -233,6 +306,78 @@ export function App() {
       throw reason;
     }
   };
+
+  const [evidenceView, setEvidenceView] = useState<"sessions" | "dgnss">(() => location.pathname === "/dgnss" ? "dgnss" : "sessions");
+  const [incomingSbs, setIncomingSbs] = useState<IncomingSbsFiles>();
+  const [sbsDragging, setSbsDragging] = useState(false);
+  const dgnssOpen = activeDrawer === "evidence" && evidenceView === "dgnss";
+  const dgnssOpenRef = useRef(dgnssOpen);
+  dgnssOpenRef.current = dgnssOpen;
+
+  const openDgnss = () => {
+    setEvidenceView("dgnss");
+    openDetails("evidence");
+  };
+
+  // The address follows the DGNSS drawer, so /dgnss can be bookmarked and shared on the bridge.
+  useEffect(() => {
+    if (helpOpen) return;
+    const target = dgnssOpen ? "/dgnss" : "/";
+    if (location.pathname !== target && (dgnssOpen || location.pathname === "/dgnss")) history.replaceState(null, "", `${target}${retainedQaSearch()}`);
+  }, [dgnssOpen, helpOpen]);
+
+  // Gator .sbs files dropped anywhere on the dashboard start a DGNSS report.
+  const sbsDropActions = useRef({ toast: (_message: string) => {}, start: (_files: File[]) => {} });
+  sbsDropActions.current = {
+    toast: (message) => showTemporaryToast(message),
+    start: (files) => {
+      setIncomingSbs({ id: Date.now(), files });
+      openDgnss();
+    },
+  };
+  useEffect(() => {
+    if (helpOpen || settingsTab) return;
+    let depth = 0;
+    const carriesFiles = (event: DragEvent) => Array.from(event.dataTransfer?.types ?? []).includes("Files");
+    const onEnter = (event: DragEvent) => {
+      if (!carriesFiles(event)) return;
+      depth += 1;
+      if (!dgnssOpenRef.current) setSbsDragging(true);
+    };
+    const onOver = (event: DragEvent) => {
+      if (!carriesFiles(event)) return;
+      event.preventDefault();
+      if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+    };
+    const onLeave = (event: DragEvent) => {
+      if (!carriesFiles(event)) return;
+      depth = Math.max(0, depth - 1);
+      if (!depth) setSbsDragging(false);
+    };
+    const onDrop = (event: DragEvent) => {
+      depth = 0;
+      setSbsDragging(false);
+      if (!carriesFiles(event) || event.defaultPrevented) return; // The upload area handled it.
+      event.preventDefault();
+      const files = Array.from(event.dataTransfer?.files ?? []).filter((file) => /\.sbs$/i.test(file.name));
+      if (!files.length) {
+        sbsDropActions.current.toast("Drop Gator .sbs files to start a DGNSS report.");
+        return;
+      }
+      sbsDropActions.current.start(files);
+    };
+    window.addEventListener("dragenter", onEnter);
+    window.addEventListener("dragover", onOver);
+    window.addEventListener("dragleave", onLeave);
+    window.addEventListener("drop", onDrop);
+    return () => {
+      window.removeEventListener("dragenter", onEnter);
+      window.removeEventListener("dragover", onOver);
+      window.removeEventListener("dragleave", onLeave);
+      window.removeEventListener("drop", onDrop);
+      setSbsDragging(false);
+    };
+  }, [helpOpen, settingsTab]);
 
   const openDetails = (view: DetailsView) => {
     setDetailsView(view);
@@ -271,14 +416,70 @@ export function App() {
 
   const openCurrentIncident = () => {
     setArchivedEvent(undefined);
-    setSelectedEventId(event?.id);
+    setIncidentFromEvidence(false);
+    setIncidentFromRecent(false);
+    setSelectedEventId(event?.id ?? (detailsView === "incident" ? selectedEventId : undefined));
     openDetails("incident");
   };
 
   const openArchivedIncident = (archiveEvent: DetectionEvent) => {
     setArchivedEvent(archiveEvent);
     setSelectedEventId(archiveEvent.id);
+    setIncidentFromEvidence(true);
+    setIncidentFromRecent(false);
     openDetails("incident");
+  };
+
+  const backToEvidence = () => {
+    setIncidentFromEvidence(false);
+    setArchivedEvent(undefined);
+    openDetails("evidence");
+  };
+
+  /** Incidents from this run open live (notes and review stay available); older ones open read-only. */
+  const openRecentIncident = (target: DetectionEvent) => {
+    setArchivedEvent(liveEventIds.has(target.id) ? undefined : target);
+    setSelectedEventId(target.id);
+    setIncidentFromEvidence(false);
+    setIncidentFromRecent(true);
+  };
+
+  const backToRecent = () => {
+    setArchivedEvent(undefined);
+    setIncidentFromRecent(false);
+    setSelectedEventId(undefined);
+  };
+
+  const recentPosition = incidentFromRecent && recentList && selectedEvent ? recentList.findIndex((candidate) => candidate.id === selectedEvent.id) : -1;
+  const stepper: IncidentStepper | undefined = recentList && recentPosition >= 0 ? {
+    position: recentPosition + 1,
+    total: recentList.length,
+    onNewer: recentPosition > 0 ? () => openRecentIncident(recentList[recentPosition - 1]) : undefined,
+    onOlder: recentPosition < recentList.length - 1 ? () => openRecentIncident(recentList[recentPosition + 1]) : undefined,
+  } : undefined;
+
+  // Replay is offered for finalized sessions on this host; the server has the final say.
+  const replaySessionRecord = selectedEvent ? snapshot.sessions.find((session) => session.id === selectedEvent.sessionId) : undefined;
+  const replay: IncidentReplaySource | undefined = selectedEvent && !selectedEvent.syntheticExercise
+    && (replaySessionRecord ? replaySessionRecord.lifecycle === "Complete" || replaySessionRecord.lifecycle === "Incomplete" : !liveEventIds.has(selectedEvent.id))
+    ? {
+      session: { id: selectedEvent.sessionId, lifecycle: replaySessionRecord?.lifecycle, incompleteReasons: replaySessionRecord?.incompleteReasons },
+      getBatch: getEvidenceReplayBatch,
+      signalLabel: (bandId) => replaySignalLabel(snapshot, bandId),
+    }
+    : undefined;
+
+  /** A stored incident in the drawer shows its new note or review at once; the recent list and count follow. */
+  const afterReview = (updated: DetectionEvent | undefined) => {
+    if (updated && archivedEvent?.id === updated.id) setArchivedEvent(updated);
+    setRecentRevision((revision) => revision + 1);
+  };
+
+  const selectOpenIncident = (target: DetectionEvent) => {
+    setArchivedEvent(undefined);
+    setIncidentFromEvidence(false);
+    setIncidentFromRecent(false);
+    setSelectedEventId(target.id);
   };
 
   const startLiveFeed = async () => {
@@ -351,7 +552,8 @@ export function App() {
       onClose={closeHelp}
       onOpenHealth={() => openSettings("health")}
       onOpenRecording={() => openSettings("recording")}
-      onOpenEvidence={() => { closeHelp(); openDetails("evidence"); }}
+      onOpenEvidence={() => { closeHelp(); setEvidenceView("sessions"); openDetails("evidence"); }}
+      onOpenDgnss={() => { closeHelp(); openDgnss(); }}
       onOpenEngineer={() => { closeHelp(); setOptions((current) => ({ ...current, engineer: true })); }}
     />;
   }
@@ -368,6 +570,8 @@ export function App() {
           unlockSettings={monitor.unlockSettings}
           lockSettings={monitor.lockSettings}
           applySettings={monitor.applySettings}
+          getAlertPreview={monitor.getAlertPreview}
+          uploadReportLogo={monitor.uploadReportLogo}
           approveBaseline={monitor.approveBaseline}
           restartBaseline={monitor.restartBaseline}
           clearTestData={monitor.clearTestData}
@@ -375,6 +579,7 @@ export function App() {
           restartSoftware={monitor.restartSoftware}
           startFocus={monitor.startFocus}
           stopFocus={monitor.stopFocus}
+          onOpenDgnssReports={() => { setSettingsTab(undefined); openDgnss(); }}
           renderSystemHealth={({ openTab }) => (
             <SystemHealth
               snapshot={snapshot}
@@ -386,12 +591,12 @@ export function App() {
             />
           )}
         />
-        {toast ? <div className="toast" role="status">{toast}</div> : null}
+        <Toast message={toast} />
       </>
     );
   }
 
-  const activeIncidentCount = operatorIncident ? 1 : 0;
+  const toReview = recentPage?.toReview ?? 0;
   const affectedLabel = affectedTargetsCopy(snapshot.operatorSummary);
   const operatorObservation = operatorIncident?.observation ?? operator.observation;
   const operatorAction = operatorIncident?.recommendedAction ?? operator.action;
@@ -424,6 +629,8 @@ export function App() {
         onSettings={() => openSettings("monitoring")}
         onHelp={openHelp}
         onAlertOption={(key) => void changeOptions({ ...options, [key]: !options[key] })}
+        dgnssOpen={dgnssOpen}
+        onDgnss={() => (dgnssOpen ? closeDetails() : openDgnss())}
       />
       {error ? <div className="mission-connection-error" role="status" aria-live="polite"><span>{error}</span>{reloadRequired ? <button type="button" onClick={() => location.reload()}>Reload</button> : null}</div> : null}
       <main className="mission-dashboard">
@@ -458,26 +665,84 @@ export function App() {
         <footer className={`mission-footer ${snapshot.operatorSummary.monitoring.state === "alert" ? "alert" : ""} ${snapshot.operatorSummary.dataMode === "simulation" ? "simulation" : ""}`}>
           <button type="button" className="mission-monitoring" onClick={performOperatorAction} aria-label={`Monitoring: ${operator.monitoring}. ${footerDetail}`}><i aria-hidden="true" /><span className="mission-status-copy"><small>Monitoring</small><strong>{operator.monitoring}</strong></span><span className="mission-footer-detail">{footerDetail}</span></button>
           <span className="mission-truth-chip" title={operator.recording === "Recording" ? "Recording on" : `Action: ${snapshot.operatorSummary.recording.actionCode === "open-recording" ? "Open Recording" : "None"}`}><Database size={16} aria-hidden="true" /><span><small>Recording</small><strong>{operator.recording}</strong></span></span>
-          <button type="button" onClick={openCurrentIncident}><Flag size={18} aria-hidden="true" />{operatorIncident ? `${operatorIncident.evidenceStrength} evidence` : `Incidents ${activeIncidentCount}`}</button>
-          {snapshot.activeFocus ? <button type="button" onClick={() => void stopFocus()}>Resume survey{activeFeed ? ` from ${activeFeed.shortLabel}` : ""}</button> : <button type="button" onClick={() => openDetails("evidence")}><CalendarDays size={18} aria-hidden="true" />Evidence history</button>}
+          <button type="button" className={!operatorIncident && toReview ? "mission-review-pending" : undefined} onClick={openCurrentIncident} title={toReview ? `${toReview} incident${toReview === 1 ? "" : "s"} from the last ${recentPage?.reviewWindowHours ?? 24} h not yet reviewed` : undefined}><Flag size={18} aria-hidden="true" />{operatorIncident ? `${operatorIncident.evidenceStrength} evidence` : toReview ? `Incidents · ${toReview} to review` : "Incidents"}</button>
+          {snapshot.activeFocus ? <button type="button" onClick={() => void stopFocus()}>Resume survey{activeFeed ? ` from ${activeFeed.shortLabel}` : ""}</button> : <button type="button" onClick={() => { setEvidenceView("sessions"); openDetails("evidence"); }}><CalendarDays size={18} aria-hidden="true" />Evidence history</button>}
         </footer>
       </main>
 
       {activeDrawer ? (
-        <DialogShell backdropClassName="details-backdrop" dialogClassName={`details-drawer mission-details details-view-${activeDrawer}`} ariaLabel={activeDrawer === "incident" ? "Incident details" : activeDrawer === "evidence" ? "Evidence history" : "Engineer details"} onClose={closeDetails}>
-          <div className="details-drawer-header"><div><span>{operator.mode} · {operator.productionQualification}</span><strong>{activeDrawer === "incident" ? "Incident details" : activeDrawer === "evidence" ? "Evidence history" : "Engineer"}</strong></div><button type="button" onClick={closeDetails} aria-label="Close details"><X size={20} /></button></div>
-          <div className="details-drawer-scroll">
+        <DialogShell backdropClassName="details-backdrop" dialogClassName={`details-drawer mission-details details-view-${activeDrawer}`} ariaLabel={activeDrawer === "incident" ? (showingRecent ? "Incidents" : "Incident details") : activeDrawer === "evidence" ? (dgnssOpen ? "DGNSS reports" : "Evidence history") : "Engineer details"} onClose={closeDetails}>
+          <div className="details-drawer-header"><div><span>{operator.mode} · {operator.productionQualification}</span><strong>{activeDrawer === "incident" ? (showingRecent ? "Incidents" : "Incident details") : activeDrawer === "evidence" ? (dgnssOpen ? "DGNSS reports" : "Evidence history") : "Engineer"}</strong></div><button type="button" onClick={closeDetails} aria-label="Close details"><X size={20} /></button></div>
+          <div className="details-drawer-scroll" ref={drawerScroll}>
             {activeDrawer === "engineer" ? <><EngineerWorkspace snapshot={snapshot} sweepFrames={sweepFrames} selectedFeedId={wallPreferences.selectedFeedId} onSelectFeed={(selectedFeedId) => setWallPreferences((current) => ({ ...current, selectedFeedId }))} healthIndicator={<EngineerHealthIndicator onOpen={() => openSettings("health")} />} getSettings={monitor.getSettings} startFocus={monitor.startFocus} stopFocus={monitor.stopFocus} startSyntheticExercise={startSyntheticExercise} stopSyntheticExercise={stopSyntheticExercise} onToast={showTemporaryToast} /><OptionsPanel options={options} onChange={(next) => void changeOptions(next)} /></> : null}
-            {activeDrawer === "incident" ? <IncidentPanel archived={selectedEventArchived} event={selectedEvent} operatorSummary={snapshot.operatorSummary} services={snapshot.services} displayTimeZone={snapshot.displayTimeZone} onAddNote={() => setNoteOpen(true)} onAcknowledge={() => selectedEvent && void acknowledge(selectedEvent.id).then(() => showTemporaryToast("Incident marked as reviewed."))} onExport={() => void handleExport()} frame={selectedEventArchived ? undefined : selectedEvent?.targetId ? targetFrames[selectedEvent.targetId]?.frame : undefined} /> : null}
-            {activeDrawer === "evidence" ? <EvidenceArchive snapshot={snapshot} getArchive={getEvidenceArchive} getSessionEvents={getEvidenceSessionEvents} getReplayBatch={getEvidenceReplayBatch} onOpenIncident={openArchivedIncident} onExportEvent={(archiveEvent) => exportEventPackage(archiveEvent, false)} onExportSession={handleSessionExport} /> : null}
+            {activeDrawer === "incident" ? <IncidentPanel
+              archived={selectedEventArchived}
+              event={selectedEvent}
+              operatorSummary={snapshot.operatorSummary}
+              services={snapshot.services}
+              displayTimeZone={snapshot.displayTimeZone}
+              onAddNote={() => setNoteEventId(selectedEvent?.id)}
+              onAcknowledge={() => {
+                const eventId = selectedEvent?.id;
+                if (!eventId) return;
+                void acknowledge(eventId)
+                  .then((updated) => {
+                    afterReview(updated);
+                    showTemporaryToast("Incident marked as reviewed.");
+                  })
+                  .catch((reason) => showTemporaryToast(reason instanceof Error ? reason.message : "The incident could not be marked as reviewed. Try again."));
+              }}
+              onExport={() => void handleExport()}
+              frame={selectedEventArchived ? undefined : selectedEvent?.targetId ? targetFrames[selectedEvent.targetId]?.frame : undefined}
+              getEvent={getEvent}
+              onBack={incidentFromEvidence ? backToEvidence : incidentFromRecent ? backToRecent : undefined}
+              backLabel={incidentFromEvidence ? "Evidence history" : "Recent incidents"}
+              recent={showingRecent ? { incidents: recentList, error: recentPage ? undefined : recentError, liveIds: recentLiveIds, toReview: recentPage?.toReview, reviewWindowHours: recentPage?.reviewWindowHours } : undefined}
+              stepper={stepper}
+              replay={replay}
+              onOpenRecent={openRecentIncident}
+              onOpenHistory={() => {
+                setEvidenceView("sessions");
+                openDetails("evidence");
+              }}
+              otherActive={otherActive}
+              onSelectIncident={selectOpenIncident}
+              onOpenAnalysis={selectedEvent ? () => setReportEvent(selectedEvent) : undefined}
+              onOpenSensitivity={() => openSettings("monitoring")}
+              packageDownload={packageDownload}
+              onCopy={(text) => copyText(text).then(() => showTemporaryToast("SHA-256 copied."))}
+              exporting={Boolean(selectedEvent && exportingEventId === selectedEvent.id)}
+            /> : null}
+            {activeDrawer === "evidence" ? (
+              <>
+                <div className="archive-tabs" role="tablist" aria-label="Evidence history views">
+                  <button type="button" role="tab" aria-selected={evidenceView === "sessions"} onClick={() => setEvidenceView("sessions")}><FolderArchive size={14} aria-hidden="true" />Sessions</button>
+                  <button type="button" role="tab" aria-selected={evidenceView === "dgnss"} onClick={() => setEvidenceView("dgnss")}><SatelliteDish size={14} aria-hidden="true" />DGNSS reports</button>
+                </div>
+                {evidenceView === "sessions"
+                  ? <EvidenceArchive snapshot={snapshot} getArchive={getEvidenceArchive} getSessionEvents={getEvidenceSessionEvents} getReplayBatch={getEvidenceReplayBatch} onOpenIncident={openArchivedIncident} onExportEvent={(archiveEvent) => exportEventPackage(archiveEvent, false)} onExportSession={handleSessionExport} />
+                  : <DgnssReports onOpenSettings={() => openSettings("site")} incoming={incomingSbs} />}
+              </>
+            ) : null}
           </div>
         </DialogShell>
       ) : null}
 
-      {noteOpen && selectedEvent ? <NoteModal onClose={() => setNoteOpen(false)} onSave={async (text) => { await addNote(selectedEvent.id, text); setNoteOpen(false); showTemporaryToast("Note added."); }} /> : null}
+      {reportEvent ? <IncidentReportDialog
+        event={reportEvent}
+        exporting={exportingEventId === reportEvent.id}
+        onExport={() => void exportEventPackage(reportEvent, false)}
+        onClose={() => setReportEvent(undefined)}
+        onToast={showTemporaryToast}
+      /> : null}
+      {noteEventId ? <NoteModal onClose={() => setNoteEventId(undefined)} onSave={async (text) => { const updated = await addNote(noteEventId, text); setNoteEventId(undefined); afterReview(updated); showTemporaryToast("Note added."); }} /> : null}
       {feedManagerOpen ? <FeedManagerModal feeds={snapshot.monitorFeeds} pinnedFeedIds={wallPreferences.pinnedFeedIds} onOpenMonitoring={() => { setFeedManagerOpen(false); openSettings("monitoring"); }} onChange={(pinnedFeedIds) => setWallPreferences((current) => ({ ...current, pinnedFeedIds, selectedFeedId: pinnedFeedIds.includes(current.selectedFeedId ?? "") ? current.selectedFeedId : pinnedFeedIds[0] }))} onClose={() => setFeedManagerOpen(false)} /> : null}
       {focusFeed ? <FocusConfirmation feed={focusFeed} currentFeed={activeFeed} snapshot={snapshot} onCancel={() => setFocusFeed(undefined)} onConfirm={() => void startLiveFeed()} /> : null}
-      {toast ? <div className="toast" role="status">{toast}</div> : null}
+      <Toast message={toast} />
+      {sbsDragging ? createPortal(
+        <div className="sbs-drop-overlay" aria-hidden="true"><div><SatelliteDish size={30} /><strong>Drop Gator .sbs files</strong><span>to start a DGNSS report</span></div></div>,
+        document.body,
+      ) : null}
     </div>
   );
 }

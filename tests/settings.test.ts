@@ -15,7 +15,12 @@ import {
   validateBandCatalog,
   SettingsValidationError,
   validateOperationalSettings,
+  incidentFigurePolicy,
+  DEFAULT_INCIDENT_FIGURE_RETENTION_MS,
+  classifySettingsChange,
+  changedFieldPaths,
 } from "../src/shared/settings";
+import { alertPresetValues } from "../src/shared/alertPolicy";
 import type { OperationalSettings } from "../src/shared/types";
 import { FOUR_DX_BAND, TEST_CATALOG } from "./catalogFixture";
 
@@ -49,7 +54,7 @@ describe("operational monitoring settings", () => {
 
   it("applies Continuous Watch as one selected physical GNSS target", () => {
     const settings = applyMonitoringMission(defaults(), TEST_CATALOG, "continuous-watch");
-    expect(settings.schemaVersion).toBe(5);
+    expect(settings.schemaVersion).toBe(6);
     expect(settings.scan.profile).toBe("gnss-priority");
     expect(settings.monitoring.startrack.enabled).toBe(false);
     expect(settings.monitoring["4dx"].enabled).toBe(false);
@@ -217,14 +222,14 @@ describe("operational monitoring settings", () => {
     delete legacySettings.scan.maxPriorityGapMs;
     const settings = validateOperationalSettings(legacySettings, catalog);
     expect(settings).toMatchObject({
-      schemaVersion: 5,
+      schemaVersion: 6,
       scan: { profile: "balanced", maxPriorityGapMs: 10_000, revisitObjectiveOverridesMs: {} },
       monitoring: { fugro: { enabled: false, selectedBeamIds: [] } },
     });
     expect(settings.monitoring.gnss.enabledSignalIds).not.toContain("sbas-l1");
   });
 
-  it("migrates v3 settings to v5 without changing the active mission or stored choices", () => {
+  it("migrates v3 settings to v6 without changing the active mission or stored choices", () => {
     const current = applyMonitoringMission(defaults(), TEST_CATALOG, "gnss-survey");
     current.revision = 17;
     current.retention.retentionMs = 7 * 86_400_000;
@@ -237,13 +242,35 @@ describe("operational monitoring settings", () => {
 
     const migrated = validateOperationalSettings(legacy, TEST_CATALOG);
     expect(migrated).toMatchObject({
-      schemaVersion: 5,
+      schemaVersion: 6,
       revision: 17,
       scan: { profile: "fast-gnss", dwellMs: { fugro: 1_000 }, priority: { fugro: 10 }, revisitObjectiveOverridesMs: {} },
       monitoring: { fugro: { enabled: false, selectedBeamIds: [] } },
       retention: { retentionMs: 7 * 86_400_000 },
     });
     expect(monitoringMissionForSettings(migrated, TEST_CATALOG)).toBe("gnss-survey");
+  });
+
+  it("treats settings saved before incident images existed as on for 30 days, and validates the user's choice", () => {
+    const current = defaults();
+    expect(incidentFigurePolicy(current.retention)).toEqual({ enabled: true, retentionMs: DEFAULT_INCIDENT_FIGURE_RETENTION_MS });
+    expect(DEFAULT_INCIDENT_FIGURE_RETENTION_MS).toBe(30 * 86_400_000);
+    expect(validateOperationalSettings(structuredClone(current), TEST_CATALOG).retention.incidentFigureRetentionMs).toBeUndefined();
+
+    const chosen = structuredClone(current);
+    chosen.retention.incidentFiguresEnabled = false;
+    chosen.retention.incidentFigureRetentionMs = 7 * 86_400_000;
+    expect(incidentFigurePolicy(chosen.retention)).toEqual({ enabled: false, retentionMs: 7 * 86_400_000 });
+    expect(validateOperationalSettings(chosen, TEST_CATALOG).retention).toMatchObject({ incidentFiguresEnabled: false, incidentFigureRetentionMs: 7 * 86_400_000 });
+
+    for (const bad of [0, 3_600_000, 366 * 86_400_000, 86_400_000.5]) {
+      const invalid = structuredClone(current);
+      invalid.retention.incidentFigureRetentionMs = bad;
+      expect(() => validateOperationalSettings(invalid, TEST_CATALOG)).toThrow(/Keep incident images for 1 to 365 days|Settings are invalid|invalid/i);
+    }
+    const notBoolean = structuredClone(current) as any;
+    notBoolean.retention.incidentFiguresEnabled = "yes";
+    expect(() => validateOperationalSettings(notBoolean, TEST_CATALOG)).toThrow();
   });
 
   it("catalogs the published Fugro carriers with one shared capture target", () => {
@@ -345,7 +372,7 @@ describe("operational monitoring settings", () => {
       }
     }
 
-    it("migrates a v4 profile to v5 and gains an empty override map, with every other field preserved", () => {
+    it("migrates a v4 profile to v6 and gains an empty override map, with every other field preserved", () => {
       const v5 = applyMonitoringMission(defaults(), TEST_CATALOG, "gnss-survey");
       v5.revision = 9;
       const legacy = structuredClone(v5) as any;
@@ -354,7 +381,7 @@ describe("operational monitoring settings", () => {
 
       const migrated = validateOperationalSettings(legacy, TEST_CATALOG);
       expect(migrated).toMatchObject({
-        schemaVersion: 5,
+        schemaVersion: 6,
         revision: 9,
         siteName: v5.siteName,
         scan: { profile: v5.scan.profile, priorityWindowId: v5.scan.priorityWindowId, revisitObjectiveOverridesMs: {} },
@@ -426,3 +453,83 @@ describe("operational monitoring settings", () => {
     });
   });
 });
+
+describe("alert sensitivity and report identity settings (schema v6)", () => {
+  it("migrates a v5 profile with default learning rules to Standard alert sensitivity without touching the learning rules", () => {
+    const current = defaults();
+    const legacy = structuredClone(current) as any;
+    legacy.schemaVersion = 5;
+    delete legacy.alerting;
+    delete legacy.reportIdentity;
+    const migrated = validateOperationalSettings(legacy, TEST_CATALOG);
+    expect(migrated.schemaVersion).toBe(6);
+    expect(migrated.detection).toEqual(current.detection);
+    expect(migrated.alerting.default).toEqual({ preset: "standard", values: alertPresetValues("standard") });
+    expect(migrated.alerting.targetOverrides).toEqual({});
+    expect(migrated.reportIdentity).toEqual({});
+  });
+
+  it("keeps an operator's customised v5 alert behaviour as Custom sensitivity", () => {
+    const legacy = structuredClone(defaults()) as any;
+    legacy.schemaVersion = 5;
+    delete legacy.alerting;
+    legacy.detection.interferenceHits = 2;
+    legacy.detection.interferenceWindow = 4;
+    legacy.detection.narrowbandPeakSigma = 14;
+    const migrated = validateOperationalSettings(legacy, TEST_CATALOG);
+    expect(migrated.alerting.default.preset).toBe("custom");
+    expect(migrated.alerting.default.values).toMatchObject({ alertVisits: 2, alertWindow: 4, narrowbandPeakSigma: 14 });
+    expect(migrated.detection.interferenceHits).toBe(2);
+  });
+
+  it("normalises a named preset to the server's exact values and validates custom values with field names", () => {
+    const settings = defaults();
+    settings.alerting.default = { preset: "sensitive", values: { ...alertPresetValues("standard") } };
+    expect(validateOperationalSettings(settings, TEST_CATALOG).alerting.default.values).toEqual(alertPresetValues("sensitive"));
+
+    const custom = defaults();
+    custom.alerting.default = { preset: "custom", values: { ...alertPresetValues("standard"), alertVisits: 6, alertWindow: 5 } };
+    expect(() => validateOperationalSettings(custom, TEST_CATALOG)).toThrow(SettingsValidationError);
+    try {
+      validateOperationalSettings(custom, TEST_CATALOG);
+    } catch (error) {
+      expect((error as SettingsValidationError).fields["alerting.default.values.alertVisits"]).toMatch(/cannot exceed/);
+    }
+
+    const unknownWindow = defaults();
+    unknownWindow.alerting.targetOverrides = { "not-a-window": { preset: "sensitive", values: alertPresetValues("sensitive") } };
+    expect(() => validateOperationalSettings(unknownWindow, TEST_CATALOG)).toThrow(/Unknown frequency window/);
+
+    const knownWindow = defaults();
+    const targetId = TEST_CATALOG.captureTargets[0].id;
+    knownWindow.alerting.targetOverrides = { [targetId]: { preset: "conservative", values: alertPresetValues("standard") } };
+    expect(validateOperationalSettings(knownWindow, TEST_CATALOG).alerting.targetOverrides[targetId].values).toEqual(alertPresetValues("conservative"));
+  });
+
+  it("validates and trims report identity, rejecting multi-line text and malformed logos", () => {
+    const settings = defaults();
+    settings.reportIdentity = { companyName: "  Sanco Marine  ", clientName: "", vesselName: "MV Example", projectReference: "JOB-42" };
+    expect(validateOperationalSettings(settings, TEST_CATALOG).reportIdentity).toEqual({ companyName: "Sanco Marine", vesselName: "MV Example", projectReference: "JOB-42" });
+    const multiLine = defaults();
+    multiLine.reportIdentity = { companyName: "One\nTwo" };
+    expect(() => validateOperationalSettings(multiLine, TEST_CATALOG)).toThrow(/one line/);
+    const badLogo = defaults();
+    badLogo.reportIdentity = { logo: { sha256: "not-a-hash", mediaType: "image/png", widthPx: 10, heightPx: 10, bytes: 10 } };
+    expect(() => validateOperationalSettings(badLogo, TEST_CATALOG)).toThrow(/logo/);
+  });
+
+  it("classifies changes: learning rules restart learning, monitoring retunes, the rest applies live", () => {
+    const base = defaults();
+    const sensitivity = structuredClone(base);
+    sensitivity.alerting.default = { preset: "sensitive", values: alertPresetValues("sensitive") };
+    sensitivity.revision += 1;
+    expect(classifySettingsChange(changedFieldPaths(base, sensitivity))).toBe("live");
+    expect(classifySettingsChange(["siteName", "retention.retentionMs", "reportIdentity.companyName", "displayTimeZone", "deploymentId", "liveFocusTimeoutMs"])).toBe("live");
+    expect(classifySettingsChange(["revision", "updatedAt"])).toBe("none");
+    expect(classifySettingsChange(["scan.dwellMs.gnss", "siteName"])).toBe("rf-restart");
+    expect(classifySettingsChange(["monitoring.gnss.enabled"])).toBe("rf-restart");
+    expect(classifySettingsChange(["detection.driftSigma", "monitoring.gnss.enabled"])).toBe("learning-restart");
+    expect(classifySettingsChange(["somethingNew"])).toBe("rf-restart");
+  });
+});
+

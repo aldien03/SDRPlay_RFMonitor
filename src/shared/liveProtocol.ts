@@ -18,6 +18,20 @@ export interface SpectrumEnvelope extends SpectrumEnvelopeMetadata {
   bins: Uint8Array;
 }
 
+/**
+ * Bounded copy of an incident for live messages. The full record, including
+ * the complete timeline, is served by GET /api/events/:id.
+ */
+export function compactLiveEvent(event: DetectionEvent, includeTrigger = true): DetectionEvent {
+  return {
+    ...event,
+    notes: event.notes.slice(-8).map((note) => ({ ...note, text: note.text.slice(0, 512) })),
+    ...(event.timeline ? { timeline: event.timeline.slice(-4) } : {}),
+    ...(event.disturbedRangesHz ? { disturbedRangesHz: event.disturbedRangesHz.slice(0, 16) } : {}),
+    trigger: includeTrigger ? event.trigger : undefined,
+  };
+}
+
 export function encodeSpectrumEnvelope(
   frame: SpectrumFrame,
   metrics: SignalMetricSample,
@@ -26,10 +40,7 @@ export function encodeSpectrumEnvelope(
   feedId?: string,
 ): Uint8Array {
   const { bins, ...frameMetadata } = frame;
-  const compactEvent = event ? {
-    ...event,
-    notes: event.notes.slice(-8).map((note) => ({ ...note, text: note.text.slice(0, 512) })),
-  } : undefined;
+  const compactEvent = event ? compactLiveEvent(event) : undefined;
   const metadata = new TextEncoder().encode(JSON.stringify({
     frame: frameMetadata,
     metrics,

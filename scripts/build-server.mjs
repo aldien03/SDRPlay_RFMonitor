@@ -20,6 +20,7 @@ await build({
     "held-out-replay-qualification": "src/server/heldOutReplayQualificationCli.ts",
     "conducted-rf-qualification": "src/server/conductedRfQualificationCli.ts",
     traceability: "src/server/traceabilityCli.ts",
+    "dgnss-report-worker": "src/server/positioning/worker.ts",
   },
   outdir: outputDirectory,
   bundle: true,

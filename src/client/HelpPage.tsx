@@ -1,4 +1,4 @@
-import { AlertTriangle, ArrowLeft, ClockAlert, Database, HeartPulse, Radio, RotateCcw, TestTube2 } from "lucide-react";
+import { AlertTriangle, ArrowLeft, ClockAlert, Database, HeartPulse, Radio, RotateCcw, SatelliteDish, SlidersHorizontal, TestTube2 } from "lucide-react";
 import { presentOperatorSummary } from "../shared/operatorSummary";
 import type { MonitorSnapshot } from "../shared/types";
 import { SurfaceAlertBanner } from "./SurfaceAlertBanner";
@@ -10,9 +10,10 @@ interface HelpPageProps {
   onOpenRecording: () => void;
   onOpenEvidence: () => void;
   onOpenEngineer: () => void;
+  onOpenDgnss?: () => void;
 }
 
-export function HelpPage({ snapshot, onClose, onOpenHealth, onOpenRecording, onOpenEvidence, onOpenEngineer }: HelpPageProps) {
+export function HelpPage({ snapshot, onClose, onOpenHealth, onOpenRecording, onOpenEvidence, onOpenEngineer, onOpenDgnss }: HelpPageProps) {
   const operator = presentOperatorSummary(snapshot.operatorSummary);
   const release = snapshot.identity.release;
   return (
@@ -35,9 +36,11 @@ export function HelpPage({ snapshot, onClose, onOpenHealth, onOpenRecording, onO
 
         <nav className="help-shortcuts" aria-label="Help topics">
           <a href="#alert"><AlertTriangle size={18} aria-hidden="true" /> Respond to an alert</a>
+          <a href="#why"><SlidersHorizontal size={18} aria-hidden="true" /> Why an alert is raised</a>
           <a href="#data"><HeartPulse size={18} aria-hidden="true" /> Restore RF data</a>
           <a href="#coverage"><ClockAlert size={18} aria-hidden="true" /> Coverage late</a>
           <a href="#recording"><Database size={18} aria-hidden="true" /> Check recording</a>
+          <a href="#dgnss"><SatelliteDish size={18} aria-hidden="true" /> Make a DGNSS report</a>
           <a href="#learning"><RotateCcw size={18} aria-hidden="true" /> Signal learning</a>
           <a href="#test"><TestTube2 size={18} aria-hidden="true" /> Run a test</a>
         </nav>
@@ -48,10 +51,27 @@ export function HelpPage({ snapshot, onClose, onOpenHealth, onOpenRecording, onO
             <li>Check the affected signal and observation.</li>
             <li>Compare position, speed, heading and time with other bridge sources.</li>
             <li>Follow the vessel’s navigation procedure.</li>
-            <li>Open the incident and download its evidence.</li>
+            <li>Open the incident. Read Why this alert and the picture of what the detector saw.</li>
+            <li>Add a note with what you checked, then download the evidence package. The actions stay at the bottom of the incident.</li>
+            <li>After an alert ends, select Incidents. Open each incident marked To review, add what you checked and select Mark reviewed. This works for incidents from earlier runs too.</li>
           </ol>
-          <p>An alert means repeated unusual RF energy. It does not confirm intent.</p>
+          <p>An alert means repeated unusual RF energy. It does not confirm intent. Select the picture at the alert to enlarge it, or Replay to play the recording from just before the alert.</p>
           <button type="button" onClick={onOpenEvidence}>Open evidence history</button>
+        </section>
+
+        <section id="why" className="help-task">
+          <div><SlidersHorizontal size={20} aria-hidden="true" /><h2>Why an alert is raised</h2></div>
+          <p>Each frequency has a learned usual level and a normal amount of variation. A check is raised when energy goes above the alert level for one of these patterns:</p>
+          <ul>
+            <li><strong>Band-wide rise:</strong> a large share of the window is raised.</li>
+            <li><strong>Wider signal:</strong> one raised block wider than a narrow signal.</li>
+            <li><strong>Narrow signal:</strong> a strong, narrow peak.</li>
+            <li><strong>Noise-floor rise:</strong> the whole window sits higher for a while.</li>
+            <li><strong>Short bursts:</strong> energy seen in single frames (Sensitive settings only).</li>
+          </ul>
+          <p>An alert needs raised checks to repeat, for example 3 of the last 5. It clears after a run of clean checks.</p>
+          <p><strong>On the graph:</strong> blue is received energy, dashed green is the usual level, dashed amber is the alert level, and red marks energy above the alert level.</p>
+          <p>Change how easily alerts are raised in Settings, Monitoring, Alert sensitivity. This does not restart signal learning and open incidents stay open.</p>
         </section>
 
         <section id="data" className="help-task">
@@ -84,8 +104,22 @@ export function HelpPage({ snapshot, onClose, onOpenHealth, onOpenRecording, onO
             <li>Check free space and the writer state.</li>
             <li>Resolve any Critical finding before relying on new evidence.</li>
             <li>In Evidence history, choose an eligible session and select Play session. Saved .bin data is opened automatically.</li>
+            <li>In Evidence history, select Image or Analysis on an incident to open its latest time-stamped overview or analysis charts.</li>
           </ol>
+          <p>Incident images are saved automatically and deleted after the number of days set in Settings, Recording.</p>
           <button type="button" onClick={onOpenRecording}>Open Recording</button>
+        </section>
+
+        <section id="dgnss" className="help-task">
+          <div><SatelliteDish size={20} aria-hidden="true" /><h2>Make a DGNSS report</h2></div>
+          <ol>
+            <li>In Gator, export the DGPS QC pages as SBS. If Gator split the export into several files, keep them all.</li>
+            <li>Select DGNSS in the top bar and drop all the .sbs files on the upload area, or drop them anywhere on the dashboard. You can add more files afterwards.</li>
+            <li>Check the file list, the warnings about gaps or overlaps, and the RF recorded for the time span. Keep SBS span, or choose UTC day (and the day) or Custom, up to 24 h.</li>
+            <li>Select Generate report. When it is ready, select Download PDF, Open HTML or Evidence package.</li>
+          </ol>
+          <p>The report checks each DGNSS against the control system and the threshold, and relates satellite loss and position error to RF interference recorded by rf-monitor. Systems, control and threshold are set once in Settings, Site. Previous reports stay under DGNSS reports, and also in Evidence history.</p>
+          <button type="button" onClick={onOpenDgnss ?? onOpenEvidence}>Open DGNSS reports</button>
         </section>
 
         <section id="learning" className="help-task">
@@ -99,10 +133,10 @@ export function HelpPage({ snapshot, onClose, onOpenHealth, onOpenRecording, onO
           <p>Restart learning after an approved RF setup change or a confirmed contaminated learning period.</p>
           <ol>
             <li>Open Settings, then Signal learning.</li>
-            <li>Select Unlock to edit and enter the settings password.</li>
+            <li>Select Unlock to change and enter the settings password.</li>
             <li>Select Restart learning on one frequency, or Restart signal learning for every active frequency.</li>
           </ol>
-          <p>Restarting starts a new learning period. Recordings, incidents and saved learning records are kept.</p>
+          <p>Restarting starts a new learning period. Recordings, incidents and saved learning records are kept. If an alert is active on a frequency, the dialog says so and restarting ends that alert; its incident stays in Evidence History. Until learning is approved, alerts are Low evidence.</p>
         </section>
 
         <section id="test" className="help-task">

@@ -62,7 +62,7 @@ const WITNESS: V6WitnessContext = { publicKeyPem: PUBLIC_KEY, expectedKeySha256:
 const V5_VERIFIER_KEYS = generateKeyPairSync("ed25519");
 const V5_VERIFIER_PUBLIC_KEY = V5_VERIFIER_KEYS.publicKey.export({ type: "spki", format: "pem" }).toString();
 const V5_VERIFIER_KEY_SHA256 = v6WitnessKeyFingerprint(V5_VERIFIER_PUBLIC_KEY);
-const operational = validateOperationalSettings(operationalJson as OperationalSettings, TEST_CATALOG);
+const operational = validateOperationalSettings(operationalJson as unknown as OperationalSettings, TEST_CATALOG);
 const CANDIDATE: V6CandidateContext = {
   release: RELEASE,
   catalog: TEST_CATALOG,

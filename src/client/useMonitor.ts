@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { CLIENT_DATA_LATE_AFTER_MS, decodeSpectrumEnvelope } from "../shared/liveProtocol";
+import { detectorAnomalyRanges } from "./detectorPresentation";
+import { buildWaterfallPalette, composeWaterfall, rasterizeRow } from "../shared/waterfallRaster";
 import { liveSubscriptionSignature, MAX_VISIBLE_TARGETS, normalizeLiveSubscription, sameStringSet } from "../shared/liveSubscription";
+import { incidentPackageBaseName } from "../shared/incidentNaming";
 import {
   MAX_OPERATOR_AFFECTED_TARGETS,
   OPERATOR_ACTION_CODES,
@@ -10,7 +13,13 @@ import {
   type OperatorActionCode,
   type OperatorSummaryV1,
 } from "../shared/operatorSummary";
-import type { BaselineDescriptor, ChannelMonitorState, DataDomain, EvidenceArchiveEventPage, EvidenceArchivePage, EvidenceReplayBatch, FocusSession, LiveSubscription, MonitorSnapshot, MonitorStateDelta, OperationalSettings, RecordingDeletionResult, RecoveryOperationHealth, ServiceMessage, SettingsRevision, SignalMetricSample, SpectrumFrame, SyntheticExerciseState } from "../shared/types";
+import type { AlertPreview, BaselineDescriptor, DetectionEvent, ReportLogo, ChannelMonitorState, DataDomain, EvidenceArchiveEventPage, EvidenceArchivePage, EvidenceReplayBatch, FocusSession, RecentIncidentsPage, LiveSubscription, MonitorSnapshot, MonitorStateDelta, OperationalSettings, RecordingDeletionResult, RecoveryOperationHealth, ServiceMessage, SettingsRevision, SignalMetricSample, SpectrumFrame, SyntheticExerciseState } from "../shared/types";
+
+/** Replay one capture window only (an incident's). */
+export interface ReplayFocus {
+  targetId?: string;
+  bandId?: string;
+}
 
 const loadingGeneratedAt = new Date().toISOString();
 const emptySnapshot: MonitorSnapshot = {
@@ -613,18 +622,10 @@ export function appendWaterfallFrame(history: SpectrumFrame[], frame: SpectrumFr
 }
 
 export class ApiError extends Error {
-  constructor(message: string, readonly status: number, readonly fields?: Record<string, string>) {
+  constructor(message: string, readonly status: number, readonly fields?: Record<string, string>, readonly code?: string) {
     super(message);
     this.name = "ApiError";
   }
-}
-
-function evidenceColor(value: number): string {
-  const level = Math.max(0, Math.min(1, (value - 18) / 125));
-  if (level < 0.28) return `rgb(0, ${Math.round(25 + level * 175)}, ${Math.round(92 + level * 360)})`;
-  if (level < 0.52) return `rgb(0, ${Math.round(120 + level * 230)}, ${Math.round(190 - level * 240)})`;
-  if (level < 0.76) return `rgb(${Math.round(110 + level * 185)}, ${Math.round(225 - level * 35)}, 0)`;
-  return `rgb(${Math.round(230 + level * 25)}, ${Math.round(210 - level * 190)}, 0)`;
 }
 
 function fitCanvasText(context: CanvasRenderingContext2D, value: string, maxWidth: number): string {
@@ -684,22 +685,37 @@ function drawEvidencePlot(context: CanvasRenderingContext2D, snapshot: MonitorSn
 }
 
 function drawEvidenceWaterfall(context: CanvasRenderingContext2D, snapshot: MonitorSnapshot, top: number, width: number, height: number): void {
+  const palette = buildWaterfallPalette();
   context.fillStyle = "#06285d";
   context.fillRect(0, top, width, height);
-  const frames = [...snapshot.waterfall].reverse();
+  const frames = snapshot.waterfall;
   if (!frames.length) return;
-  const rowHeight = Math.max(1, height / Math.max(24, frames.length));
-  frames.forEach((frame, row) => {
-    const visibleBins = Math.min(width, frame.bins.length);
-    for (let column = 0; column < visibleBins; column += 1) {
-      const sourceIndex = Math.min(frame.bins.length - 1, Math.floor((column / visibleBins) * frame.bins.length));
-      context.fillStyle = evidenceColor(frame.bins[sourceIndex]);
-      context.fillRect((column / visibleBins) * width, top + row * rowHeight, width / visibleBins + 1, rowHeight + 0.5);
-    }
-  });
+  // Same rasteriser and palette as the live waterfall, so the saved image is what the operator saw.
+  const rowCapacity = Math.max(24, frames.length);
+  const rows: Uint32Array[] = [];
+  for (let index = frames.length - 1; index >= 0; index -= 1) {
+    const frame = frames[index];
+    rows.push(rasterizeRow({
+      bins: frame.bins,
+      startBin: 0,
+      endBin: frame.bins.length,
+      widthPx: width,
+      anomalyRanges: detectorAnomalyRanges(frame),
+      palette,
+      hatch: true,
+    }));
+  }
+  const pixels = new Uint32Array(width * rowCapacity);
+  composeWaterfall(rows, width, rowCapacity, palette, pixels);
+  const surface = document.createElement("canvas");
+  surface.width = width;
+  surface.height = rowCapacity;
+  surface.getContext("2d")?.putImageData(new ImageData(new Uint8ClampedArray(pixels.buffer), width, rowCapacity), 0, 0);
+  context.imageSmoothingEnabled = false;
+  context.drawImage(surface, 0, 0, width, rowCapacity, 0, top, width, height);
 }
 
-async function createEvidenceScreenshot(snapshot: MonitorSnapshot, eventId: string): Promise<Blob | null> {
+export async function createEvidenceScreenshot(snapshot: MonitorSnapshot, eventId: string): Promise<Blob | null> {
   const width = 1_200;
   const headerHeight = 126;
   const spectrumHeight = 360;
@@ -727,7 +743,8 @@ async function createEvidenceScreenshot(snapshot: MonitorSnapshot, eventId: stri
   drawEvidenceWaterfall(context, snapshot, headerHeight + spectrumHeight + gap, width, waterfallHeight);
   context.fillStyle = "#142536";
   context.font = "16px Arial, sans-serif";
-  context.fillText("Spectrum above. Signal history below, newest first. Full RF data is included with the incident.", 24, canvas.height - 20);
+  context.fillText("Spectrum above. Signal history below, newest first. Full RF data is included with the incident.", 24, canvas.height - 34);
+  context.fillText("History colour: dark blue is quiet, red is strong (relative, uncalibrated). Striped red marks detector-flagged bins.", 24, canvas.height - 12);
   return new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, "image/png"));
 }
 
@@ -741,8 +758,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     },
   });
   if (!response.ok) {
-    const payload = await response.json().catch(() => ({})) as { error?: string; fields?: Record<string, string> };
-    throw new ApiError(payload.error ?? response.statusText, response.status, payload.fields);
+    const payload = await response.json().catch(() => ({})) as { error?: string; fields?: Record<string, string>; code?: string };
+    throw new ApiError(payload.error ?? response.statusText, response.status, payload.fields, payload.code);
   }
   return response.json() as Promise<T>;
 }
@@ -761,12 +778,18 @@ interface ExportJobResponse {
   id: string;
   state: "queued" | "running" | "ready" | "failed";
   error?: string;
+  sha256?: string;
   statusUrl: string;
   downloadUrl: string;
   parts?: Array<{ number: number; sizeBytes: number; sha256: string; downloadUrl: string }>;
 }
 
-async function queueExportDownload(body: object, fallbackFilename: string): Promise<void> {
+export interface ExportDownloadResult {
+  /** SHA-256 of each downloaded file, as computed by the server while building it. */
+  files: Array<{ filename: string; sha256?: string }>;
+}
+
+async function queueExportDownload(body: object, fallbackFilename: string): Promise<ExportDownloadResult> {
   let job = await request<ExportJobResponse>("/api/exports", { method: "POST", body: JSON.stringify(body) });
   const deadline = Date.now() + 10 * 60_000;
   while (job.state === "queued" || job.state === "running") {
@@ -775,13 +798,16 @@ async function queueExportDownload(body: object, fallbackFilename: string): Prom
     job = await request<ExportJobResponse>(job.statusUrl);
   }
   if (job.state !== "ready") throw new Error(job.error ?? "Evidence export failed");
-  const parts = job.parts?.length ? job.parts : [{ number: 1, downloadUrl: job.downloadUrl }];
+  const parts: Array<{ number: number; downloadUrl: string; sha256?: string }> = job.parts?.length ? job.parts : [{ number: 1, downloadUrl: job.downloadUrl, sha256: job.sha256 }];
+  const files: ExportDownloadResult["files"] = [];
   for (const part of parts) {
     const filename = parts.length === 1
       ? fallbackFilename
       : fallbackFilename.replace(/\.zip$/i, `-part-${String(part.number).padStart(3, "0")}.zip`);
     await downloadArchive(part.downloadUrl, filename, "Evidence export failed");
+    files.push({ filename, sha256: part.sha256 });
   }
+  return { files };
 }
 
 /**
@@ -1154,35 +1180,61 @@ export function useMonitor() {
     setSnapshot(next);
   }, []);
 
-  const acknowledge = useCallback(async (eventId: string) => {
-    await request(`/api/events/${eventId}/acknowledge`, { method: "POST", body: "{}" });
-  }, []);
+  /** Both return the updated record, so a stored incident shown in the drawer can refresh. */
+  const acknowledge = useCallback((eventId: string) => (
+    request<DetectionEvent>(`/api/events/${encodeURIComponent(eventId)}/acknowledge`, { method: "POST", body: "{}" })
+  ), []);
 
-  const addNote = useCallback(async (eventId: string, text: string) => {
-    await request(`/api/events/${eventId}/notes`, { method: "POST", body: JSON.stringify({ text }) });
-  }, []);
+  const addNote = useCallback((eventId: string, text: string) => (
+    request<DetectionEvent>(`/api/events/${encodeURIComponent(eventId)}/notes`, { method: "POST", body: JSON.stringify({ text }) })
+  ), []);
 
-  const exportIncident = useCallback(async (eventId: string, sessionId?: string) => {
-    await queueExportDownload({ kind: "incident", eventId, sessionId }, `rf-incident-${eventId}.zip`);
+  const exportIncident = useCallback(async (eventId: string, sessionId?: string, event?: Pick<DetectionEvent, "id" | "startedAt" | "targetId" | "bandId">) => (
+    queueExportDownload({ kind: "incident", eventId, sessionId }, `${event ? incidentPackageBaseName(event) : `rf-incident-${eventId}`}.zip`)
+  ), []);
+
+  const getEvent = useCallback((eventId: string, sessionId?: string) => (
+    request<DetectionEvent>(`/api/events/${encodeURIComponent(eventId)}${sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : ""}`)
+  ), []);
+
+  const getAlertPreview = useCallback(() => request<AlertPreview>("/api/alert-preview"), []);
+
+  const uploadReportLogo = useCallback(async (file: File): Promise<ReportLogo> => {
+    const response = await fetch("/api/settings/report-logo", {
+      method: "PUT",
+      credentials: "same-origin",
+      headers: { "content-type": file.type || "application/octet-stream", "x-rf-monitor-csrf": "settings-v1" },
+      body: file,
+    });
+    const payload = await response.json().catch(() => ({})) as { error?: string } & Partial<ReportLogo>;
+    if (!response.ok) throw new ApiError(payload.error ?? response.statusText, response.status);
+    return payload as ReportLogo;
   }, []);
 
   const getEvidenceArchive = useCallback((offset = 0, limit = 20) => (
     request<EvidenceArchivePage>(`/api/evidence/archive?offset=${offset}&limit=${limit}`)
   ), []);
 
+  const getRecentIncidents = useCallback((limit = 6) => (
+    request<RecentIncidentsPage>(`/api/incidents/recent?limit=${limit}`)
+  ), []);
+
   const getEvidenceSessionEvents = useCallback((sessionId: string, offset = 0, limit = 20) => (
     request<EvidenceArchiveEventPage>(`/api/evidence/sessions/${encodeURIComponent(sessionId)}/events?offset=${offset}&limit=${limit}`)
   ), []);
 
-  const getEvidenceReplayBatch = useCallback((sessionId: string, cursor?: string, limit = 12) => {
+  const getEvidenceReplayBatch = useCallback((sessionId: string, cursor?: string, limit = 12, from?: string, focus?: ReplayFocus) => {
     const parameters = new URLSearchParams({ limit: String(limit) });
     if (cursor) parameters.set("cursor", cursor);
+    else if (from) parameters.set("from", from);
+    if (focus?.targetId) parameters.set("target", focus.targetId);
+    if (focus?.bandId) parameters.set("band", focus.bandId);
     return request<EvidenceReplayBatch>(`/api/evidence/sessions/${encodeURIComponent(sessionId)}/replay?${parameters}`);
   }, []);
 
-  const exportSession = useCallback(async (sessionId: string) => {
-    await queueExportDownload({ kind: "session", sessionId }, `${sessionId}.zip`);
-  }, []);
+  const exportSession = useCallback(async (sessionId: string) => (
+    queueExportDownload({ kind: "session", sessionId }, `${sessionId}.zip`)
+  ), []);
 
   const captureScreenshot = useCallback(async (eventId: string) => {
     const blob = await createEvidenceScreenshot(snapshot, eventId);
@@ -1206,13 +1258,13 @@ export function useMonitor() {
 
   const lockSettings = useCallback(() => request<{ unlocked: false }>("/api/admin/lock", { method: "POST", body: "{}" }), []);
 
-  const applySettings = useCallback((settings: OperationalSettings, expectedRevision: number) => request<SettingsRevision>("/api/settings", {
+  const applySettings = useCallback((settings: OperationalSettings, expectedRevision: number, options?: { confirmSignalLearningRestart?: boolean }) => request<SettingsRevision>("/api/settings", {
     method: "PUT",
     headers: { "x-rf-monitor-csrf": "settings-v1" },
-    body: JSON.stringify({ settings, expectedRevision }),
+    body: JSON.stringify({ settings, expectedRevision, ...(options?.confirmSignalLearningRestart ? { confirmSignalLearningRestart: true } : {}) }),
   }), []);
 
-  const baselineRequest = useCallback(<T,>(action: "approve" | "restart", baseline: BaselineDescriptor, expectedConfigurationRevision: number) => (
+  const baselineRequest = useCallback(<T,>(action: "approve" | "restart", baseline: BaselineDescriptor, expectedConfigurationRevision: number, options?: { endActiveObservation?: boolean }) => (
     request<T>(`/api/baselines/${encodeURIComponent(baseline.targetId)}/${action}`, {
       method: "POST",
       headers: { "x-rf-monitor-csrf": "settings-v1" },
@@ -1220,6 +1272,7 @@ export function useMonitor() {
         expectedConfigurationRevision,
         expectedFingerprintId: baseline.fingerprintId,
         expectedGeneration: Number(baseline.learningGenerationId),
+        ...(action === "restart" && options?.endActiveObservation ? { endActiveObservation: true } : {}),
       }),
     })
   ), []);
@@ -1285,16 +1338,20 @@ export function useMonitor() {
     addNote,
     captureScreenshot,
     exportIncident,
+    getEvent,
+    getAlertPreview,
+    uploadReportLogo,
     getEvidenceArchive,
     getEvidenceSessionEvents,
     getEvidenceReplayBatch,
+    getRecentIncidents,
     exportSession,
     getSettings,
     unlockSettings,
     lockSettings,
     applySettings,
     approveBaseline: (baseline: BaselineDescriptor, revision: number) => baselineRequest<BaselineApprovalResponse>("approve", baseline, revision),
-    restartBaseline: (baseline: BaselineDescriptor, revision: number) => baselineRequest<BaselineRestartResponse>("restart", baseline, revision),
+    restartBaseline: (baseline: BaselineDescriptor, revision: number, options?: { endActiveObservation?: boolean }) => baselineRequest<BaselineRestartResponse>("restart", baseline, revision, options),
     clearTestData,
     deleteRecordings,
     restartSoftware,

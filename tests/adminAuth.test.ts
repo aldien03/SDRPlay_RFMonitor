@@ -81,4 +81,23 @@ describe("settings authentication", () => {
     );
     expect(failures.size).toBe(1_024);
   });
+
+  it("treats a malformed cookie escape as no session instead of throwing", async () => {
+    const auth = await authFor();
+    expect(auth.session("rf_monitor_admin=%E0%A4%A; other=1", "127.0.0.1")).toEqual({ unlocked: false });
+    expect(auth.session("%zz=%", "127.0.0.1")).toEqual({ unlocked: false });
+  });
+
+  it("prunes expired sessions on the next unlock", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "rf-monitor-auth-"));
+    temporaryRoots.push(root);
+    const credentialPath = path.join(root, "admin.json");
+    await writeFile(credentialPath, JSON.stringify(await createAdminCredential("correct horse battery staple")));
+    const auth = await AdminAuth.load(credentialPath, 5);
+    await auth.unlock("correct horse battery staple", "127.0.0.1");
+    await auth.unlock("correct horse battery staple", "127.0.0.2");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await auth.unlock("correct horse battery staple", "127.0.0.3");
+    expect((auth as unknown as { sessions: Map<string, unknown> }).sessions.size).toBe(1);
+  });
 });

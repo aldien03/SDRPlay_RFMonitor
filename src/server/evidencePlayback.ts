@@ -463,7 +463,18 @@ function replayFrame(indexed: IndexedFrame, bins: Buffer, expectedDomain: DataDo
   return { frame, ...(metrics ? { metrics } : {}) };
 }
 
-async function readIndexRecords(handle: FileHandle, startOffset: number, limit: number): Promise<{
+/** Replay of one capture window (an incident's), not every window the receiver visited. */
+export interface ReplayFrameFilter {
+  targetId?: string;
+  bandId?: string;
+}
+
+function matchesFilter(frame: Record<string, unknown>, filter: ReplayFrameFilter): boolean {
+  if (filter.targetId && typeof frame.targetId === "string") return frame.targetId === filter.targetId;
+  return !filter.bandId || frame.bandId === filter.bandId;
+}
+
+async function readIndexRecords(handle: FileHandle, startOffset: number, limit: number, filter?: ReplayFrameFilter): Promise<{
   records: IndexedFrame[];
   nextOffset: number;
   done: boolean;
@@ -510,7 +521,7 @@ async function readIndexRecords(handle: FileHandle, startOffset: number, limit: 
       pending.length = 0;
       pendingBytes = 0;
       nextOffset = position + newline + 1;
-      if (nextOffset - startOffset > MAX_BATCH_SCAN_BYTES) throw sourceInvalid("Evidence replay batch exceeded its scan bound");
+      if (!filter && nextOffset - startOffset > MAX_BATCH_SCAN_BYTES) throw sourceInvalid("Evidence replay batch exceeded its scan bound");
       if (!line.toString("utf8").trim()) throw sourceInvalid("Evidence replay index contains an empty record");
       let parsed: unknown;
       try {
@@ -518,9 +529,12 @@ async function readIndexRecords(handle: FileHandle, startOffset: number, limit: 
       } catch {
         throw sourceInvalid("Evidence replay index contains malformed JSON");
       }
-      records.push(decodeIndexedFrame(parsed));
+      const decoded = decodeIndexedFrame(parsed);
+      if (!filter || matchesFilter(decoded.frame, filter)) records.push(decoded);
       chunkOffset = newline + 1;
-      if (records.length >= limit) {
+      // A filtered batch may skip many other windows' frames: it stops at the
+      // scan bound and returns what it found, with a cursor to continue.
+      if (records.length >= limit || (filter && nextOffset - startOffset > MAX_BATCH_SCAN_BYTES)) {
         stopped = true;
         break;
       }
@@ -531,6 +545,67 @@ async function readIndexRecords(handle: FileHandle, startOffset: number, limit: 
     throw sourceInvalid("Evidence replay index ends with an unterminated record");
   }
   return { records, nextOffset, done: nextOffset >= details.size };
+}
+
+/** The line that starts at or after `offset`, with its frame time, or undefined past the end. */
+async function indexLineAt(handle: FileHandle, offset: number, size: number): Promise<{ start: number; end: number; ms: number } | undefined> {
+  let start = offset;
+  if (offset > 0) {
+    const probe = Buffer.allocUnsafe(Math.min(READ_BLOCK_BYTES, size - offset + 1));
+    const read = await handle.read(probe, 0, probe.byteLength, offset - 1);
+    const newline = probe.subarray(0, read.bytesRead).indexOf(0x0a);
+    if (newline < 0) return undefined;
+    start = offset - 1 + newline + 1;
+  }
+  if (start >= size) return undefined;
+  const block = Buffer.allocUnsafe(Math.min(READ_BLOCK_BYTES, size - start));
+  const read = await handle.read(block, 0, block.byteLength, start);
+  const newline = block.subarray(0, read.bytesRead).indexOf(0x0a);
+  if (newline < 0) return undefined;
+  try {
+    const parsed = JSON.parse(block.subarray(0, newline).toString("utf8")) as { frame?: { timestamp?: unknown } };
+    const ms = typeof parsed.frame?.timestamp === "string" ? Date.parse(parsed.frame.timestamp) : Number.NaN;
+    return Number.isFinite(ms) ? { start, end: start + newline + 1, ms } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Record boundary of the first frame at or after `fromMs`, by binary search.
+ * The index is only roughly time-ordered, so callers ask for a little lead-in.
+ */
+async function seekIndexOffset(handle: FileHandle, fromMs: number): Promise<number> {
+  const { size } = await handle.stat();
+  let low = 0;
+  let high = size;
+  for (let step = 0; step < 64 && high - low > READ_BLOCK_BYTES; step += 1) {
+    const middle = Math.floor((low + high) / 2);
+    const line = await indexLineAt(handle, middle, size);
+    if (!line) {
+      high = middle;
+      continue;
+    }
+    if (line.ms < fromMs) low = line.end;
+    else high = line.start;
+  }
+  // Finish within the last block: the first record at or after the time.
+  const block = Buffer.allocUnsafe(Math.min(READ_BLOCK_BYTES * 2, size - low));
+  const read = await handle.read(block, 0, block.byteLength, low);
+  let offset = 0;
+  while (offset < read.bytesRead) {
+    const newline = block.subarray(0, read.bytesRead).indexOf(0x0a, offset);
+    if (newline < 0) break;
+    try {
+      const parsed = JSON.parse(block.subarray(offset, newline).toString("utf8")) as { frame?: { timestamp?: unknown } };
+      const ms = typeof parsed.frame?.timestamp === "string" ? Date.parse(parsed.frame.timestamp) : Number.NaN;
+      if (Number.isFinite(ms) && ms >= fromMs) return low + offset;
+    } catch {
+      return low + offset; // The batch reader reports a damaged record itself.
+    }
+    offset = newline + 1;
+  }
+  return low + offset;
 }
 
 export class EvidencePlaybackReader {
@@ -721,7 +796,11 @@ export class EvidencePlaybackReader {
     };
   }
 
-  async readBatch(sessionId: string, cursor?: string, requestedLimit = 12): Promise<EvidenceReplayBatch> {
+  /**
+   * `fromMs` (first batch only, without a cursor) starts the replay near that
+   * time; `filter` keeps only one capture window's frames.
+   */
+  async readBatch(sessionId: string, cursor?: string, requestedLimit = 12, fromMs?: number, filter?: ReplayFrameFilter): Promise<EvidenceReplayBatch> {
     const { session, sessionPath, manifest } = await this.eligibleSession(sessionId);
     const limit = Number.isFinite(requestedLimit)
       ? Math.max(1, Math.min(MAX_BATCH_FRAMES, Math.floor(requestedLimit)))
@@ -766,7 +845,10 @@ export class EvidencePlaybackReader {
           MAX_REPLAY_INDEX_BYTES,
         )
         : undefined;
-      const page = await readIndexRecords(indexHandle, startOffset, limit);
+      const firstOffset = !cursor && fromMs !== undefined && Number.isFinite(fromMs)
+        ? await seekIndexOffset(indexHandle, fromMs)
+        : startOffset;
+      const page = await readIndexRecords(indexHandle, firstOffset, limit, filter?.targetId || filter?.bandId ? filter : undefined);
       if (verifiedIndexIdentity) {
         await this.assertStillVerified(indexHandle, verifiedIndexIdentity, indexRelativePath);
       }

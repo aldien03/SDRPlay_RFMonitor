@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 5,
+  "schemaVersion": 6,
   "revision": 1,
   "updatedAt": "2026-08-20T00:00:00.000Z",
   "siteName": "RF Monitoring Site",
@@ -48,6 +48,31 @@
     "reservoirSize": 256,
     "minimumLearningMs": 1800000
   },
+  "alerting": {
+    "presetTableVersion": 1,
+    "default": {
+      "preset": "standard",
+      "values": {
+        "segmentSigma": 6,
+        "segmentGapRatio": 0.005,
+        "widebandOccupancy": 0.35,
+        "partialSigma": 6,
+        "narrowbandMaxWidthRatio": 0.1,
+        "narrowbandPeakSigma": 10,
+        "narrowbandMinBins": 1,
+        "alertVisits": 3,
+        "alertWindow": 5,
+        "minExposureMs": 1000,
+        "noiseFloorSigma": 4,
+        "noiseFloorExposureMs": 10000,
+        "noiseFloorRequiresProtected": false,
+        "burstSigma": 0,
+        "clearVisits": 10
+      }
+    },
+    "targetOverrides": {}
+  },
+  "reportIdentity": {},
   "retention": {
     "sessionMaxBytes": 2147483648,
     "sessionMaxMs": 86400000,
