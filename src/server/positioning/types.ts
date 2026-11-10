@@ -6,12 +6,10 @@ export interface PositioningSystemConfig {
   /** Correction service / solution, e.g. "G4 SPEL". */
   output: string;
   receiver: string;
+  /** Antenna name. Systems sharing one antenna use the same name; used to separate antenna from receiver causes. */
   antenna: string;
-  /** Solutions on one splitter share an antenna group; used to separate antenna from receiver causes. */
-  antennaGroup: string;
   /** Fugro L-band beam, e.g. "EASAT"; matched to the rf-monitor lane "fugro-<beam>". */
   beam: string;
-  ip?: string;
 }
 
 export interface PositioningReportIdentity {
@@ -40,6 +38,13 @@ export interface PositioningThresholds {
   movingKnots: number;
   /** Flags on the same solution closer than this are one event. */
   mergeGapS: number;
+  /**
+   * Under way, offsets are split along/across track from this speed. At 0.5 kn
+   * a 1 s timing error moves a position only 0.26 m, so slower shots compare in 2D.
+   */
+  alongTrackMinKnots: number;
+  /** Along-track excursions beyond this many seconds of travel are not timing (counted as offsets). */
+  timingStepMaxS: number;
 }
 
 export const DEFAULT_THRESHOLDS: PositioningThresholds = {
@@ -51,6 +56,8 @@ export const DEFAULT_THRESHOLDS: PositioningThresholds = {
   ageExcessS: 30,
   movingKnots: 0.5,
   mergeGapS: 300,
+  alongTrackMinKnots: 0.5,
+  timingStepMaxS: 3,
 };
 
 export type ReportWindowMode = "sbs" | "utc-day" | "custom";

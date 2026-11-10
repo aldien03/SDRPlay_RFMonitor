@@ -10,9 +10,11 @@ import { renderIncidentReportHtml } from "../src/server/report/reportHtml";
 import { renderIncidentReportPdf } from "../src/server/report/reportPdf";
 import { pdfSafe, frequencyRange } from "../src/server/report/format";
 import { chartToSvg } from "../src/server/report/svgChart";
-import { disturbedSummary, incidentStatusLabel, incidentTimeline, triggerBars, whyAlertSentence } from "../src/client/incidentPresentation";
+import { checkedSpanLabel, disturbedSummary, endReasonLabel, incidentActionCopy, incidentClock, incidentEndAt, incidentStatusLabel, incidentTimeline, recentIncidents, shortDuration, triggerBars, triggerBarScale, whyAlertSentence } from "../src/client/incidentPresentation";
 import { appliedToastCopy, applyImpactCopy } from "../src/client/SettingsPage";
 import { IncidentPanel } from "../src/client/MonitorPanels";
+import { forwardOnlyFrames, replaySignalLabel } from "../src/client/BottomPanels";
+import { frequencyRangeLabel } from "../src/client/format";
 import { resolveOperatorSummary } from "../src/shared/operatorSummary";
 
 const trigger: AlertTrigger = {
@@ -114,7 +116,7 @@ describe("incident presentation (operator copy)", () => {
       onBack: () => undefined,
       onOpenAnalysis: () => undefined,
     }));
-    const order = ["Evidence history", "Suspected RF interference", "Disturbed", "Why this alert", "Timeline", "Notes", "Bridge saw a position jump.", "Evidence", "Download evidence package", "Incident report", "Technical details"];
+    const order = ["Evidence history", "Suspected RF interference", "Disturbed", "Action", "Why this alert", "Timeline", "Notes", "Bridge saw a position jump.", "Evidence", "Add note", "Incident report", "Download evidence package", "Mark reviewed", "Technical details"];
     let cursor = -1;
     for (const label of order) {
       const index = markup.indexOf(label, cursor + 1);
@@ -123,6 +125,152 @@ describe("incident presentation (operator copy)", () => {
     }
     expect(markup).toContain("Medium evidence");
     expect(markup).not.toMatch(/spoof|jamm|dbm/i);
+  });
+
+  it("lists recent incidents newest first, preferring this run's live copy", () => {
+    const stored = [
+      incident({ id: "a", startedAt: "2026-11-09T08:00:00.000Z", lifecycle: "active", clearedAt: undefined }),
+      incident({ id: "b", startedAt: "2026-11-09T09:00:00.000Z" }),
+      incident({ id: "c", startedAt: "2026-11-08T09:00:00.000Z" }),
+    ];
+    const live = [incident({ id: "a", startedAt: "2026-11-09T08:00:00.000Z", lifecycle: "cleared", clearedAt: "2026-11-09T08:30:00.000Z" })];
+    const list = recentIncidents(live, stored, 2);
+    expect(list.map((entry) => entry.id)).toEqual(["b", "a"]);
+    expect(list[1].lifecycle).toBe("cleared");
+    expect(shortDuration("2026-11-09T08:00:00.000Z", "2026-11-09T10:05:00.000Z")).toBe("2 h 05 min");
+    expect(shortDuration("2026-11-09T08:00:00.000Z", "2026-11-09T08:00:20.000Z")).toBe("20 s");
+    expect(shortDuration("2026-11-09T08:00:00.000Z", "2026-11-09T08:00:00.400Z")).toBe("Under 1 s");
+    expect(shortDuration("2026-11-09T08:00:00.000Z", "2026-11-09T08:04:10.000Z")).toBe("4 min 10 s");
+    expect(shortDuration("2026-11-09T08:00:00.000Z", "2026-11-09T08:12:00.000Z")).toBe("12 min");
+    expect(shortDuration("2026-11-09T08:00:00.000Z", "2026-11-12T12:00:00.000Z")).toBe("3 d 4 h");
+    expect(shortDuration("bad", "2026-11-09T08:00:20.000Z")).toBe("–");
+  });
+
+  it("never counts a stored open record up to now", () => {
+    const open = incident({ lifecycle: "active", clearedAt: undefined, endedAt: undefined, lastSeenAt: "2026-11-09T10:07:00.000Z" });
+    expect(incidentEndAt(open, false)).toBe("2026-11-09T10:07:00.000Z");
+    expect(incidentEndAt(open, true, "2026-11-09T12:00:00.000Z")).toBe("2026-11-09T12:00:00.000Z");
+    const summary = resolveOperatorSummary({
+      generatedAt: "2026-11-09T12:00:00.000Z", serverBuildId: "release-a", dataDomain: "field",
+      monitoring: { receiverOnline: true, dataFresh: true, paused: false, alertActive: false, recovering: false, candidateActive: false, detectingActive: false, checking: false, since: "2026-11-09T12:00:00.000Z" },
+      recording: { state: "recording" }, currentHealth: { state: "normal" }, productionQualification: { state: "pending", ready: false },
+      affectedTargets: [], observation: { at: "2026-11-09T12:00:00.000Z", coverage: "observed", targetId: "gnss-l1-e1-b1c-sbas" },
+    });
+    const markup = renderToStaticMarkup(createElement(IncidentPanel, {
+      event: open, operatorSummary: summary, services: [], displayTimeZone: "UTC",
+      onAddNote: () => undefined, onAcknowledge: () => undefined, onExport: () => undefined, archived: true,
+    }));
+    expect(markup).toContain("Ended");
+    expect(markup).not.toContain(">Alert<");
+  });
+
+  it("shows recent incidents when nothing is active", () => {
+    const summary = resolveOperatorSummary({
+      generatedAt: "2026-11-09T12:00:00.000Z", serverBuildId: "release-a", dataDomain: "field",
+      monitoring: { receiverOnline: true, dataFresh: true, paused: false, alertActive: false, recovering: false, candidateActive: false, detectingActive: false, checking: false, since: "2026-11-09T12:00:00.000Z" },
+      recording: { state: "recording" }, currentHealth: { state: "normal" }, productionQualification: { state: "pending", ready: false },
+      affectedTargets: [], observation: { at: "2026-11-09T12:00:00.000Z", coverage: "observed", targetId: "gnss-l1-e1-b1c-sbas" },
+    });
+    const render = (incidents?: DetectionEvent[]) => renderToStaticMarkup(createElement(IncidentPanel, {
+      operatorSummary: summary, services: [], displayTimeZone: "UTC",
+      onAddNote: () => undefined, onAcknowledge: () => undefined, onExport: () => undefined,
+      recent: { incidents, liveIds: new Set<string>() }, onOpenRecent: () => undefined, onOpenHistory: () => undefined,
+    }));
+    const markup = render([incident()]);
+    expect(markup).toContain("No active incident");
+    expect(markup).toContain("Recent incidents");
+    expect(markup).toContain("Suspected RF interference");
+    expect(markup).toContain("Evidence history");
+    expect(render([])).toContain("No incidents recorded.");
+    expect(render(undefined)).toContain("Loading");
+  });
+
+  it("uses one clock and range style, and plain reasons", () => {
+    const now = new Date("2026-11-09T18:00:00.000Z");
+    expect(incidentClock("2026-11-09T10:05:02.000Z", "UTC", now)).toBe("10:05:02 UTC");
+    expect(incidentClock("2026-11-08T10:05:02.000Z", "UTC", now)).toBe("08 Nov 10:05:02 UTC");
+    expect(incidentClock("2025-11-08T10:05:02.000Z", "UTC", now)).toBe("08 Nov 2025 10:05:02 UTC");
+    expect(incidentClock("2026-11-09T10:05:02.000Z", "Europe/Athens", now)).toBe("12:05:02 EET");
+    expect(incidentClock("bad", "UTC", now)).toBe("–");
+    expect(checkedSpanLabel(incident())).toBe("1571.42–1579.42 MHz");
+    expect(endReasonLabel("service-restart")).toBe("RF Monitor restarted before it cleared");
+    expect(frequencyRangeLabel(452_900_000, 462_900_000)).toBe("452.900–462.900 MHz");
+    const scan = { bands: [{ id: "gps-l1", label: "GPS L1" }], monitorFeeds: [], services: [{ service: "startrack", label: "StarTrack radio" }] } as unknown as Parameters<typeof replaySignalLabel>[0];
+    expect(replaySignalLabel(scan, "gps-l1")).toBe("GPS L1");
+    expect(replaySignalLabel(scan, "startrack-410-470")).toBe("StarTrack radio");
+    expect(replaySignalLabel(scan, "unknown-band")).toBe("unknown-band");
+    expect(endReasonLabel("RF configuration changed before the alert cleared")).toBe("RF configuration changed before the alert cleared");
+  });
+
+  it("plays an incident replay forward even when the recording repeats or back-fills frames", () => {
+    const entry = (id: string, second: number) => ({ frame: { id, timestamp: new Date(Date.UTC(2026, 10, 10, 6, 6, second)).toISOString() } }) as unknown as Parameters<typeof forwardOnlyFrames>[0][number];
+    const state = { lastMs: Number.NEGATIVE_INFINITY, ids: new Set<string>() };
+    // As recorded overnight: 06:06:20 to 06:07:10, then the pre-alert history written again.
+    const first = forwardOnlyFrames([entry("a", 20), entry("b", 25), entry("c", 70)], state);
+    const second = forwardOnlyFrames([entry("a", 20), entry("b", 25), entry("x", 40), entry("d", 75), entry("e", 80)], state);
+    expect(first.map((item) => item.frame.id)).toEqual(["a", "b", "c"]);
+    expect(second.map((item) => item.frame.id)).toEqual(["d", "e"]);
+  });
+
+  it("asks for a review once the alert has ended, and keeps the live action while it is open", () => {
+    const base = { synthetic: false, recommendedAction: "Check position on an independent receiver.", timeZone: "UTC", now: new Date("2026-11-09T18:00:00.000Z") };
+    expect(incidentActionCopy({ ...base, live: true, status: "Alert" })).toEqual({ text: base.recommendedAction, tone: "alert" });
+    expect(incidentActionCopy({ ...base, live: false, status: "Ended" })).toMatchObject({ text: "Alert ended. Add what you checked, then mark it reviewed.", tone: "review", during: base.recommendedAction });
+    expect(incidentActionCopy({ ...base, live: false, status: "Cleared", acknowledgedAt: "2026-11-09T11:00:00.000Z" })).toMatchObject({ text: "Reviewed 11:00:00 UTC. No action needed.", tone: "clear" });
+  });
+
+  it("draws only the firing rule in red, with the alert-level marker in proportion", () => {
+    const bars = triggerBars(trigger);
+    expect(bars.map((bar) => bar.emphasis)).toEqual(["rule", "context", "rule"]);
+    expect(triggerBarScale(1)).toEqual({ width: (1 / 1.5) * 100, marker: 100 / 1.5 });
+    expect(triggerBarScale(3)).toMatchObject({ width: 80, marker: 100 / 3.75 });
+    expect(triggerBarScale(10).marker).toBe(25);
+    expect(triggerBarScale(Number.NaN).width).toBe(3);
+  });
+
+  it("lets a stored incident be noted and reviewed, and steps through the recent list", () => {
+    const summary = resolveOperatorSummary({
+      generatedAt: "2026-11-09T12:00:00.000Z", serverBuildId: "release-a", dataDomain: "field",
+      monitoring: { receiverOnline: true, dataFresh: true, paused: false, alertActive: false, recovering: false, candidateActive: false, detectingActive: false, checking: false, since: "2026-11-09T12:00:00.000Z" },
+      recording: { state: "recording" }, currentHealth: { state: "normal" }, productionQualification: { state: "pending", ready: false },
+      affectedTargets: [], observation: { at: "2026-11-09T12:00:00.000Z", coverage: "observed", targetId: "gnss-l1-e1-b1c-sbas" },
+    });
+    const render = (event: DetectionEvent) => renderToStaticMarkup(createElement(IncidentPanel, {
+      event, operatorSummary: summary, services: [], displayTimeZone: "UTC", archived: true,
+      onAddNote: () => undefined, onAcknowledge: () => undefined, onExport: () => undefined, onOpenAnalysis: () => undefined,
+      onBack: () => undefined, backLabel: "Recent incidents", stepper: { position: 2, total: 3, onNewer: () => undefined },
+    }));
+    const pending = render(incident({ endReason: "service-restart", lifecycle: "ended-unknown", endedAt: "2026-11-09T10:09:00.000Z", clearedAt: undefined }));
+    expect(pending).toMatch(/<button class="button secondary" type="button">.*Add note<\/button>/);
+    expect(pending).toMatch(/<button class="button primary" type="button">.*Mark reviewed<\/button>/);
+    expect(pending).toContain("2 of 3");
+    expect(pending).toMatch(/disabled="" aria-label="Older incident"/);
+    expect(pending).toContain("RF Monitor restarted before it cleared");
+    expect(pending).toContain("During the alert:");
+    const done = render(incident({ acknowledgedAt: "2026-11-09T11:00:00.000Z" }));
+    expect(done).toMatch(/Reviewed (09 Nov )?11:00:00 UTC\. No action needed\./);
+    expect(done).toMatch(/disabled="">.*Reviewed<\/button>/);
+  });
+
+  it("shows Checking as a status, not an alarm, and counts incidents to review", () => {
+    const summary = resolveOperatorSummary({
+      generatedAt: "2026-11-09T12:00:00.000Z", serverBuildId: "release-a", dataDomain: "field",
+      monitoring: { receiverOnline: true, dataFresh: true, paused: false, alertActive: false, recovering: false, candidateActive: false, detectingActive: false, checking: true, since: "2026-11-09T12:00:00.000Z" },
+      recording: { state: "recording" }, currentHealth: { state: "normal" }, productionQualification: { state: "pending", ready: false },
+      affectedTargets: [], observation: { at: "2026-11-09T12:00:00.000Z", coverage: "observed", targetId: "gnss-l1-e1-b1c-sbas" },
+    });
+    expect(summary.monitoring.state).toBe("checking");
+    const markup = renderToStaticMarkup(createElement(IncidentPanel, {
+      operatorSummary: summary, services: [], displayTimeZone: "UTC",
+      onAddNote: () => undefined, onAcknowledge: () => undefined, onExport: () => undefined,
+      recent: { incidents: [incident({ acknowledgedAt: undefined }), incident({ id: "b", acknowledgedAt: "2026-11-09T11:00:00.000Z" })], liveIds: new Set<string>(), toReview: 1, reviewWindowHours: 24 },
+      onOpenRecent: () => undefined, onOpenHistory: () => undefined,
+    }));
+    expect(markup).toContain("incident-heading checking");
+    expect(markup).not.toContain("incident-heading active");
+    expect(markup).toContain("1 to review · last 24 h");
+    expect(markup).toContain("To review");
+    expect(markup).toContain("recent-incident-status cleared");
   });
 
   it("says what Apply will do before saving", () => {

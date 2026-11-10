@@ -58,6 +58,7 @@ import type {
 } from "../shared/types";
 import { ensureDomainRoot } from "./dataDomains";
 import { IncidentFigureBuilder, type IncidentFigureData, type IncidentFigureSummary } from "./incidentFigure";
+import { IncidentReviewLog } from "./incidentReviews";
 import type { AnalysisChartSet } from "./incidentAnalysis";
 import {
   createEvidenceFinalizationRecord,
@@ -229,6 +230,12 @@ export interface IncidentReportContext {
 
 const INCIDENT_LOG_MARGIN_MS = 10 * 60_000;
 const MAX_EXPORT_SCREENSHOTS = 32;
+
+/** Per-request memo for incident lookups across sessions. */
+export interface IncidentLookupCache {
+  sessions?: Promise<EvidenceSession[]>;
+  events: Map<string, Promise<DetectionEvent[]>>;
+}
 
 export class EvidenceCorruptionError extends Error {
   constructor(message: string) {
@@ -720,9 +727,12 @@ export class EvidenceStore {
   private screenshotQuotaReady = false;
   private screenshotQuotaFailure?: string;
   readonly dataDomain: DataDomain;
+  /** Notes and review marks added after an incident's sessions were finalized. */
+  readonly reviews: IncidentReviewLog;
 
   constructor(readonly root: string, options: EvidenceStoreOptions = {}) {
     this.dataDomain = options.dataDomain ?? "field";
+    this.reviews = new IncidentReviewLog(root, this.dataDomain);
     this.rawChunkMaxBytes = options.rawChunkMaxBytes ?? RAW_CHUNK_MAX_BYTES;
     this.incidentPrehistoryMs = options.incidentPrehistoryMs ?? INCIDENT_PREHISTORY_MS;
     this.incidentPostClearMs = options.incidentPostClearMs ?? INCIDENT_POST_CLEAR_MS;
@@ -1191,7 +1201,8 @@ export class EvidenceStore {
     this.activeExportOperations += 1;
     try {
       const storedEvent = await this.findIncidentEvent(event.id, event.sessionId);
-      const exportEvent = storedEvent ?? event;
+      // Notes and review added after the session closed travel with the package and report.
+      const exportEvent = await this.reviews.apply(storedEvent ?? event);
       const requestedSessionIds = [...new Set([exportEvent.sessionId, ...(exportEvent.sessionIds ?? [])])];
       for (const sessionId of requestedSessionIds) this.updateLease(this.exportSourceSessionLeases, sessionId, 1);
       let stagingPath: string | undefined;
@@ -1451,15 +1462,28 @@ export class EvidenceStore {
     }
   }
 
-  async findIncidentEvent(eventId: string, hintedSessionId?: string): Promise<DetectionEvent | undefined> {
+  /**
+   * The newest record of an incident across every session it was written to.
+   * `cache` lets one request look up several incidents with one read per session.
+   */
+  async findIncidentEvent(eventId: string, hintedSessionId?: string, cache?: IncidentLookupCache): Promise<DetectionEvent | undefined> {
     const safeEventId = safeIdentifier(eventId, "event id");
-    const sessions = await this.listSessions();
+    const sessions = await (cache ? (cache.sessions ??= this.listSessions()) : this.listSessions());
     const ordered = hintedSessionId
       ? [...sessions.filter((session) => session.id === hintedSessionId), ...sessions.filter((session) => session.id !== hintedSessionId)]
       : sessions;
+    const sessionEvents = (sessionId: string) => {
+      if (!cache) return this.listSessionEvents(sessionId);
+      let pending = cache.events.get(sessionId);
+      if (!pending) {
+        pending = this.listSessionEvents(sessionId).catch(() => []);
+        cache.events.set(sessionId, pending);
+      }
+      return pending;
+    };
     const candidates: DetectionEvent[] = [];
     for (const session of ordered) {
-      const candidate = (await this.listSessionEvents(session.id)).find((event) => event.id === safeEventId);
+      const candidate = (await sessionEvents(session.id)).find((event) => event.id === safeEventId);
       if (candidate) candidates.push(candidate);
     }
     if (!candidates.length) return undefined;
@@ -3202,6 +3226,14 @@ export class EvidenceStore {
           // A session without this log contributes nothing.
         }
       }
+    }
+    // Added after the source sessions were finalized: kept in the review log, not in a session.
+    for (const entry of await this.reviews.entriesFor(event.id)) {
+      if (entry.type !== "note") continue;
+      await writeAtomic(
+        path.join(destination, "evidence", "notes", `${safeTimestamp(entry.at)}-${safeEventId}-review.json`),
+        JSON.stringify(sanitizeEvidence({ eventId: safeEventId, timestamp: entry.at, text: entry.text, source: "incident-review-log" }), null, 2),
+      );
     }
     for (const [log, lines] of Object.entries(logLines)) {
       await mkdir(path.join(destination, "logs"), { recursive: true });

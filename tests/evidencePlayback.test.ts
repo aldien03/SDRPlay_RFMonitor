@@ -45,13 +45,13 @@ function frame(sequence: number): PersistedSpectrumFrame {
   };
 }
 
-async function completeFixture(frameCount = 5): Promise<{ root: string; session: EvidenceSession }> {
+async function completeFixture(frameCount = 5, targetFor?: (sequence: number) => { targetId: string; bandId: string }): Promise<{ root: string; session: EvidenceSession }> {
   const root = await mkdtemp(path.join(os.tmpdir(), "rf-monitor-replay-"));
   temporaryRoots.push(root);
   const store = new EvidenceStore(root, { dataDomain: "field" });
   const session = await store.initialize({ config: { fixture: true }, sdrconnect: { fixture: true } });
   for (let sequence = 0; sequence < frameCount; sequence += 1) {
-    await store.recordFrame(frame(sequence), {
+    await store.recordFrame({ ...frame(sequence), ...targetFor?.(sequence) }, {
       timestamp: frame(sequence).timestamp,
       bandId: "gps-l1",
       meanLevel: sequence + 1.5,
@@ -100,6 +100,38 @@ describe("read-only evidence playback", () => {
     expect(final.done).toBe(true);
     expect(final.nextCursor).toBeUndefined();
     expect(await readFile(path.join(fixture.session.path, "session.json"))).toEqual(before);
+  });
+
+  it("starts near a requested time without a cursor", async () => {
+    const fixture = await completeFixture(240);
+    // Large enough for the binary search, not only the final scan.
+    expect((await readFile(path.join(fixture.session.path, "spectrum", "frames.jsonl"))).byteLength).toBeGreaterThan(200_000);
+    const reader = new EvidencePlaybackReader(fixture.root, "field");
+    const at = (sequence: number) => Date.UTC(2026, 7, 24, 10, 0, sequence);
+    const middle = await reader.readBatch(fixture.session.id, undefined, 2, at(200));
+    expect(middle.frames.map((entry) => entry.frame.id)).toEqual(["frame-200", "frame-201"]);
+    const next = await reader.readBatch(fixture.session.id, middle.nextCursor, 1, at(10));
+    expect(next.frames.map((entry) => entry.frame.id)).toEqual(["frame-202"]);
+    expect((await reader.readBatch(fixture.session.id, undefined, 1, at(-60))).frames[0].frame.id).toBe("frame-0");
+    expect(await reader.readBatch(fixture.session.id, undefined, 1, at(10_000))).toMatchObject({ frames: [], done: true });
+  });
+
+  it("replays only one capture window when asked, reading past other windows", async () => {
+    const windows = [
+      { targetId: "gnss-l1-e1-b1c-sbas", bandId: "gps-l1" },
+      { targetId: "gnss-gps-l2c", bandId: "gps-l2" },
+      { targetId: "gnss-l5-e5a-b2a", bandId: "gps-l5" },
+    ];
+    const fixture = await completeFixture(30, (sequence) => windows[sequence % 3]);
+    const reader = new EvidencePlaybackReader(fixture.root, "field");
+    const first = await reader.readBatch(fixture.session.id, undefined, 4, Date.UTC(2026, 7, 24, 10, 0, 10), { targetId: "gnss-gps-l2c" });
+    expect(first.frames.map((entry) => entry.frame.id)).toEqual(["frame-10", "frame-13", "frame-16", "frame-19"]);
+    expect(first.frames.every((entry) => entry.frame.targetId === "gnss-gps-l2c")).toBe(true);
+    const rest = await reader.readBatch(fixture.session.id, first.nextCursor, 16, undefined, { targetId: "gnss-gps-l2c" });
+    expect(rest.frames.map((entry) => entry.frame.id)).toEqual(["frame-22", "frame-25", "frame-28"]);
+    expect(rest.done).toBe(true);
+    const byBand = await reader.readBatch(fixture.session.id, undefined, 2, undefined, { bandId: "gps-l5" });
+    expect(byBand.frames.map((entry) => entry.frame.id)).toEqual(["frame-2", "frame-5"]);
   });
 
   it("caps oversized batch requests at the server frame bound", async () => {

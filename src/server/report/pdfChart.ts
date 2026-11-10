@@ -67,10 +67,26 @@ export function drawChartPdf(page: PDFPage, spec: ChartSpec, x: number, top: num
     } else if (series.kind === "area") {
       for (const path of areaPaths(spec, series.points)) svg(path, { color: color(series.color), opacity: series.opacity });
     } else if (series.kind === "points") {
+      // All dots of one colour as one path: a drawCircle per dot writes its own
+      // graphics state and costs far more memory on long series.
+      const radius = series.radius ?? 2.6;
+      const k = radius * 0.5523;
+      const byColor = new Map<string, string[]>();
       series.points.forEach((point, index) => {
         if (!point) return;
-        page.drawCircle({ x: toPdfX(scaleX(spec, point[0])), y: toPdfY(scaleY(spec, point[1])), size: (series.radius ?? 2.6) * scale, color: color(series.colors?.[index] ?? series.color), borderColor: color(REPORT_COLORS.ink), borderWidth: 0.3, borderOpacity: 0.45 });
+        const cx = scaleX(spec, point[0]);
+        const cy = scaleY(spec, point[1]);
+        if (!Number.isFinite(cx) || !Number.isFinite(cy)) return;
+        const parts = byColor.get(series.colors?.[index] ?? series.color) ?? [];
+        parts.push(`M${(cx + radius).toFixed(2)} ${cy.toFixed(2)}C${(cx + radius).toFixed(2)} ${(cy + k).toFixed(2)} ${(cx + k).toFixed(2)} ${(cy + radius).toFixed(2)} ${cx.toFixed(2)} ${(cy + radius).toFixed(2)}C${(cx - k).toFixed(2)} ${(cy + radius).toFixed(2)} ${(cx - radius).toFixed(2)} ${(cy + k).toFixed(2)} ${(cx - radius).toFixed(2)} ${cy.toFixed(2)}C${(cx - radius).toFixed(2)} ${(cy - k).toFixed(2)} ${(cx - k).toFixed(2)} ${(cy - radius).toFixed(2)} ${cx.toFixed(2)} ${(cy - radius).toFixed(2)}C${(cx + k).toFixed(2)} ${(cy - radius).toFixed(2)} ${(cx + radius).toFixed(2)} ${(cy - k).toFixed(2)} ${(cx + radius).toFixed(2)} ${cy.toFixed(2)}Z`);
+        byColor.set(series.colors?.[index] ?? series.color, parts);
       });
+      for (const [fill, parts] of byColor) {
+        // Bounded chunks keep each content-stream path short.
+        for (let start = 0; start < parts.length; start += 400) {
+          svg(parts.slice(start, start + 400).join(""), { color: color(fill), borderColor: color(REPORT_COLORS.ink), borderWidth: 0.3 * scale, borderOpacity: 0.45 });
+        }
+      }
     } else {
       const path = linePath(spec, series.points);
       if (path) {

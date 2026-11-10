@@ -1560,3 +1560,104 @@ describe("alert sensitivity applies live and incidents explain themselves", () =
     await monitor.stop();
   });
 });
+
+describe("incident records that outlive their process", () => {
+  function openEvent(id: string, sessionId: string, dataDomain: string, targetId: string): DetectionEvent {
+    return {
+      id, dataDomain, sessionId, sessionIds: [sessionId], kind: "gnss-energy-anomaly", status: "interference-likely",
+      severity: "medium", evidenceStrength: "Low", evidenceBasis: "Relative RF energy", baselineFingerprintId: "f", ruleSetId: "r",
+      observationId: "o", service: "startrack", bandId: "b", targetId, bandLabel: "StarTrack", affectedRangeHz: [1, 2],
+      observed: "Raised energy", recommendedAction: "Check the antenna", startedAt: "2026-08-20T11:59:00.000Z", lastSeenAt: "2026-08-20T11:59:30.000Z",
+      lifecycle: "active", notes: [], metrics: {},
+    } as unknown as DetectionEvent;
+  }
+
+  it("ends an open incident in the record when the service stops", async () => {
+    const config = enableSingleRadioTarget(await temporaryConfig("stop-open-incident"));
+    const monitor = new MonitorService(config);
+    await monitor.start();
+    const internal = monitor as unknown as {
+      stopSimulation(): void;
+      activeEventsByTarget: Map<string, DetectionEvent>;
+      events: DetectionEvent[];
+      evidence: { currentSession?: { id: string } };
+    };
+    internal.stopSimulation();
+    const sessionId = internal.evidence.currentSession!.id;
+    const event = openEvent("event-open-at-stop", sessionId, config.dataDomain, "target-a");
+    internal.events = [event, ...internal.events];
+    internal.activeEventsByTarget.set("target-a", event);
+    await monitor.stop();
+
+    const restarted = new MonitorService(config);
+    await restarted.start();
+    (restarted as unknown as { stopSimulation(): void }).stopSimulation();
+    const stored = await restarted.getEvent(event.id, sessionId);
+    expect(stored).toMatchObject({ lifecycle: "ended-unknown", endReason: "RF Monitor stopped before the alert cleared" });
+    expect(stored?.timeline?.at(-1)).toMatchObject({ code: "ended" });
+    await restarted.stop();
+  });
+
+  it("shows a stored record that was never closed as ended at its last observation", async () => {
+    const config = enableSingleRadioTarget(await temporaryConfig("untracked-open-incident"));
+    const monitor = new MonitorService(config);
+    await monitor.start();
+    const internal = monitor as unknown as {
+      stopSimulation(): void;
+      evidence: { currentSession?: { id: string }; recordEvent(event: DetectionEvent): Promise<void> };
+    };
+    internal.stopSimulation();
+    const sessionId = internal.evidence.currentSession!.id;
+    // Written as open, then lost by the process (as after a retune or a failed final write).
+    await internal.evidence.recordEvent(openEvent("event-never-closed", sessionId, config.dataDomain, "target-b"));
+
+    const stored = await monitor.getEvent("event-never-closed", sessionId);
+    expect(stored).toMatchObject({ lifecycle: "ended-unknown", endedAt: "2026-08-20T11:59:30.000Z" });
+    const archive = await monitor.getEvidenceArchive();
+    const listed = archive.sessions.flatMap((session) => session.events).find((entry) => entry.id === "event-never-closed");
+    expect(listed).toMatchObject({ lifecycle: "ended-unknown", endedAt: "2026-08-20T11:59:30.000Z" });
+    await monitor.stop();
+  });
+
+  it("takes notes and a review on an incident from an earlier run without changing its session", async () => {
+    const config = enableSingleRadioTarget(await temporaryConfig("review-stored-incident"));
+    const monitor = new MonitorService(config);
+    await monitor.start();
+    const internal = monitor as unknown as {
+      stopSimulation(): void;
+      evidence: { currentSession?: { id: string }; recordEvent(event: DetectionEvent): Promise<void> };
+    };
+    internal.stopSimulation();
+    const sessionId = internal.evidence.currentSession!.id;
+    const startedAt = new Date(Date.now() - 3_600_000).toISOString();
+    const clearedAt = new Date(Date.now() - 3_500_000).toISOString();
+    await internal.evidence.recordEvent({ ...openEvent("event-to-review", sessionId, config.dataDomain, "target-c"), startedAt, lastSeenAt: clearedAt, clearedAt, lifecycle: "cleared" });
+    await monitor.stop();
+
+    const restarted = new MonitorService(config);
+    await restarted.start();
+    const evidence = (restarted as unknown as { stopSimulation(): void; evidence: { root: string; listSessions(): Promise<Array<{ id: string; path: string }>> } });
+    evidence.stopSimulation();
+    const sessionPath = (await evidence.evidence.listSessions()).find((session) => session.id === sessionId)!.path;
+    const eventsBefore = await readFile(path.join(sessionPath, "events", "events.jsonl"), "utf8");
+    expect((await restarted.getRecentIncidents()).toReview).toBe(1);
+
+    const noted = await restarted.addNote("event-to-review", "Checked the antenna; bridge saw no position jump.");
+    expect(noted?.notes.map((note) => note.text)).toEqual(["Checked the antenna; bridge saw no position jump."]);
+    const reviewed = await restarted.acknowledgeEvent("event-to-review");
+    expect(reviewed?.acknowledgedAt).toBeTruthy();
+    expect(await restarted.acknowledgeEvent("event-to-review")).toMatchObject({ acknowledgedAt: reviewed?.acknowledgedAt });
+
+    const stored = await restarted.getEvent("event-to-review", sessionId);
+    expect(stored?.notes).toHaveLength(1);
+    expect(stored?.acknowledgedAt).toBe(reviewed?.acknowledgedAt);
+    expect(stored?.timeline?.map((entry) => entry.code)).toEqual(expect.arrayContaining(["note", "acknowledged"]));
+    const recent = await restarted.getRecentIncidents();
+    expect(recent.toReview).toBe(0);
+    expect(recent.incidents.find((entry) => entry.id === "event-to-review")?.notes).toHaveLength(1);
+    expect(await readFile(path.join(sessionPath, "events", "events.jsonl"), "utf8")).toBe(eventsBefore);
+    expect(await readFile(path.join(evidence.evidence.root, "incident-reviews.jsonl"), "utf8")).toContain("event-to-review");
+    expect(await restarted.addNote("missing-incident", "No such incident")).toBeUndefined();
+    await restarted.stop();
+  });
+});

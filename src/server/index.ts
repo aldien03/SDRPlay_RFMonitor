@@ -1481,12 +1481,26 @@ app.post("/api/storage/maintenance", async (_request, response) => {
 });
 
 app.post("/api/events/:eventId/acknowledge", async (request, response) => {
-  const event = await monitor.acknowledgeEvent(request.params.eventId);
-  if (!event) {
-    response.status(404).json({ error: "Event not found" });
-    return;
+  try {
+    const event = await monitor.acknowledgeEvent(request.params.eventId);
+    if (!event) {
+      response.status(404).json({ error: "Event not found" });
+      return;
+    }
+    response.json(event);
+  } catch (error) {
+    response.status(422).json({ error: error instanceof Error ? error.message : String(error) });
   }
-  response.json(event);
+});
+
+app.get("/api/incidents/recent", async (request, response) => {
+  const limit = typeof request.query.limit === "string" ? Number(request.query.limit) : 6;
+  try {
+    response.setHeader("Cache-Control", "no-store");
+    response.json(await monitor.getRecentIncidents(limit));
+  } catch {
+    response.status(503).json({ error: "Recent incidents could not be read. Try again." });
+  }
 });
 
 app.post("/api/events/:eventId/notes", async (request, response) => {
@@ -1764,7 +1778,10 @@ app.get("/api/events/:eventId/trigger.svg", async (request, response) => {
     response.setHeader("Cache-Control", "no-store");
     response.setHeader("X-Content-Type-Options", "nosniff");
     response.setHeader("Content-Security-Policy", "default-src 'none'; img-src data:; style-src 'unsafe-inline'; sandbox");
-    response.type("image/svg+xml").send(chartToSvg(triggerSnapshotChart(snapshot, event), { standalone: true, idPrefix: "trigger" }));
+    // size=compact: the drawer picture (no title or caption inside); range=disturbed: zoom on the raised frequencies.
+    const compact = request.query.size === "compact";
+    const chart = triggerSnapshotChart(snapshot, event, { compact, disturbedOnly: request.query.range === "disturbed" });
+    response.type("image/svg+xml").send(chartToSvg(chart, { standalone: !compact, idPrefix: "trigger" }));
   } catch {
     response.status(400).json({ error: "The trigger snapshot could not be drawn" });
   }
@@ -1977,7 +1994,7 @@ app.post("/api/dgnss/uploads", (request, response, next) => {
   dgnssUploadParser(request, response, (error?: unknown) => {
     if (error) {
       const tooLarge = (error as { type?: string }).type === "entity.too.large";
-      response.status(tooLarge ? 413 : 400).json({ error: tooLarge ? "The file is too large. Export up to 24 h from Gator." : "The upload could not be read. Try again." });
+      response.status(tooLarge ? 413 : 400).json({ error: tooLarge ? "The file is too large to upload. Export it from Gator in parts and add them all." : "The upload could not be read. Try again." });
       return;
     }
     next();
@@ -1998,13 +2015,21 @@ app.post("/api/dgnss/uploads", (request, response, next) => {
   }
 });
 
+app.post("/api/dgnss/uploads/preview", async (request, response) => {
+  try {
+    response.json(await dgnssReports.previewSet(request.body?.uploadIds));
+  } catch (error) {
+    dgnssFailure(response, error);
+  }
+});
+
 app.get("/api/dgnss/reports", async (_request, response) => {
   response.json({ reports: await dgnssReports.list() });
 });
 
 app.post("/api/dgnss/reports", async (request, response) => {
   try {
-    response.status(202).json(await dgnssReports.generate(request.body?.uploadId, request.body?.window));
+    response.status(202).json(await dgnssReports.generate(request.body?.uploadIds ?? request.body?.uploadId, request.body?.window));
   } catch (error) {
     dgnssFailure(response, error);
   }
@@ -2084,11 +2109,16 @@ app.get("/api/evidence/sessions/:sessionId/replay", async (request, response) =>
     const sessionId = boundedIdentifier(request.params.sessionId);
     const cursor = typeof request.query.cursor === "string" ? request.query.cursor : undefined;
     const requestedLimit = typeof request.query.limit === "string" ? Number(request.query.limit) : 12;
+    const from = typeof request.query.from === "string" ? Date.parse(request.query.from) : Number.NaN;
+    // target/band: replay only one capture window (opened from an incident).
+    const replayId = (value: unknown) => typeof value === "string" && /^[A-Za-z0-9._:-]{1,160}$/.test(value) ? value : undefined;
     response.setHeader("Cache-Control", "no-store");
     response.json(await evidencePlayback.readBatch(
       sessionId,
       cursor,
       Number.isFinite(requestedLimit) ? requestedLimit : 12,
+      Number.isFinite(from) ? from : undefined,
+      { targetId: replayId(request.query.target), bandId: replayId(request.query.band) },
     ));
   } catch (error) {
     if (error instanceof EvidencePlaybackError) {

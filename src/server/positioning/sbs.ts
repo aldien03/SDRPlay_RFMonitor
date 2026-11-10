@@ -32,10 +32,24 @@ export interface SbsSystem {
   shots: SbsShot[];
   /** Raw QC fields that never carried a value (e.g. a receiver that does not output PDOP). */
   absentFields: string[];
+  /** Shots of this page whose raw QC block was all zero and was treated as missing. */
+  missingRawQcShots?: number;
+}
+
+/** What one input file contributed (inside the parse window). */
+export interface SbsFileStats {
+  lineName: string;
+  /** NaN when the file has no shots inside the window. */
+  startMs: number;
+  endMs: number;
+  /** Shots of the file's fullest system (one per epoch). */
+  epochs: number;
 }
 
 export interface SbsDataset {
+  /** Distinct Gator line names, joined. */
   lineName: string;
+  lineNames: string[];
   systems: SbsSystem[];
   startMs: number;
   endMs: number;
@@ -44,6 +58,26 @@ export interface SbsDataset {
   shotCount: number;
   /** Shots whose raw QC block was all zero (end-of-line export artefact) and was treated as missing. */
   missingRawQcShots: number;
+  /** Time spans with Gator data: [first shot, last shot + interval), split where shots stop for more than 3 intervals. */
+  coverage: Array<[number, number]>;
+  /** Shots that appeared more than once for the same system and time (overlapping files); the first is kept. */
+  duplicateShots: number;
+  /** Repeated shots whose values differed from the kept one. */
+  conflictingShots: number;
+  /** One entry per input file, in input order. */
+  files: SbsFileStats[];
+}
+
+/** Shots outside [fromMs, toMs) are skipped while parsing, so memory follows the report window. */
+export interface SbsParseWindow {
+  fromMs: number;
+  toMs: number;
+}
+
+/** One parsed file before it is merged. */
+export interface SbsPart {
+  lineName: string;
+  systems: SbsSystem[];
 }
 
 type FieldKey = "crpE" | "crpN" | "antE" | "antN" | "antH" | "pdop" | "hdop" | "pcalc" | "nsats" | "ageS";
@@ -90,7 +124,8 @@ export class SbsParser {
   private lineName = "";
   private current?: SbsSystem;
   private columns?: ReturnType<typeof mapHeader>;
-  private missingRawQcShots = 0;
+
+  constructor(private readonly window?: SbsParseWindow) {}
 
   line(rawLine: string): void {
     if (!rawLine.trim()) return;
@@ -120,6 +155,8 @@ export class SbsParser {
     const crpE = numberAt(cells, columns.fields.crpE);
     const crpN = numberAt(cells, columns.fields.crpN);
     if (seconds === null || crpE === null || crpN === null) return;
+    const timeMs = Math.round(seconds * 1000);
+    if (this.window && (timeMs < this.window.fromMs || timeMs >= this.window.toMs)) return;
     const field = (key: FieldKey) => numberAt(cells, columns.fields[key]);
     let pdop = field("pdop");
     let hdop = field("hdop");
@@ -131,12 +168,12 @@ export class SbsParser {
     // "no data", never a real fix.
     if ((nsats ?? 0) === 0 && (hdop ?? 0) === 0 && (pcalc ?? 0) === 0) {
       pdop = hdop = pcalc = nsats = ageS = null;
-      if (current === this.systems[0]) this.missingRawQcShots += 1;
+      current.missingRawQcShots = (current.missingRawQcShots ?? 0) + 1;
     }
     if (pdop === 0) pdop = null;
     current.shots.push({
       shot: numberAt(cells, columns.shot) ?? current.shots.length + 1,
-      timeMs: Math.round(seconds * 1000),
+      timeMs,
       crpE,
       crpN,
       antE: field("antE") ?? Number.NaN,
@@ -150,29 +187,134 @@ export class SbsParser {
     });
   }
 
+  /** The file as parsed, before merging; may hold no shots when a window is set. */
+  part(): SbsPart {
+    return { lineName: this.lineName, systems: this.systems.filter((system) => system.shots.length) };
+  }
+
   finish(): SbsDataset {
-    const populated = this.systems.filter((system) => system.shots.length);
+    return mergeSbs([this.part()]);
+  }
+}
+
+function sameValue(left: number | null, right: number | null): boolean {
+  if (left === null || right === null) return left === right;
+  return Math.abs(left - right) < 1e-9;
+}
+
+function sameShot(left: SbsShot, right: SbsShot): boolean {
+  return sameValue(left.crpE, right.crpE) && sameValue(left.crpN, right.crpN) && sameValue(left.nsats, right.nsats) && sameValue(left.hdop, right.hdop) && sameValue(left.pcalc, right.pcalc) && sameValue(left.ageS, right.ageS);
+}
+
+const RAW_LABELS: Array<[keyof SbsShot, string]> = [["pdop", "PDOP"], ["hdop", "HDOP"], ["pcalc", "PCALC"], ["nsats", "NSats"], ["ageS", "Age Correction"]];
+
+/**
+ * Combines Gator files into one dataset. Pages are matched by Gator system id
+ * (a split export, or a page repeated inside one file, becomes one system),
+ * shots are put in time order, and a shot repeated for the same system and
+ * time (overlapping files) is kept once: the first file's copy wins.
+ */
+export class SbsMerger {
+  private readonly byId = new Map<string, SbsSystem>();
+  private readonly files: SbsFileStats[] = [];
+  private readonly lineNames: string[] = [];
+
+  add(part: SbsPart): void {
+    const perId = new Map<string, number>();
+    let startMs = Number.POSITIVE_INFINITY;
+    let endMs = Number.NEGATIVE_INFINITY;
+    for (const system of part.systems) {
+      if (!system.shots.length) continue;
+      perId.set(system.id, (perId.get(system.id) ?? 0) + system.shots.length);
+      for (const shot of system.shots) {
+        if (shot.timeMs < startMs) startMs = shot.timeMs;
+        if (shot.timeMs > endMs) endMs = shot.timeMs;
+      }
+      const target = this.byId.get(system.id);
+      if (!target) {
+        this.byId.set(system.id, { id: system.id, page: system.page, shots: system.shots, absentFields: [], missingRawQcShots: system.missingRawQcShots ?? 0 });
+        continue;
+      }
+      for (const shot of system.shots) target.shots.push(shot);
+      target.missingRawQcShots = (target.missingRawQcShots ?? 0) + (system.missingRawQcShots ?? 0);
+    }
+    const epochs = Math.max(0, ...perId.values());
+    this.files.push({ lineName: part.lineName, startMs: epochs ? startMs : Number.NaN, endMs: epochs ? endMs : Number.NaN, epochs });
+    if (part.lineName && !this.lineNames.includes(part.lineName)) this.lineNames.push(part.lineName);
+  }
+
+  finish(): SbsDataset {
+    const populated = [...this.byId.values()].filter((system) => system.shots.length);
     if (!populated.length) throw new SbsParseError("No DGNSS pages with shots were found");
+    let duplicateShots = 0;
+    let conflictingShots = 0;
+    let total = 0;
     for (const system of populated) {
+      // Stable sort: equal times keep input order, so the first file's shot is kept.
       system.shots.sort((left, right) => left.timeMs - right.timeMs);
-      const fields: Array<[keyof SbsShot, string]> = [["pdop", "PDOP"], ["hdop", "HDOP"], ["pcalc", "PCALC"], ["nsats", "NSats"], ["ageS", "Age Correction"]];
-      system.absentFields = fields.filter(([key]) => system.shots.every((shot) => shot[key] === null)).map(([, label]) => label);
+      let write = 0;
+      for (let read = 0; read < system.shots.length; read += 1) {
+        const shot = system.shots[read];
+        const kept = write > 0 ? system.shots[write - 1] : undefined;
+        if (kept && kept.timeMs === shot.timeMs) {
+          duplicateShots += 1;
+          if (!sameShot(kept, shot)) conflictingShots += 1;
+          continue;
+        }
+        system.shots[write] = shot;
+        write += 1;
+      }
+      system.shots.length = write;
+      total += write;
+      system.absentFields = RAW_LABELS.filter(([key]) => system.shots.every((shot) => shot[key] === null)).map(([, label]) => label);
     }
     const startMs = Math.min(...populated.map((system) => system.shots[0].timeMs));
     const endMs = Math.max(...populated.map((system) => system.shots.at(-1)!.timeMs));
     const steps = new Map<number, number>();
-    const reference = populated[0].shots;
-    for (let index = 1; index < reference.length; index += 1) {
-      const step = Math.round((reference[index].timeMs - reference[index - 1].timeMs) / 100) * 100;
-      steps.set(step, (steps.get(step) ?? 0) + 1);
+    const reference = populated[0];
+    for (let index = 1; index < reference.shots.length; index += 1) {
+      const step = Math.round((reference.shots[index].timeMs - reference.shots[index - 1].timeMs) / 100) * 100;
+      if (step > 0) steps.set(step, (steps.get(step) ?? 0) + 1);
     }
     const intervalMs = [...steps.entries()].sort((left, right) => right[1] - left[1])[0]?.[0] ?? 1000;
-    return { lineName: this.lineName, systems: populated, startMs, endMs, intervalMs, shotCount: reference.length, missingRawQcShots: this.missingRawQcShots };
+
+    // Coverage over every system's shot times.
+    const times = new Float64Array(total);
+    let offset = 0;
+    for (const system of populated) for (const shot of system.shots) times[offset++] = shot.timeMs;
+    times.sort();
+    const coverage: Array<[number, number]> = [];
+    for (const time of times) {
+      const last = coverage.at(-1);
+      if (last && time - (last[1] - intervalMs) <= intervalMs * 3) last[1] = Math.max(last[1], time + intervalMs);
+      else coverage.push([time, time + intervalMs]);
+    }
+
+    return {
+      lineName: this.lineNames.join(", "),
+      lineNames: [...this.lineNames],
+      systems: populated,
+      startMs,
+      endMs,
+      intervalMs,
+      shotCount: reference.shots.length,
+      missingRawQcShots: reference.missingRawQcShots ?? 0,
+      coverage,
+      duplicateShots,
+      conflictingShots,
+      files: this.files,
+    };
   }
 }
 
-export function parseSbs(text: string): SbsDataset {
-  const parser = new SbsParser();
+export function mergeSbs(parts: SbsPart[]): SbsDataset {
+  const merger = new SbsMerger();
+  for (const part of parts) merger.add(part);
+  return merger.finish();
+}
+
+export function parseSbs(text: string, window?: SbsParseWindow): SbsDataset {
+  const parser = new SbsParser(window);
   let start = 0;
   while (start < text.length) {
     let end = text.indexOf("\n", start);
@@ -183,14 +325,32 @@ export function parseSbs(text: string): SbsDataset {
   return parser.finish();
 }
 
-/** Streams an SBS file from disk. */
-export async function parseSbsFile(file: string): Promise<SbsDataset> {
+async function parsePart(file: string, window?: SbsParseWindow): Promise<SbsPart> {
   const { createReadStream } = await import("node:fs");
   const { createInterface } = await import("node:readline");
-  const parser = new SbsParser();
+  const parser = new SbsParser(window);
   const lines = createInterface({ input: createReadStream(file, { encoding: "utf8" }), crlfDelay: Infinity });
   for await (const line of lines) parser.line(line);
-  return parser.finish();
+  return parser.part();
+}
+
+/** Streams an SBS file from disk. */
+export async function parseSbsFile(file: string, window?: SbsParseWindow): Promise<SbsDataset> {
+  return mergeSbs([await parsePart(file, window)]);
+}
+
+/**
+ * Streams several SBS files (one at a time) into one dataset. Each file's
+ * shots are merged before the next file is read, so only the window's
+ * shots are ever held.
+ */
+export async function parseSbsFiles(files: string[], window?: SbsParseWindow, onFile?: (index: number) => void): Promise<SbsDataset> {
+  const merger = new SbsMerger();
+  for (const [index, file] of files.entries()) {
+    onFile?.(index);
+    merger.add(await parsePart(file, window));
+  }
+  return merger.finish();
 }
 
 export interface SbsSummary {

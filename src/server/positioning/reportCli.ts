@@ -2,26 +2,28 @@
  * Command-line DGNSS report (same pipeline as the web app), for testing and
  * for the mock-up:
  *
- *   npx tsx src/server/positioning/reportCli.ts --sbs <file.sbs> --config <dgnss.json> --out <dir>
- *     [--window sbs|utc-day|custom --start ISO --end ISO]
+ *   npx tsx src/server/positioning/reportCli.ts --sbs <file.sbs> [--sbs <more.sbs> ...] --config <dgnss.json> --out <dir>
+ *     [--window sbs|utc-day|custom --day YYYY-MM-DD --start ISO --end ISO]
  *     [--evidence-root <dir> | --rf-session <session dir> [--rf-shift] [--simulate-wideband]]
  *
+ * Several --sbs files are combined into one report (split Gator exports).
  * The config file is a DgnssConfig plus an "identity" block. --rf-shift and
  * --simulate-wideband mark the report as a mock-up.
  */
 import { createHash } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { parseArgs } from "node:util";
 import { validateDgnssConfig, type DgnssConfig, type DgnssWindowMode } from "../../shared/dgnss";
 import { buildDgnssReport } from "./pipeline";
 import { simulatedWideband } from "./rfEvidence";
-import { parseSbs } from "./sbs";
+import { parseSbsFiles } from "./sbs";
 import type { PositioningReportIdentity } from "./types";
 
 const { values } = parseArgs({
   options: {
-    sbs: { type: "string" },
+    sbs: { type: "string", multiple: true },
+    day: { type: "string" },
     config: { type: "string" },
     out: { type: "string" },
     window: { type: "string", default: "sbs" },
@@ -34,12 +36,17 @@ const { values } = parseArgs({
     "file-name": { type: "string" },
   },
 });
-if (!values.sbs || !values.config || !values.out) {
-  console.error("Usage: reportCli --sbs <file.sbs> --config <dgnss.json> --out <dir> [--window sbs|utc-day|custom --start ISO --end ISO] [--evidence-root <dir> | --rf-session <dir> [--rf-shift] [--simulate-wideband]]");
+if (!values.sbs?.length || !values.config || !values.out) {
+  console.error("Usage: reportCli --sbs <file.sbs> [--sbs <more.sbs> ...] --config <dgnss.json> --out <dir> [--window sbs|utc-day|custom --start ISO --end ISO] [--evidence-root <dir> | --rf-session <dir> [--rf-shift] [--simulate-wideband]]");
   process.exit(2);
 }
 
-const bytes = await readFile(values.sbs);
+const sbsPaths = values.sbs;
+const files: Array<{ name: string; bytes: number; sha256: string }> = [];
+for (const [index, file] of sbsPaths.entries()) {
+  const hash = createHash("sha256").update(await readFile(file)).digest("hex");
+  files.push({ name: index === 0 && values["file-name"] ? values["file-name"] : basename(file), bytes: (await stat(file)).size, sha256: hash });
+}
 const raw = JSON.parse(await readFile(values.config, "utf8")) as Record<string, unknown> & { identity?: PositioningReportIdentity };
 const checked = validateDgnssConfig(raw);
 if (!checked.config) {
@@ -47,7 +54,7 @@ if (!checked.config) {
   process.exit(2);
 }
 const config: DgnssConfig = { schemaVersion: 1, revision: 1, ...checked.config };
-const dataset = parseSbs(bytes.toString("utf8"));
+const dataset = await parseSbsFiles(sbsPaths);
 
 let rfStream: Parameters<typeof buildDgnssReport>[0]["rfStream"];
 let rfSourceNote: string | undefined;
@@ -71,10 +78,10 @@ if (values["rf-session"]) {
 
 const result = await buildDgnssReport({
   dataset,
-  file: { name: values["file-name"] ?? basename(values.sbs), bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") },
+  files,
   config,
   identity: raw.identity ?? { vesselName: "Vessel" },
-  window: { mode: values.window as DgnssWindowMode, start: values.start, end: values.end },
+  window: { mode: values.window as DgnssWindowMode, start: values.start, end: values.end, day: values.day },
   evidenceRoot: values["evidence-root"] ?? "/nonexistent",
   dataDomain: "field",
   rfStream,
@@ -84,7 +91,7 @@ const result = await buildDgnssReport({
 });
 process.stderr.write("\n");
 await mkdir(values.out, { recursive: true });
-const stem = `DGNSS-verification-${dataset.lineName.replace(/[^A-Za-z0-9.-]+/g, "_")}-${values.window}`;
+const stem = `DGNSS-verification-${(dataset.lineNames[0] ?? "line").replace(/[^A-Za-z0-9.-]+/g, "_")}-${values.window}`;
 await writeFile(join(values.out, `${stem}.html`), result.html);
 await writeFile(join(values.out, `${stem}.pdf`), result.pdf);
 console.log(JSON.stringify({ out: join(values.out, stem), status: result.status, verdict: result.verdict, facts: result.facts }, null, 2));

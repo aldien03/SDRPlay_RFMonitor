@@ -6,8 +6,15 @@ export function formatRange(startHz: number, endHz: number): string {
   return `${(startHz / 1_000_000).toFixed(startHz % 1_000_000 ? 3 : 0)} - ${(endHz / 1_000_000).toFixed(endHz % 1_000_000 ? 3 : 0)} MHz`;
 }
 
+/** "452.900–462.900 MHz": the en-dash style used in incident and replay views. */
+export function frequencyRangeLabel(startHz: number, endHz: number, decimals = 3): string {
+  return `${(startHz / 1_000_000).toFixed(decimals)}–${(endHz / 1_000_000).toFixed(decimals)} MHz`;
+}
+
 export function formatDuration(startedAt: string, endedAt = new Date().toISOString()): string {
-  const seconds = Math.max(0, Math.floor((Date.parse(endedAt) - Date.parse(startedAt)) / 1_000));
+  const elapsed = Date.parse(endedAt) - Date.parse(startedAt);
+  if (!Number.isFinite(elapsed)) return "–";
+  const seconds = Math.max(0, Math.floor(elapsed / 1_000));
   const minutes = Math.floor(seconds / 60);
   return `${String(minutes).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
 }
@@ -45,17 +52,27 @@ export function formatCompactPercent(value: number | undefined): string {
   return value === undefined || !Number.isFinite(value) ? "Not reported" : `${compactNumber(Math.max(0, value))}%`;
 }
 
+/** A record with a damaged timestamp shows a dash instead of stopping the display. */
+function validDate(timestamp: string): Date | undefined {
+  const date = new Date(timestamp);
+  return Number.isFinite(date.getTime()) ? date : undefined;
+}
+
 export function timeOnly(timestamp: string, timeZone = "UTC"): string {
+  const date = validDate(timestamp);
+  if (!date) return "–";
   return new Intl.DateTimeFormat(undefined, {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
     hour12: false,
     timeZone,
-  }).format(new Date(timestamp));
+  }).format(date);
 }
 
 export function dateTime(timestamp: string, timeZone = "UTC"): string {
+  const date = validDate(timestamp);
+  if (!date) return "–";
   return new Intl.DateTimeFormat(undefined, {
     year: "numeric",
     month: "short",
@@ -64,7 +81,7 @@ export function dateTime(timestamp: string, timeZone = "UTC"): string {
     minute: "2-digit",
     hour12: false,
     timeZone,
-  }).format(new Date(timestamp));
+  }).format(date);
 }
 
 export function timeZoneShort(timeZone: string, timestamp = new Date()): string {

@@ -10,7 +10,7 @@ import { writeFile } from "node:fs/promises";
 import path from "node:path";
 import { getHeapStatistics } from "node:v8";
 import { buildDgnssReport } from "./pipeline";
-import { parseSbsFile } from "./sbs";
+import { parseSbsFiles } from "./sbs";
 import type { DgnssWorkerInput, DgnssWorkerMessage } from "./workerProtocol";
 
 let cancelled = false;
@@ -26,12 +26,17 @@ const post = (message: DgnssWorkerMessage) => new Promise<void>((resolve) => {
 
 async function run(input: DgnssWorkerInput): Promise<void> {
   try {
+    // The parsed SBS is handed straight to the pipeline (no local reference), which releases it before drawing the PDF.
     const result = await buildDgnssReport({
-      dataset: await parseSbsFile(input.sbsPath),
-      file: input.file,
+      dataset: await parseSbsFiles(input.sbsPaths, { fromMs: input.resolvedWindow.startMs, toMs: input.resolvedWindow.endMs }, (index) => {
+        sampleHeap();
+        void post({ type: "stage", stage: input.sbsPaths.length > 1 ? `Reading SBS file ${index + 1} of ${input.sbsPaths.length}` : "Reading SBS", progress: 0.03 + (0.06 * index) / input.sbsPaths.length });
+      }),
+      files: input.files,
       config: input.config,
       identity: input.identity,
       window: input.window,
+      resolvedWindow: input.resolvedWindow,
       evidenceRoot: input.evidenceRoot,
       dataDomain: input.dataDomain,
       onStage: (stage, progress) => {

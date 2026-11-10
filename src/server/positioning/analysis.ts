@@ -8,6 +8,9 @@
  */
 import type { SbsDataset, SbsShot, SbsSystem } from "./sbs";
 import type { PositioningSystemConfig, PositioningThresholds, ReportWindow, RfEvidence, RfLane, RfLaneState } from "./types";
+import { alongCross, medianOf, referenceTrack, timingProfile, type OffsetSample, type TimingProfile, type TimingRule, type TimingStep, type TrackPoint } from "./underWay";
+
+export type { TimingProfile, TimingStep } from "./underWay";
 
 export interface AxisStats {
   mean: number;
@@ -25,7 +28,7 @@ export interface SpreadStats {
   n: number;
 }
 
-export type NavIndicator = "offset" | "sats" | "hdop" | "age" | "pcalc";
+export type NavIndicator = "offset" | "sats" | "hdop" | "age" | "pcalc" | "timing";
 
 export const INDICATOR_LABEL: Record<NavIndicator, string> = {
   offset: "CRP beyond agreement limit",
@@ -33,10 +36,14 @@ export const INDICATOR_LABEL: Record<NavIndicator, string> = {
   hdop: "HDOP raised",
   age: "Correction age raised",
   pcalc: "PCALC change",
+  timing: "Position timing step",
 };
 
 export interface DistanceStats {
-  /** Per shot: [timeMs, dE, dN] of this CRP minus the control CRP. */
+  /**
+   * Per shot: [timeMs, dE, dN] of this CRP minus the control CRP. Shots where
+   * either position is a timing step are left out (see `excludedTiming`).
+   */
   offsets: Array<[number, number, number]>;
   n: number;
   min: number;
@@ -44,7 +51,30 @@ export interface DistanceStats {
   mean: number;
   p95: number;
   withinLimit: number;
+  /** Shots left out because this system or the control took a timing step. */
+  excludedTiming: number;
+  /** Static and slow shots (2D comparison). */
+  static: { n: number; max: number; p95: number; samples: Array<[number, number]> };
+  /** The distance the agreement check uses: 2D static, across track under way. */
+  agreementMax: number;
+  agreementP95: number;
+  /** Under way: across track, and the steady along-track offset, to the control. */
+  underWay?: {
+    n: number;
+    crossMax: number;
+    crossP95: number;
+    /** Median along-track offset to the control (+ ahead). Steady lag or along-track lever-arm error. */
+    alongSteadyM: number;
+    alongP95: number;
+    /** [timeMs, along, cross] per shot under way (timing excursions included). */
+    samples: Array<[number, number, number]>;
+    /** Along-track timing relative to the control: steady, 95th percentile and largest, s. */
+    timing: TimingProfile;
+  };
 }
+
+/** A system's position timing under way, against the reference track built from all systems. */
+export type TimingSummary = TimingProfile;
 
 export interface EllipseStats {
   meanE: number;
@@ -85,6 +115,8 @@ export interface SystemAnalysis {
   absentFields: string[];
   /** Per shot, the indicators that tripped. */
   flags: Map<number, Set<NavIndicator>>;
+  /** Timing steps under way, against the reference track built from all systems. */
+  timing: TimingSummary;
 }
 
 export interface NavFlagRun {
@@ -104,7 +136,8 @@ export type EventKind =
   | "correction-link"
   | "single-solution"
   | "rf-only"
-  | "rf-no-nav-data";
+  | "rf-no-nav-data"
+  | "position-timing";
 
 export type EventLevel = "alert" | "check" | "info";
 
@@ -144,6 +177,20 @@ export interface MotionSummary {
   movingFraction: number;
   /** [timeMs, knots] of the mean CRP over ~30 s. */
   series: Array<[number, number]>;
+  /** Per-shot speed of the reference track; shots split into static (≤ movingKnots) and under way. */
+  shots: { static: KnotStats; underWay: KnotStats; all: KnotStats };
+  /** Speed from which offsets are split along/across track. */
+  alongTrackKnots: number;
+}
+
+export interface KnotStats {
+  n: number;
+  min: number;
+  max: number;
+  mean: number;
+  median: number;
+  fromMs?: number;
+  toMs?: number;
 }
 
 export interface PositioningAnalysis {
@@ -155,11 +202,15 @@ export interface PositioningAnalysis {
   times: number[];
   meanCrp: Array<[number, number, number]>;
   motion: MotionSummary;
-  positioningCoverage: { fromMs: number; toMs: number; fraction: number };
+  positioningCoverage: GatorCoverage;
   flagRuns: NavFlagRun[];
   events: CorrelatedEvent[];
   rf: RfEvidence;
   lanes: LaneSummary[];
+  /** Comparisons beyond the limit: static 2D, or under way across track or steady along track. */
+  agreementFailures: string[];
+  /** Shot positions of all systems together against the smooth reference track, under way. */
+  commonTiming?: TimingProfile;
   verdict: string;
   verdictLevel: EventLevel | "ok";
 }
@@ -203,10 +254,24 @@ function mode(values: number[]): number | undefined {
 
 // ---- windows and RF lanes -----------------------------------------------------
 
-export function resolveWindow(dataset: Pick<SbsDataset, "startMs" | "endMs" | "intervalMs">, mode: ReportWindow["mode"], custom?: { startMs: number; endMs: number }): ReportWindow {
+/** UTC midnight of the day holding `ms`. */
+export function utcDayStart(ms: number): number {
+  const day = new Date(ms);
+  return Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate());
+}
+
+/** "YYYY-MM-DD" of each UTC day touched by [startMs, endMs]. */
+export function utcDays(startMs: number, endMs: number): string[] {
+  const days: string[] = [];
+  for (let day = utcDayStart(startMs); day <= endMs && days.length < 31; day += 86_400_000) days.push(new Date(day).toISOString().slice(0, 10));
+  return days;
+}
+
+export function resolveWindow(dataset: Pick<SbsDataset, "startMs" | "endMs" | "intervalMs">, mode: ReportWindow["mode"], options: { custom?: { startMs: number; endMs: number }; day?: string } = {}): ReportWindow {
+  const custom = options.custom;
   if (mode === "utc-day") {
-    const day = new Date(dataset.startMs);
-    const startMs = Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), day.getUTCDate());
+    const chosen = options.day ? Date.parse(`${options.day}T00:00:00Z`) : Number.NaN;
+    const startMs = Number.isFinite(chosen) ? chosen : utcDayStart(dataset.startMs);
     return { mode, startMs, endMs: startMs + 86_400_000 };
   }
   if (mode === "custom" && custom) {
@@ -214,6 +279,45 @@ export function resolveWindow(dataset: Pick<SbsDataset, "startMs" | "endMs" | "i
     return { mode, startMs: custom.startMs, endMs };
   }
   return { mode: "sbs", startMs: dataset.startMs, endMs: dataset.endMs + dataset.intervalMs };
+}
+
+/** Where the window has Gator data, and where it has none. */
+export interface GatorCoverage {
+  /** First and last moment with data inside the window (window start when there is none). */
+  fromMs: number;
+  toMs: number;
+  /** Share of the window with data. */
+  fraction: number;
+  intervals: Array<[number, number]>;
+  /** Spans inside the window without data (before, between and after the intervals). */
+  missing: Array<[number, number]>;
+  /** Missing spans between two data intervals: a pause or a missing file. */
+  gaps: Array<[number, number]>;
+}
+
+export function gatorCoverage(dataset: Pick<SbsDataset, "startMs" | "endMs" | "intervalMs"> & { coverage?: Array<[number, number]> }, window: Pick<ReportWindow, "startMs" | "endMs">): GatorCoverage {
+  const spans = dataset.coverage?.length ? dataset.coverage : [[dataset.startMs, dataset.endMs + dataset.intervalMs] as [number, number]];
+  const intervals = spans
+    .map(([from, to]) => [Math.max(window.startMs, from), Math.min(window.endMs, to)] as [number, number])
+    .filter(([from, to]) => to > from);
+  const missing: Array<[number, number]> = [];
+  let cursor = window.startMs;
+  for (const [from, to] of intervals) {
+    if (from > cursor) missing.push([cursor, from]);
+    cursor = Math.max(cursor, to);
+  }
+  if (cursor < window.endMs) missing.push([cursor, window.endMs]);
+  const covered = intervals.reduce((sum, [from, to]) => sum + to - from, 0);
+  const fromMs = intervals[0]?.[0] ?? window.startMs;
+  const toMs = intervals.at(-1)?.[1] ?? window.startMs;
+  return {
+    fromMs,
+    toMs,
+    fraction: covered / Math.max(1, window.endMs - window.startMs),
+    intervals,
+    missing,
+    gaps: missing.filter(([from, to]) => from > fromMs && to < toMs),
+  };
 }
 
 function clipLane(lane: RfLane, window: ReportWindow): RfLane {
@@ -281,28 +385,118 @@ export function analysePositioning(input: {
     p95Knots: percentile(speeds, 0.95) || 0,
     movingFraction,
     series,
+    shots: { static: { n: 0, min: Number.NaN, max: Number.NaN, mean: Number.NaN, median: Number.NaN }, underWay: { n: 0, min: Number.NaN, max: Number.NaN, mean: Number.NaN, median: Number.NaN }, all: { n: 0, min: Number.NaN, max: Number.NaN, mean: Number.NaN, median: Number.NaN } },
+    alongTrackKnots: thresholds.alongTrackMinKnots,
   };
 
-  // Deltas against the control CRP. If most comparisons exceed the limit at the
-  // same shot, the control is the outlier and is flagged instead of them.
+  // Reference track: per-shot median of all systems, smoothed, with velocity.
+  // Under way, offsets are split along/across track against it.
+  const medianCrp: Array<[number, number, number]> = [];
+  for (const time of times) {
+    const shots = byTime.map((map) => map.get(time)).filter((shot): shot is SbsShot => Boolean(shot));
+    if (shots.length < Math.min(3, sbsSystems.length)) continue;
+    medianCrp.push([time, medianOf(shots.map((shot) => shot.crpE)), medianOf(shots.map((shot) => shot.crpN))]);
+  }
+  const reference = referenceTrack(medianCrp, dataset.intervalMs);
+  const limit = thresholds.agreementM;
+  const alongTrackKnots = Math.max(thresholds.movingKnots, thresholds.alongTrackMinKnots);
+  const trackAt = (time: number): TrackPoint | undefined => {
+    const point = reference.get(time);
+    return point && point.knots >= alongTrackKnots ? point : undefined;
+  };
+  // Excursions from 0.2 m (at most half the limit) are set aside from the 2D statistics and figures.
+  const timingRule: TimingRule = { minM: Math.min(0.2, limit / 2), maxCrossM: limit / 2, maxSeconds: thresholds.timingStepMaxS };
+  const underWaySamples = (positions: Array<{ timeMs: number; e: number; n: number }>): OffsetSample[] => positions.flatMap((position) => {
+    if (position.timeMs < window.startMs || position.timeMs >= window.endMs) return [];
+    const point = trackAt(position.timeMs);
+    if (!point) return [];
+    const { along, cross } = alongCross(position.e - point.e, position.n - point.n, point);
+    return Number.isFinite(along) ? [{ timeMs: position.timeMs, along, cross, knots: point.knots }] : [];
+  });
+
+  // Timing of each system, and of all systems together, against the reference track.
+  const timingById = new Map<string, TimingProfile>();
+  for (const system of sbsSystems) {
+    timingById.set(system.id, timingProfile(underWaySamples(system.shots.map((shot) => ({ timeMs: shot.timeMs, e: shot.crpE, n: shot.crpN }))), timingRule));
+  }
+  const commonSamples = underWaySamples(medianCrp.map(([timeMs, e, n]) => ({ timeMs, e, n })));
+  const commonTiming = commonSamples.length ? timingProfile(commonSamples, timingRule) : undefined;
+
+  // Each comparison against the control at the same shot. Static and slow
+  // shots compare in 2D. Under way, agreement is across track at every shot
+  // plus the steady along-track offset; shot-to-shot along-track excursions
+  // are timing and are set aside from the 2D statistics.
   const controlId = input.controlId && configById.has(input.controlId) ? input.controlId : sbsSystems[0].id;
   const controlShots = byTime[sbsSystems.findIndex((system) => system.id === controlId)];
   const comparisonCount = sbsSystems.length - 1;
-  const exceedAt = new Map<number, string[]>();
+  interface Pairing {
+    aligned: Array<[number, number, number]>;
+    excluded: number;
+    staticDistances: Array<[number, number]>;
+    underWay: Array<[number, number, number, number]>;
+    timing?: TimingProfile;
+    /** Shots beyond the limit (not timing). */
+    beyond: Set<number>;
+  }
+  const pairings = new Map<string, Pairing>();
   for (const system of sbsSystems) {
     if (system.id === controlId) continue;
+    const raw: Array<{ time: number; dE: number; dN: number; point?: TrackPoint }> = [];
     for (const shot of system.shots) {
+      if (shot.timeMs < window.startMs || shot.timeMs >= window.endMs) continue;
       const control = controlShots.get(shot.timeMs);
-      if (control && Math.hypot(shot.crpE - control.crpE, shot.crpN - control.crpN) > thresholds.agreementM) {
-        exceedAt.set(shot.timeMs, [...(exceedAt.get(shot.timeMs) ?? []), system.id]);
-      }
+      if (!control) continue;
+      raw.push({ time: shot.timeMs, dE: shot.crpE - control.crpE, dN: shot.crpN - control.crpN, point: trackAt(shot.timeMs) });
     }
+    const pairSamples: OffsetSample[] = raw.filter((entry) => entry.point)
+      .map((entry) => ({ timeMs: entry.time, ...alongCross(entry.dE, entry.dN, entry.point!), knots: entry.point!.knots }));
+    const timing = pairSamples.length ? timingProfile(pairSamples, timingRule) : undefined;
+    const timingShots = new Set(timing?.excursions.map((step) => step.timeMs));
+    const pairing: Pairing = { aligned: [], excluded: 0, staticDistances: [], underWay: [], timing, beyond: new Set() };
+    const steadyAlong = timing?.steadyAlong ?? 0;
+    for (const entry of raw) {
+      if (entry.point) {
+        const { along, cross } = alongCross(entry.dE, entry.dN, entry.point);
+        pairing.underWay.push([entry.time, along, cross, entry.point.knots]);
+        // Along-track excursions within the timing range are never position offsets.
+        const beyondTiming = Math.abs(along - steadyAlong) > thresholds.timingStepMaxS * entry.point.knots * 0.514444;
+        if (Math.abs(cross) > limit || Math.abs(steadyAlong) > limit || (beyondTiming && Math.abs(along) > limit)) pairing.beyond.add(entry.time);
+        if (timingShots.has(entry.time)) {
+          pairing.excluded += 1;
+          continue;
+        }
+      } else {
+        const distance = Math.hypot(entry.dE, entry.dN);
+        pairing.staticDistances.push([entry.time, distance]);
+        if (distance > limit) pairing.beyond.add(entry.time);
+      }
+      pairing.aligned.push([entry.time, entry.dE, entry.dN]);
+    }
+    pairings.set(system.id, pairing);
   }
+  // If most comparisons are beyond the limit at the same shot, the control is
+  // the outlier and is flagged instead of them.
+  const exceedAt = new Map<number, string[]>();
+  for (const [systemId, pairing] of pairings) for (const time of pairing.beyond) exceedAt.set(time, [...(exceedAt.get(time) ?? []), systemId]);
   const offsetFlagged = (systemId: string, time: number) => {
     const list = exceedAt.get(time) ?? [];
     const controlIsOutlier = comparisonCount >= 2 && list.length >= Math.ceil(comparisonCount / 2);
     return systemId === controlId ? controlIsOutlier : !controlIsOutlier && list.includes(systemId);
   };
+
+  const knotStats = (entries: Array<[number, number]>): KnotStats => {
+    const values = entries.map(([, knots]) => knots);
+    return values.length
+      ? { n: values.length, min: Math.min(...values), max: Math.max(...values), mean: values.reduce((sum, value) => sum + value, 0) / values.length, median: medianOf(values), fromMs: entries[0][0], toMs: entries.at(-1)![0] }
+      : { n: 0, min: Number.NaN, max: Number.NaN, mean: Number.NaN, median: Number.NaN };
+  };
+  const shotSpeeds = [...reference.entries()].filter(([time]) => time >= window.startMs && time < window.endMs).map(([time, point]) => [time, point.knots] as [number, number]);
+  motion.shots = {
+    static: knotStats(shotSpeeds.filter(([, knots]) => knots <= thresholds.movingKnots)),
+    underWay: knotStats(shotSpeeds.filter(([, knots]) => knots > thresholds.movingKnots)),
+    all: knotStats(shotSpeeds),
+  };
+  motion.alongTrackKnots = alongTrackKnots;
 
   const systems: SystemAnalysis[] = sbsSystems.map((system: SbsSystem) => {
     const config = configById.get(system.id)!;
@@ -310,14 +504,10 @@ export function analysePositioning(input: {
     const heights = shots.map((shot) => shot.antH).filter((value): value is number => value !== null);
     const height = heights.length ? axisStats(heights) : undefined;
     const isControl = system.id === controlId;
-    const offsets: Array<[number, number, number]> = [];
-    if (!isControl) {
-      for (const shot of shots) {
-        const control = controlShots.get(shot.timeMs);
-        if (control) offsets.push([shot.timeMs, shot.crpE - control.crpE, shot.crpN - control.crpN]);
-      }
-    }
+    const pairing = pairings.get(system.id);
+    const offsets = pairing?.aligned ?? [];
     const distances = offsets.map(([, dE, dN]) => Math.hypot(dE, dN));
+    const timing = timingById.get(system.id) ?? timingProfile([], timingRule);
     const pcalcValues = shots.map((shot) => shot.pcalc).filter((value): value is number => value !== null);
     const pcalcUsual = mode(pcalcValues);
     let pcalcChanges = 0;
@@ -346,6 +536,7 @@ export function analysePositioning(input: {
       set.add(indicator);
       flags.set(time, set);
     };
+    for (const step of timing.excursions) flag(step.timeMs, "timing");
     for (const shot of shots) {
       if (offsetFlagged(system.id, shot.timeMs)) flag(shot.timeMs, "offset");
       if (shot.nsats !== null && quality.sats) {
@@ -378,6 +569,28 @@ export function analysePositioning(input: {
             mean: distances.reduce((sum, value) => sum + value, 0) / Math.max(1, distances.length),
             p95: percentile(distances, 0.95),
             withinLimit: distances.length ? distances.filter((value) => value <= thresholds.agreementM).length / distances.length : Number.NaN,
+            excludedTiming: pairing?.excluded ?? 0,
+            static: {
+              n: pairing?.staticDistances.length ?? 0,
+              max: pairing?.staticDistances.length ? Math.max(...pairing.staticDistances.map(([, distance]) => distance)) : Number.NaN,
+              p95: percentile((pairing?.staticDistances ?? []).map(([, distance]) => distance), 0.95),
+              samples: pairing?.staticDistances ?? [],
+            },
+            ...(() => {
+              const agreement = [...(pairing?.staticDistances ?? []).map(([, distance]) => distance), ...(pairing?.underWay ?? []).map(([, , cross]) => Math.abs(cross))];
+              return { agreementMax: agreement.length ? Math.max(...agreement) : Number.NaN, agreementP95: percentile(agreement, 0.95) };
+            })(),
+            underWay: pairing?.underWay.length
+              ? {
+                  n: pairing.underWay.length,
+                  crossMax: Math.max(...pairing.underWay.map(([, , cross]) => Math.abs(cross))),
+                  crossP95: percentile(pairing.underWay.map(([, , cross]) => Math.abs(cross)), 0.95),
+                  alongSteadyM: medianOf(pairing.underWay.map(([, along]) => along)),
+                  alongP95: percentile(pairing.underWay.map(([, along]) => Math.abs(along)), 0.95),
+                  samples: pairing.underWay.map(([time, along, cross]) => [time, along, cross] as [number, number, number]),
+                  timing: pairing.timing ?? timingProfile([], timingRule),
+                }
+              : undefined,
           },
       ellipse: ellipseOf(
         motion.state === "static" ? shots.map((shot) => [shot.crpE, shot.crpN] as [number, number]) : offsets.map(([, dE, dN]) => [dE, dN] as [number, number]),
@@ -386,6 +599,7 @@ export function analysePositioning(input: {
       quality,
       absentFields: system.absentFields,
       flags,
+      timing,
     };
   });
 
@@ -424,12 +638,16 @@ export function analysePositioning(input: {
     };
   });
 
-  const coverageFrom = Math.max(window.startMs, dataset.startMs);
-  const coverageTo = Math.min(window.endMs, dataset.endMs + dataset.intervalMs);
-  const positioningCoverage = { fromMs: coverageFrom, toMs: coverageTo, fraction: Math.max(0, coverageTo - coverageFrom) / windowMs };
+  const positioningCoverage = gatorCoverage(dataset, window);
 
   const events = correlate({ systems, flagRuns, lanes, thresholds, positioningCoverage, systemConfigs: input.systems });
-  const exceeding = systems.filter((system) => (system.vsControl?.max ?? 0) > thresholds.agreementM).map((system) => system.id);
+  const exceeding = systems.filter((system) => {
+    const stats = system.vsControl;
+    if (!stats) return false;
+    return (stats.static.n > 0 && stats.static.max > limit)
+      || (stats.underWay !== undefined && (stats.underWay.crossMax > limit || Math.abs(stats.underWay.alongSteadyM) > limit));
+  }).map((system) => system.id);
+  const timingSystems = systems.filter((system) => system.timing.excursions.length).map((system) => system.id);
   let verdict: string;
   let verdictLevel: PositioningAnalysis["verdictLevel"];
   if (events.some((event) => event.kind === "rf-and-nav-common")) {
@@ -439,10 +657,21 @@ export function analysePositioning(input: {
     verdict = `${exceeding.join(", ")} exceeded ${limitText(thresholds.agreementM)} from control ${controlId}`;
     verdictLevel = "check";
   } else {
-    verdict = `All comparisons within ${limitText(thresholds.agreementM)} of control ${controlId}; no interference affected positioning`;
+    verdict = `All comparisons within ${limitText(thresholds.agreementM)} of control ${controlId}${timingSystems.length ? `; shot positions not time-aligned under way (${timingSystems.join(", ")})` : ""}; no interference affected positioning`;
     verdictLevel = events.some((event) => event.level === "check") ? "check" : "ok";
   }
-  return { controlId, dataset, window, thresholds, systems, times, meanCrp, motion, positioningCoverage, flagRuns, events, rf, lanes: laneSummaries, verdict, verdictLevel };
+  return { controlId, dataset, window, thresholds, systems, times, meanCrp, motion, positioningCoverage, flagRuns, events, rf, lanes: laneSummaries, agreementFailures: exceeding, commonTiming, verdict, verdictLevel };
+}
+
+/**
+ * The distance the agreement check uses, per shot: 2D while static, across
+ * track under way (along-track timing is reported separately).
+ */
+export function agreementDistances(system: Pick<SystemAnalysis, "vsControl">): Array<[number, number]> {
+  const stats = system.vsControl;
+  if (!stats) return [];
+  if (!stats.underWay) return stats.offsets.map(([time, dE, dN]) => [time, Math.hypot(dE, dN)]);
+  return [...stats.static.samples, ...stats.underWay.samples.map(([time, , cross]) => [time, Math.abs(cross)] as [number, number])].sort((left, right) => left[0] - right[0]);
 }
 
 /** 95% error ellipse from (E, N) pairs; undefined with fewer than three points. */
@@ -498,12 +727,13 @@ function correlate(input: {
   flagRuns: NavFlagRun[];
   lanes: RfLane[];
   thresholds: PositioningThresholds;
-  positioningCoverage: { fromMs: number; toMs: number };
+  positioningCoverage: GatorCoverage;
   systemConfigs: PositioningSystemConfig[];
 }): CorrelatedEvent[] {
   const joinMs = 60_000;
   const items: ClusterItem[] = [
-    ...input.flagRuns.map((run) => ({ fromMs: run.fromMs, toMs: run.toMs, run })),
+    // Timing steps are not degradation; they form their own events below.
+    ...input.flagRuns.filter((run) => run.indicator !== "timing").map((run) => ({ fromMs: run.fromMs, toMs: run.toMs, run })),
     ...input.lanes.flatMap((lane) => lane.intervals.filter((interval) => interval.state === "anomaly").map((interval) => ({ fromMs: interval.fromMs, toMs: interval.toMs, lane }))),
   ].sort((left, right) => left.fromMs - right.fromMs);
 
@@ -516,10 +746,10 @@ function correlate(input: {
   }
 
   const configs = input.systemConfigs;
-  const allGroups = [...new Set(configs.map((system) => system.antennaGroup))];
+  const allGroups = [...new Set(configs.map((system) => system.antenna))];
   const gnssLanes = input.lanes.filter((lane) => lane.service === "gnss");
 
-  return clusters.map((cluster, index) => {
+  const navEvents: Array<Omit<CorrelatedEvent, "id">> = clusters.map((cluster) => {
     const fromMs = Math.min(...cluster.map((item) => item.fromMs));
     const toMs = Math.max(...cluster.map((item) => item.toMs));
     const runs = cluster.flatMap((item) => (item.run ? [item.run] : []));
@@ -539,7 +769,7 @@ function correlate(input: {
     const indicators = [...new Set(runs.map((run) => INDICATOR_LABEL[run.indicator]))];
     const config = (id: string) => configs.find((system) => system.id === id)!;
     const hasNav = runs.length > 0;
-    const covered = overlapMs(fromMs, toMs, input.positioningCoverage.fromMs, input.positioningCoverage.toMs) > 0;
+    const covered = input.positioningCoverage.intervals.some(([from, to]) => overlapMs(fromMs, toMs, from, to) > 0);
     const rfShort = rfLanes.map((lane) => lane.shortLabel);
     const rfSentence = rfLanes.length ? ` RF anomaly on ${list(rfShort)} at the same time.` : " No RF anomaly.";
 
@@ -550,7 +780,7 @@ function correlate(input: {
     let action: string;
 
     if (degraded.length) {
-      const groups = [...new Set(degraded.map((id) => config(id).antennaGroup))];
+      const groups = [...new Set(degraded.map((id) => config(id).antenna))];
       const receivers = [...new Set(degraded.map((id) => config(id).receiver))];
       if (groups.length === allGroups.length && degraded.length >= Math.ceil(configs.length / 2)) {
         if (gnssAnomaly.length) {
@@ -628,6 +858,44 @@ function correlate(input: {
     }
 
     const evidence: CorrelatedEvent["evidence"] = hasNav && rfLanes.length ? "RF + navigation" : rfLanes.length ? "RF only" : "Navigation only";
-    return { id: `E${index + 1}`, fromMs, toMs, kind, level, title, evidence, systems: allNav, indicators, rfLanes: rfShort, rfCoverage: Math.max(0, rfCoverage), explanation, action };
+    return { fromMs, toMs, kind, level, title, evidence, systems: allNav, indicators, rfLanes: rfShort, rfCoverage: Math.max(0, rfCoverage), explanation, action };
   });
+
+  // Shot positions not time-aligned under way: one event per period, across all systems.
+  const timingRuns = input.flagRuns.filter((run) => run.indicator === "timing").sort((left, right) => left.fromMs - right.fromMs);
+  const timingClusters: NavFlagRun[][] = [];
+  for (const run of timingRuns) {
+    const last = timingClusters.at(-1);
+    if (last && run.fromMs <= Math.max(...last.map((entry) => entry.toMs)) + input.thresholds.mergeGapS * 1000) last.push(run);
+    else timingClusters.push([run]);
+  }
+  const timingEvents: Array<Omit<CorrelatedEvent, "id">> = timingClusters.map((cluster) => {
+    const fromMs = Math.min(...cluster.map((run) => run.fromMs));
+    const toMs = Math.max(...cluster.map((run) => run.toMs));
+    const counts = new Map<string, number>();
+    for (const run of cluster) counts.set(run.systemId, (counts.get(run.systemId) ?? 0) + run.shots);
+    const ranked = [...counts.entries()].sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]));
+    const steps = input.systems.flatMap((system) => system.timing.excursions.filter((step) => step.timeMs >= fromMs && step.timeMs < toMs));
+    const seconds = steps.map((step) => Math.abs(step.seconds)).sort((left, right) => left - right);
+    const typical = seconds.length ? `up to ${percentile(seconds, 0.95).toFixed(1)} s` : "–";
+    const largest = steps.reduce<TimingStep | undefined>((best, step) => (!best || Math.abs(step.alongM) > Math.abs(best.alongM) ? step : best), undefined);
+    return {
+      fromMs,
+      toMs,
+      kind: "position-timing" as const,
+      level: "check" as const,
+      title: "Shot positions not time-aligned under way",
+      evidence: "Navigation only" as const,
+      systems: ranked.map(([id]) => id).sort(),
+      indicators: [INDICATOR_LABEL.timing],
+      rfLanes: [],
+      rfCoverage: 0,
+      explanation: `Positions ${typical} of travel off the shot time along track (shots ≥ ${limitText(Math.min(0.2, input.thresholds.agreementM / 2))}: ${ranked.map(([id, count]) => `${id} ${count}`).join(", ")}${largest ? `; largest ${Math.abs(largest.alongM).toFixed(2)} m at ${largest.knots.toFixed(1)} kn` : ""}); across track normal. Not a position error.`,
+      action: "Check that Gator time-tags each position input and interpolates it to the shot time (receiver output rate, PPS/ZDA, latency).",
+    };
+  });
+
+  return [...navEvents, ...timingEvents]
+    .sort((left, right) => left.fromMs - right.fromMs || left.toMs - right.toMs)
+    .map((event, index) => ({ ...event, id: `E${index + 1}` }));
 }

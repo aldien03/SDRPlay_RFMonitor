@@ -31,6 +31,7 @@ import type {
   EvidenceArchiveEventPage,
   EvidenceArchiveHealth,
   EvidenceArchivePage,
+  RecentIncidentsPage,
   EvidenceSession,
   RecordingDeletionResult,
   FocusSession,
@@ -56,7 +57,7 @@ import type {
   SweepCycle,
   SweepSegment,
 } from "../shared/types";
-import { EvidenceStore, WRITER_ORDINARY_MAX_BYTES, WRITER_ORDINARY_MAX_ITEMS, type EvidenceInterruptionContext, type IncidentFigureReason, type IncidentReportContext } from "./evidenceStore";
+import { EvidenceStore, WRITER_ORDINARY_MAX_BYTES, WRITER_ORDINARY_MAX_ITEMS, type EvidenceInterruptionContext, type IncidentFigureReason, type IncidentLookupCache, type IncidentReportContext } from "./evidenceStore";
 import type { IncidentReportModel } from "./report/reportModel";
 import { IncidentFigureScheduler } from "./incidentFigureScheduler";
 import {
@@ -234,6 +235,9 @@ interface CompletedSweepState {
 
 const STITCHED_SWEEP_BIN_COUNT = 720;
 const MAX_EVENT_NOTES = 32;
+/** "To review" counts incidents from the last day; the recent list reads at most this many sessions. */
+const RECENT_REVIEW_WINDOW_MS = 24 * 3_600_000;
+const RECENT_MAX_SESSIONS = 48;
 const MAX_EVENT_NOTE_BYTES = 32 * 1024;
 
 export function reduceSpectrumBins(input: ArrayLike<number>, maxBins: number): Uint8Array {
@@ -502,6 +506,7 @@ export class MonitorService extends EventEmitter {
     if (this.storageReprobeTimer) clearTimeout(this.storageReprobeTimer);
     if (this.receiverHealthTimer) clearInterval(this.receiverHealthTimer);
     if (this.sessionContextTimer) clearTimeout(this.sessionContextTimer);
+    await this.endOpenIncidentsForStop();
     if (this.evidence.currentSession) await this.checkpointSessionContext("service-stopping").catch(() => undefined);
     for (const client of this.clients) client.close();
     await this.baselineStore?.close().catch(() => undefined);
@@ -512,6 +517,43 @@ export class MonitorService extends EventEmitter {
     }
     await this.domainLease?.release().catch(() => undefined);
     this.domainLease = undefined;
+  }
+
+  /**
+   * A stopping service can no longer watch its open incidents, so each one is
+   * ended in the record (as an unclean restart already does on the next start)
+   * instead of staying "Alert" in Evidence history for ever.
+   */
+  private async endOpenIncidentsForStop(): Promise<void> {
+    const open = [...this.activeEventsByTarget.values()].filter((event) => !event.syntheticExercise);
+    if (!open.length) return;
+    const stoppedAt = new Date().toISOString();
+    for (const event of open) {
+      event.lifecycle = "ended-unknown";
+      event.endedAt = stoppedAt;
+      event.endReason = "RF Monitor stopped before the alert cleared";
+      this.addTimeline(event, "ended", stoppedAt, "RF Monitor stopped; RF after this time was not watched.");
+      if (this.evidenceHealthy && this.evidence.currentSession) await this.persistEvent({ ...event }).catch(() => undefined);
+    }
+    this.activeEventsByTarget.clear();
+    this.refreshActiveEvent();
+  }
+
+  /** True while this process still follows the incident. */
+  private isTrackedEvent(eventId: string): boolean {
+    return this.events.some((event) => event.id === eventId) || [...this.activeEventsByTarget.values()].some((event) => event.id === eventId);
+  }
+
+  /**
+   * A stored record that still says Alert or Recovering for an incident this
+   * process no longer follows: the service stopped, was retuned or lost the
+   * final write before it cleared. It is shown as ended at its last
+   * observation. The evidence files are not changed.
+   */
+  private closeUntrackedRecord(event: DetectionEvent): DetectionEvent {
+    const open = (event.lifecycle === undefined || event.lifecycle === "active" || event.lifecycle === "recovering") && !event.clearedAt && !event.endedAt;
+    if (!open || event.syntheticExercise || this.isTrackedEvent(event.id)) return event;
+    return { ...event, lifecycle: "ended-unknown", endedAt: event.lastSeenAt, endReason: "RF Monitor restarted before it cleared; end is the last observation" };
   }
 
   getSnapshot(): MonitorSnapshot {
@@ -2212,7 +2254,7 @@ export class MonitorService extends EventEmitter {
 
   async acknowledgeEvent(eventId: string): Promise<DetectionEvent | undefined> {
     const event = this.events.find((candidate) => candidate.id === eventId);
-    if (!event) return undefined;
+    if (!event) return this.reviewStoredIncident(eventId, { type: "reviewed" });
     event.acknowledgedAt = new Date().toISOString();
     this.addTimeline(event, "acknowledged", event.acknowledgedAt, "Acknowledged by an operator.");
     if (this.activeEvent?.id === eventId) this.activeEvent = event;
@@ -2223,7 +2265,7 @@ export class MonitorService extends EventEmitter {
 
   async addNote(eventId: string, text: string): Promise<DetectionEvent | undefined> {
     const event = this.events.find((candidate) => candidate.id === eventId);
-    if (!event) return undefined;
+    if (!event) return this.reviewStoredIncident(eventId, { type: "note", text: text.trim() });
     const note = { id: randomUUID(), timestamp: new Date().toISOString(), text: text.trim() };
     if (!note.text) return event;
     if (event.notes.length >= MAX_EVENT_NOTES) throw new Error(`An incident can contain at most ${MAX_EVENT_NOTES} notes`);
@@ -2241,6 +2283,76 @@ export class MonitorService extends EventEmitter {
     }
     this.broadcastSnapshot();
     return event;
+  }
+
+  /**
+   * A note or "reviewed" mark on an incident from an earlier run. Its sessions
+   * are finalized and immutable, so the entry goes into the review log and is
+   * folded into every later read, report and package.
+   */
+  private async reviewStoredIncident(eventId: string, review: { type: "note" | "reviewed"; text?: string }): Promise<DetectionEvent | undefined> {
+    const stored = await this.evidence.findIncidentEvent(eventId).catch(() => undefined);
+    if (!stored || stored.syntheticExercise || stored.dataDomain !== this.config.dataDomain) return undefined;
+    const current = this.closeUntrackedRecord(await this.evidence.reviews.apply(stored));
+    if (review.type === "reviewed" && current.acknowledgedAt) return current;
+    if (review.type === "note") {
+      if (!review.text) return current;
+      if (current.notes.length >= MAX_EVENT_NOTES) throw new Error(`An incident can contain at most ${MAX_EVENT_NOTES} notes`);
+      const projected = current.notes.reduce((total, item) => total + Buffer.byteLength(item.text), 0) + Buffer.byteLength(review.text);
+      if (projected > MAX_EVENT_NOTE_BYTES) throw new Error("Incident notes have reached the 32 KiB resource bound");
+    }
+    const entry = await this.evidence.reviews.append(
+      { eventId: stored.id, sessionId: stored.sessionId, type: review.type, text: review.text },
+      async () => new Set((await this.evidence.listSessions()).map((session) => session.id)),
+    );
+    if (this.evidenceHealthy && this.evidence.currentSession) {
+      await this.evidence.recordOperationalAction({
+        type: review.type === "note" ? "incident-note-added" : "incident-reviewed",
+        eventId: stored.id,
+        reviewEntryId: entry.id,
+        storedIn: "incident-review-log",
+      }).catch(() => undefined);
+    }
+    const updated = this.closeUntrackedRecord(await this.evidence.reviews.apply(stored));
+    this.broadcastSnapshot();
+    return updated;
+  }
+
+  /**
+   * The newest incidents (live ones from this run included) and how many from
+   * the last 24 hours nobody has marked reviewed. Reads only as many sessions
+   * as it needs, newest first.
+   */
+  async getRecentIncidents(limit = 6): Promise<RecentIncidentsPage> {
+    const safeLimit = Math.max(1, Math.min(20, Math.floor(Number.isFinite(limit) ? limit : 6)));
+    const now = Date.now();
+    const sinceMs = now - RECENT_REVIEW_WINDOW_MS;
+    const currentSession = this.evidence.currentSession;
+    const stored = await this.evidence.listSessions();
+    const sessions = [
+      ...(currentSession ? [currentSession] : []),
+      ...stored.filter((session) => session.id !== currentSession?.id).sort((left, right) => right.startedAt.localeCompare(left.startedAt)),
+    ];
+    const cache: IncidentLookupCache = { events: new Map() };
+    const byId = new Map<string, DetectionEvent>();
+    let scanned = 0;
+    for (const session of sessions) {
+      const lastActivity = Date.parse(session.endedAt ?? session.finalizedAt ?? "") || now;
+      if (scanned >= RECENT_MAX_SESSIONS || (byId.size >= safeLimit && lastActivity < sinceMs)) break;
+      scanned += 1;
+      const events = await this.archivedEventsForSession(session.id, cache).catch(() => []);
+      for (const event of events) if (!byId.has(event.id)) byId.set(event.id, event);
+    }
+    for (const event of this.events) byId.set(event.id, structuredClone(event));
+    const all = [...byId.values()].sort((left, right) => right.startedAt.localeCompare(left.startedAt));
+    const toReview = all.filter((event) => !event.syntheticExercise && !event.acknowledgedAt && Date.parse(event.startedAt) >= sinceMs).length;
+    return {
+      generatedAt: new Date(now).toISOString(),
+      incidents: all.slice(0, safeLimit),
+      toReview,
+      reviewWindowHours: RECENT_REVIEW_WINDOW_MS / 3_600_000,
+      liveIds: this.events.map((event) => event.id),
+    };
   }
 
   async exportIncident(eventId: string, sessionId?: string, immutableExportId?: string, requester?: string): Promise<string | string[] | undefined> {
@@ -2281,9 +2393,16 @@ export class MonitorService extends EventEmitter {
     }
   }
 
-  private async archivedEventsForSession(sessionId: string): Promise<DetectionEvent[]> {
+  private async archivedEventsForSession(sessionId: string, cache: IncidentLookupCache = { events: new Map() }): Promise<DetectionEvent[]> {
     const persisted = await this.evidence.listSessionEvents(sessionId);
-    const latestById = new Map(persisted.map((event) => [event.id, event]));
+    const latestById = new Map<string, DetectionEvent>();
+    for (const event of persisted) {
+      const open = (event.lifecycle === undefined || event.lifecycle === "active" || event.lifecycle === "recovering") && !event.clearedAt && !event.endedAt;
+      // An open copy may be out of date: the incident can have continued and cleared in a later session.
+      const latest = open && !this.isTrackedEvent(event.id) ? (await this.evidence.findIncidentEvent(event.id, sessionId, cache).catch(() => undefined)) ?? event : event;
+      latestById.set(event.id, this.closeUntrackedRecord(latest));
+    }
+    for (const reviewed of await this.evidence.reviews.applyAll([...latestById.values()])) latestById.set(reviewed.id, reviewed);
     for (const event of this.events) {
       if ((event.sessionIds ?? [event.sessionId]).includes(sessionId)) latestById.set(event.id, event);
     }
@@ -2309,8 +2428,9 @@ export class MonitorService extends EventEmitter {
     const safeOffset = sessionPage.offset;
     const safeLimit = sessionPage.limit;
     const pageSessions = sessions.slice(safeOffset, safeOffset + safeLimit);
+    const cache: IncidentLookupCache = { events: new Map() };
     const archiveSessions = await Promise.all(pageSessions.map(async (session) => {
-      const events = await this.archivedEventsForSession(session.id);
+      const events = await this.archivedEventsForSession(session.id, cache);
       return {
         ...session,
         events: events.slice(eventPage.offset, eventPage.offset + eventPage.limit),
@@ -2551,7 +2671,8 @@ export class MonitorService extends EventEmitter {
   async getEvent(eventId: string, sessionId?: string): Promise<DetectionEvent | undefined> {
     const live = this.events.find((candidate) => candidate.id === eventId);
     if (live) return structuredClone(live);
-    return this.evidence.findIncidentEvent(eventId, sessionId);
+    const stored = await this.evidence.findIncidentEvent(eventId, sessionId);
+    return stored ? this.closeUntrackedRecord(await this.evidence.reviews.apply(stored)) : undefined;
   }
 
   async getTriggerSnapshot(eventId: string) {

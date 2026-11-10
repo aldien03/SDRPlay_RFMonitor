@@ -66,6 +66,15 @@ export interface TriggerBar {
   /** measured / threshold, for the bar fill (1 = exactly at the alert level). */
   fill: number;
   met: boolean;
+  /** "rule": a comparison that raised the alert (red when met). "context": shape of the signal, drawn neutral. */
+  emphasis: "rule" | "context";
+}
+
+/** Bar geometry: the alert-level marker moves left as the measurement goes further past it. */
+export function triggerBarScale(fill: number): { width: number; marker: number } {
+  const value = Number.isFinite(fill) ? Math.max(0, fill) : 0;
+  const scale = Math.min(4, Math.max(1.5, value * 1.25));
+  return { width: Math.max(3, Math.min(100, (value / scale) * 100)), marker: 100 / scale };
 }
 
 function comparison(trigger: AlertTrigger, rule: AlertRuleComparison["rule"]): AlertRuleComparison | undefined {
@@ -84,25 +93,28 @@ export function triggerBars(trigger: AlertTrigger): TriggerBar[] {
   const kind = trigger.detailKind;
   if (kind === "narrowband") {
     const rule = comparison(trigger, "narrowband");
-    if (rule) bars.push({ id: "strength", label: "Strength above usual", measured: `${multiple(rule.measured)} normal variation`, limit: `alert at ${multiple(rule.threshold)}`, fill: rule.measured / rule.threshold, met: rule.met });
-    bars.push({ id: "width", label: "Width", measured: bandwidthLabel(trigger.measured.widestSegmentRatio * span || trigger.binWidthHz), limit: `narrow up to ${bandwidthLabel(values.narrowbandMaxWidthRatio * span)}`, fill: 1, met: true });
+    if (rule) bars.push({ id: "strength", label: "Strength above usual", measured: `${multiple(rule.measured)} normal variation`, limit: `alert at ${multiple(rule.threshold)}`, fill: rule.measured / rule.threshold, met: rule.met, emphasis: "rule" });
+    const widthHz = trigger.measured.widestSegmentRatio * span || trigger.binWidthHz;
+    const maxWidthHz = values.narrowbandMaxWidthRatio * span;
+    bars.push({ id: "width", label: "Width", measured: bandwidthLabel(widthHz), limit: `narrow up to ${bandwidthLabel(maxWidthHz)}`, fill: maxWidthHz > 0 ? widthHz / maxWidthHz : 0, met: widthHz <= maxWidthHz, emphasis: "context" });
   } else if (kind === "partial-band") {
     const rule = comparison(trigger, "partial-band");
-    if (rule) bars.push({ id: "strength", label: "Strength above usual", measured: `${multiple(rule.measured)} normal variation`, limit: `alert at ${multiple(rule.threshold)}`, fill: rule.measured / rule.threshold, met: rule.met });
-    bars.push({ id: "width", label: "Width", measured: bandwidthLabel(trigger.measured.widestSegmentRatio * span), limit: `wider than ${bandwidthLabel(values.narrowbandMaxWidthRatio * span)}`, fill: trigger.measured.widestSegmentRatio / Math.max(1e-6, values.narrowbandMaxWidthRatio), met: true });
+    if (rule) bars.push({ id: "strength", label: "Strength above usual", measured: `${multiple(rule.measured)} normal variation`, limit: `alert at ${multiple(rule.threshold)}`, fill: rule.measured / rule.threshold, met: rule.met, emphasis: "rule" });
+    bars.push({ id: "width", label: "Width", measured: bandwidthLabel(trigger.measured.widestSegmentRatio * span), limit: `wider than ${bandwidthLabel(values.narrowbandMaxWidthRatio * span)}`, fill: trigger.measured.widestSegmentRatio / Math.max(1e-6, values.narrowbandMaxWidthRatio), met: true, emphasis: "context" });
   } else if (kind === "wideband") {
     const rule = comparison(trigger, "wideband");
-    if (rule) bars.push({ id: "share", label: "Share of window raised", measured: ratioPercent(rule.measured), limit: `alert at ${ratioPercent(rule.threshold)}`, fill: rule.measured / rule.threshold, met: rule.met });
-    bars.push({ id: "strength", label: "Raised level", measured: `${multiple(trigger.measured.peakZ)} normal variation at peak`, limit: `counted from ${multiple(values.segmentSigma)}`, fill: trigger.measured.peakZ / values.segmentSigma, met: true });
+    if (rule) bars.push({ id: "share", label: "Share of window raised", measured: ratioPercent(rule.measured), limit: `alert at ${ratioPercent(rule.threshold)}`, fill: rule.measured / rule.threshold, met: rule.met, emphasis: "rule" });
+    bars.push({ id: "strength", label: "Raised level", measured: `${multiple(trigger.measured.peakZ)} normal variation at peak`, limit: `counted from ${multiple(values.segmentSigma)}`, fill: trigger.measured.peakZ / values.segmentSigma, met: true, emphasis: "context" });
   } else if (kind === "noise-floor") {
     const rule = comparison(trigger, "noise-floor");
-    if (rule) bars.push({ id: "floor", label: "Whole-window rise", measured: `${multiple(rule.measured)} normal variation`, limit: `alert at ${multiple(rule.threshold)}`, fill: rule.measured / rule.threshold, met: rule.met });
+    if (rule) bars.push({ id: "floor", label: "Whole-window rise", measured: `${multiple(rule.measured)} normal variation`, limit: `alert at ${multiple(rule.threshold)}`, fill: rule.measured / rule.threshold, met: rule.met, emphasis: "rule" });
   } else if (kind === "burst") {
     const rule = comparison(trigger, "burst");
-    if (rule) bars.push({ id: "burst", label: "Short-burst strength", measured: `${multiple(rule.measured)} normal variation`, limit: `alert at ${multiple(rule.threshold)}`, fill: rule.measured / rule.threshold, met: rule.met });
+    if (rule) bars.push({ id: "burst", label: "Short-burst strength", measured: `${multiple(rule.measured)} normal variation`, limit: `alert at ${multiple(rule.threshold)}`, fill: rule.measured / rule.threshold, met: rule.met, emphasis: "rule" });
   }
   if (kind === "noise-floor") {
-    bars.push({ id: "repeat", label: "Lasted", measured: `${Math.round(values.noiseFloorExposureMs / 1_000)} s observed`, limit: `needs ${Math.round(values.noiseFloorExposureMs / 1_000)} s`, fill: 1, met: true });
+    const observedMs = Math.max(trigger.persistence.exposureMs ?? 0, values.noiseFloorExposureMs);
+    bars.push({ id: "repeat", label: "Lasted", measured: `${Math.round(observedMs / 1_000)} s observed`, limit: `needs ${Math.round(values.noiseFloorExposureMs / 1_000)} s`, fill: values.noiseFloorExposureMs > 0 ? observedMs / values.noiseFloorExposureMs : 1, met: true, emphasis: "rule" });
   } else if (kind !== "overload") {
     bars.push({
       id: "repeat",
@@ -111,6 +123,7 @@ export function triggerBars(trigger: AlertTrigger): TriggerBar[] {
       limit: `needs ${trigger.persistence.required}`,
       fill: trigger.persistence.votes / Math.max(1, trigger.persistence.required),
       met: trigger.persistence.votes >= trigger.persistence.required,
+      emphasis: "rule",
     });
   }
   return bars;
@@ -171,4 +184,118 @@ export function incidentTimeline(event: DetectionEvent): IncidentTimelineEntry[]
   if (event.clearedAt) entries.push({ at: event.clearedAt, code: "cleared" });
   if (event.endedAt) entries.push({ at: event.endedAt, code: "ended", detail: event.endReason });
   return entries.sort((left, right) => Date.parse(left.at) - Date.parse(right.at));
+}
+
+/**
+ * Newest incidents for the Incidents drawer when nothing is active. This
+ * run's live records win over stored copies of the same incident.
+ */
+export function recentIncidents(live: readonly DetectionEvent[], stored: readonly DetectionEvent[], limit = 6): DetectionEvent[] {
+  const byId = new Map<string, DetectionEvent>();
+  for (const event of stored) if (!byId.has(event.id)) byId.set(event.id, event);
+  for (const event of live) byId.set(event.id, event);
+  return [...byId.values()]
+    .sort((left, right) => right.startedAt.localeCompare(left.startedAt))
+    .slice(0, limit);
+}
+
+/** When an incident stopped, or `now` while it is still open in this run. */
+export function incidentEndAt(event: Pick<DetectionEvent, "lifecycle" | "clearedAt" | "endedAt" | "lastSeenAt">, live: boolean, now = new Date().toISOString()): string {
+  if (event.clearedAt) return event.clearedAt;
+  if (event.endedAt) return event.endedAt;
+  return live && (event.lifecycle === "active" || event.lifecycle === "recovering") ? now : event.lastSeenAt;
+}
+
+/** One duration format for the drawer and the list: "Under 1 s", "42 s", "4 min 10 s", "2 h 05 min", "3 d 4 h". */
+export function shortDuration(fromIso: string, toIso: string): string {
+  const seconds = Math.floor((Date.parse(toIso) - Date.parse(fromIso)) / 1_000);
+  if (!Number.isFinite(seconds)) return "–";
+  if (seconds < 1) return "Under 1 s";
+  if (seconds < 60) return `${seconds} s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} min${seconds % 60 ? ` ${seconds % 60} s` : ""}`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} h ${String(minutes % 60).padStart(2, "0")} min`;
+  return `${Math.floor(hours / 24)} d ${hours % 24} h`;
+}
+
+function zonedParts(date: Date, timeZone: string): Record<string, string> {
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    year: "numeric", month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23", timeZone, timeZoneName: "short",
+  }).formatToParts(date);
+  return Object.fromEntries(parts.map((part) => [part.type, part.value]));
+}
+
+/**
+ * Control-room clock: "07:37:02 UTC", with the day when it is not today
+ * ("09 Nov 07:37:02 UTC") and the year when it is not this year.
+ */
+export function incidentClock(iso: string, timeZone = "UTC", now: Date = new Date()): string {
+  const date = new Date(iso);
+  if (!Number.isFinite(date.getTime())) return "–";
+  let parts: Record<string, string>;
+  let today: Record<string, string>;
+  try {
+    parts = zonedParts(date, timeZone);
+    today = zonedParts(now, timeZone);
+  } catch {
+    parts = zonedParts(date, "UTC");
+    today = zonedParts(now, "UTC");
+  }
+  const zone = parts.timeZoneName === "GMT" && timeZone === "UTC" ? "UTC" : parts.timeZoneName;
+  const clock = `${parts.hour}:${parts.minute}:${parts.second} ${zone}`;
+  if (parts.year === today.year && parts.month === today.month && parts.day === today.day) return clock;
+  return `${parts.day} ${parts.month}${parts.year === today.year ? "" : ` ${parts.year}`} ${clock}`;
+}
+
+/** The whole window that was checked, in the same style as the disturbed range. */
+export function checkedSpanLabel(event: Pick<DetectionEvent, "affectedRangeHz" | "trigger">): string {
+  const decimals = decimalsForResolution(event.trigger?.binWidthHz);
+  return `${mhz(event.affectedRangeHz[0], decimals)}–${mhz(event.affectedRangeHz[1], decimals)} MHz`;
+}
+
+const END_REASONS: Record<string, string> = {
+  "service-restart": "RF Monitor restarted before it cleared",
+  "Record not closed; end time is the last observation": "RF Monitor restarted before it cleared; end is the last observation",
+};
+
+/** Why an incident ended without clearing, in operator words (older records stored a code). */
+export function endReasonLabel(reason: string | undefined): string | undefined {
+  if (!reason) return undefined;
+  return END_REASONS[reason] ?? reason;
+}
+
+export interface IncidentActionCopy {
+  text: string;
+  tone: "alert" | "review" | "clear";
+  /** The action given while the alert was active, kept for reference once it has ended. */
+  during?: string;
+}
+
+/** What the operator should do now: the live action while open, a review step once it has ended. */
+export function incidentActionCopy(input: {
+  live: boolean;
+  status: IncidentStatusLabel;
+  synthetic: boolean;
+  acknowledgedAt?: string;
+  recommendedAction: string;
+  timeZone?: string;
+  now?: Date;
+}): IncidentActionCopy {
+  if (input.synthetic) return { text: input.live ? input.recommendedAction : "Test record. No action needed.", tone: input.live ? "alert" : "clear" };
+  if (input.live) return { text: input.recommendedAction, tone: "alert" };
+  const during = input.recommendedAction && input.recommendedAction !== "None" ? input.recommendedAction : undefined;
+  if (input.acknowledgedAt) return { text: `Reviewed ${incidentClock(input.acknowledgedAt, input.timeZone, input.now)}. No action needed.`, tone: "clear", during };
+  return { text: `${input.status === "Cleared" ? "Alert cleared" : "Alert ended"}. Add what you checked, then mark it reviewed.`, tone: "review", during };
+}
+
+/** Status for a list row: a stored copy that still says open has ended. */
+export function recentIncidentStatus(event: DetectionEvent, live: boolean): IncidentStatusLabel {
+  const open = (event.lifecycle === "active" || event.lifecycle === "recovering") && !event.clearedAt && !event.endedAt;
+  return !live && open ? "Ended" : incidentStatusLabel(event);
+}
+
+/** Field incidents not yet marked reviewed. Test records never need review. */
+export function needsReview(event: Pick<DetectionEvent, "acknowledgedAt" | "syntheticExercise">): boolean {
+  return !event.acknowledgedAt && !event.syntheticExercise;
 }

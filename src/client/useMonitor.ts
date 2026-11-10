@@ -13,7 +13,13 @@ import {
   type OperatorActionCode,
   type OperatorSummaryV1,
 } from "../shared/operatorSummary";
-import type { AlertPreview, BaselineDescriptor, DetectionEvent, ReportLogo, ChannelMonitorState, DataDomain, EvidenceArchiveEventPage, EvidenceArchivePage, EvidenceReplayBatch, FocusSession, LiveSubscription, MonitorSnapshot, MonitorStateDelta, OperationalSettings, RecordingDeletionResult, RecoveryOperationHealth, ServiceMessage, SettingsRevision, SignalMetricSample, SpectrumFrame, SyntheticExerciseState } from "../shared/types";
+import type { AlertPreview, BaselineDescriptor, DetectionEvent, ReportLogo, ChannelMonitorState, DataDomain, EvidenceArchiveEventPage, EvidenceArchivePage, EvidenceReplayBatch, FocusSession, RecentIncidentsPage, LiveSubscription, MonitorSnapshot, MonitorStateDelta, OperationalSettings, RecordingDeletionResult, RecoveryOperationHealth, ServiceMessage, SettingsRevision, SignalMetricSample, SpectrumFrame, SyntheticExerciseState } from "../shared/types";
+
+/** Replay one capture window only (an incident's). */
+export interface ReplayFocus {
+  targetId?: string;
+  bandId?: string;
+}
 
 const loadingGeneratedAt = new Date().toISOString();
 const emptySnapshot: MonitorSnapshot = {
@@ -1174,13 +1180,14 @@ export function useMonitor() {
     setSnapshot(next);
   }, []);
 
-  const acknowledge = useCallback(async (eventId: string) => {
-    await request(`/api/events/${eventId}/acknowledge`, { method: "POST", body: "{}" });
-  }, []);
+  /** Both return the updated record, so a stored incident shown in the drawer can refresh. */
+  const acknowledge = useCallback((eventId: string) => (
+    request<DetectionEvent>(`/api/events/${encodeURIComponent(eventId)}/acknowledge`, { method: "POST", body: "{}" })
+  ), []);
 
-  const addNote = useCallback(async (eventId: string, text: string) => {
-    await request(`/api/events/${eventId}/notes`, { method: "POST", body: JSON.stringify({ text }) });
-  }, []);
+  const addNote = useCallback((eventId: string, text: string) => (
+    request<DetectionEvent>(`/api/events/${encodeURIComponent(eventId)}/notes`, { method: "POST", body: JSON.stringify({ text }) })
+  ), []);
 
   const exportIncident = useCallback(async (eventId: string, sessionId?: string, event?: Pick<DetectionEvent, "id" | "startedAt" | "targetId" | "bandId">) => (
     queueExportDownload({ kind: "incident", eventId, sessionId }, `${event ? incidentPackageBaseName(event) : `rf-incident-${eventId}`}.zip`)
@@ -1208,13 +1215,20 @@ export function useMonitor() {
     request<EvidenceArchivePage>(`/api/evidence/archive?offset=${offset}&limit=${limit}`)
   ), []);
 
+  const getRecentIncidents = useCallback((limit = 6) => (
+    request<RecentIncidentsPage>(`/api/incidents/recent?limit=${limit}`)
+  ), []);
+
   const getEvidenceSessionEvents = useCallback((sessionId: string, offset = 0, limit = 20) => (
     request<EvidenceArchiveEventPage>(`/api/evidence/sessions/${encodeURIComponent(sessionId)}/events?offset=${offset}&limit=${limit}`)
   ), []);
 
-  const getEvidenceReplayBatch = useCallback((sessionId: string, cursor?: string, limit = 12) => {
+  const getEvidenceReplayBatch = useCallback((sessionId: string, cursor?: string, limit = 12, from?: string, focus?: ReplayFocus) => {
     const parameters = new URLSearchParams({ limit: String(limit) });
     if (cursor) parameters.set("cursor", cursor);
+    else if (from) parameters.set("from", from);
+    if (focus?.targetId) parameters.set("target", focus.targetId);
+    if (focus?.bandId) parameters.set("band", focus.bandId);
     return request<EvidenceReplayBatch>(`/api/evidence/sessions/${encodeURIComponent(sessionId)}/replay?${parameters}`);
   }, []);
 
@@ -1330,6 +1344,7 @@ export function useMonitor() {
     getEvidenceArchive,
     getEvidenceSessionEvents,
     getEvidenceReplayBatch,
+    getRecentIncidents,
     exportSession,
     getSettings,
     unlockSettings,

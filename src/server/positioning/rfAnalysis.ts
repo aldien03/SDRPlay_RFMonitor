@@ -8,7 +8,7 @@
  */
 import { waterfallRgb } from "../../shared/waterfallRaster";
 import { encodePng } from "../incidentFigure";
-import { percentile, type PositioningAnalysis } from "./analysis";
+import { agreementDistances, percentile, type PositioningAnalysis } from "./analysis";
 import type { RfFrame } from "./rfEvidence";
 import type { ReportWindow, RfEvidence, RfLane, RfLaneInterval } from "./types";
 
@@ -718,11 +718,12 @@ function pearson(x: number[], y: number[]): number | undefined {
 }
 
 export function groupSeries(analysis: PositioningAnalysis): GroupSeries[] {
-  const groups = [...new Set(analysis.systems.map((system) => system.config.antennaGroup))];
+  const groups = [...new Set(analysis.systems.map((system) => system.config.antenna))];
   const shotMaps = new Map(analysis.systems.map((system) => [system.id, new Map(system.shots.map((shot) => [shot.timeMs, shot]))]));
-  const offsetMaps = new Map(analysis.systems.map((system) => [system.id, new Map((system.vsControl?.offsets ?? []).map((offset) => [offset[0], offset]))]));
+  // Agreement distance (2D static, across track under way): along-track shot timing is not an RF effect.
+  const offsetMaps = new Map(analysis.systems.map((system) => [system.id, new Map(agreementDistances(system))]));
   return groups.map((group) => {
-    const members = analysis.systems.filter((system) => system.config.antennaGroup === group);
+    const members = analysis.systems.filter((system) => system.config.antenna === group);
     const series: GroupSeries = { group, satsLoss: [], hdop: [], range: [], age: [] };
     for (const time of analysis.times) {
       const losses: number[] = [];
@@ -735,8 +736,8 @@ export function groupSeries(analysis: PositioningAnalysis): GroupSeries[] {
         if (shot.nsats !== null && system.quality.sats?.median) losses.push(((system.quality.sats.median - shot.nsats) / system.quality.sats.median) * 100);
         if (shot.hdop !== null) hdops.push(shot.hdop);
         if (shot.ageS !== null) ages.push(shot.ageS);
-        const offset = offsetMaps.get(system.id)!.get(time);
-        if (offset) ranges.push(Math.hypot(offset[1], offset[2]));
+        const distance = offsetMaps.get(system.id)!.get(time);
+        if (distance !== undefined) ranges.push(distance);
       }
       series.satsLoss.push([time, losses.length ? percentile(losses, 0.5) : null]);
       series.hdop.push([time, hdops.length ? percentile(hdops, 0.5) : null]);
@@ -776,7 +777,7 @@ export function relateRfToNavigation(analysis: PositioningAnalysis, rf: { lanes:
       const ranges = values(entry.range, episode.fromMs, episode.toMs);
       return {
         group: entry.group,
-        systems: analysis.systems.filter((system) => system.config.antennaGroup === entry.group).map((system) => system.id),
+        systems: analysis.systems.filter((system) => system.config.antenna === entry.group).map((system) => system.id),
         satsLossPct: delta(entry.satsLoss),
         hdopRise: delta(entry.hdop),
         ageRiseS: delta(entry.age),

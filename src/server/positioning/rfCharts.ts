@@ -215,9 +215,9 @@ export function relationshipCharts(analysis: PositioningAnalysis, lane: RfLaneAn
   const rangeMax = niceCeil(Math.max(limit * 1.2, ...ranges.map((value) => value * 1.1)), 0.1);
   charts.push({
     id: "rel-range",
-    title: "2D range to control by antenna group (max)",
+    title: analysis.systems.some((system) => system.vsControl?.underWay) ? "Agreement distance to control by antenna group (max; 2D static, across track under way)" : "2D range to control by antenna group (max)",
     caption: "",
-    ariaLabel: "Largest 2D range to the control per antenna group over time.",
+    ariaLabel: "Largest distance to the control per antenna group over time.",
     width: WIDE,
     height: 170,
     x: timeAxis(analysis),

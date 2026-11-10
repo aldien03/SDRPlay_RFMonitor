@@ -10,9 +10,10 @@ interface HelpPageProps {
   onOpenRecording: () => void;
   onOpenEvidence: () => void;
   onOpenEngineer: () => void;
+  onOpenDgnss?: () => void;
 }
 
-export function HelpPage({ snapshot, onClose, onOpenHealth, onOpenRecording, onOpenEvidence, onOpenEngineer }: HelpPageProps) {
+export function HelpPage({ snapshot, onClose, onOpenHealth, onOpenRecording, onOpenEvidence, onOpenEngineer, onOpenDgnss }: HelpPageProps) {
   const operator = presentOperatorSummary(snapshot.operatorSummary);
   const release = snapshot.identity.release;
   return (
@@ -51,9 +52,10 @@ export function HelpPage({ snapshot, onClose, onOpenHealth, onOpenRecording, onO
             <li>Compare position, speed, heading and time with other bridge sources.</li>
             <li>Follow the vessel’s navigation procedure.</li>
             <li>Open the incident. Read Why this alert and the picture of what the detector saw.</li>
-            <li>Add a note with what you checked, then download the evidence package.</li>
+            <li>Add a note with what you checked, then download the evidence package. The actions stay at the bottom of the incident.</li>
+            <li>After an alert ends, select Incidents. Open each incident marked To review, add what you checked and select Mark reviewed. This works for incidents from earlier runs too.</li>
           </ol>
-          <p>An alert means repeated unusual RF energy. It does not confirm intent.</p>
+          <p>An alert means repeated unusual RF energy. It does not confirm intent. Select the picture at the alert to enlarge it, or Replay to play the recording from just before the alert.</p>
           <button type="button" onClick={onOpenEvidence}>Open evidence history</button>
         </section>
 
@@ -111,13 +113,13 @@ export function HelpPage({ snapshot, onClose, onOpenHealth, onOpenRecording, onO
         <section id="dgnss" className="help-task">
           <div><SatelliteDish size={20} aria-hidden="true" /><h2>Make a DGNSS report</h2></div>
           <ol>
-            <li>In Gator, export the DGPS QC pages as SBS (up to 24 h).</li>
-            <li>Open Evidence history, select DGNSS reports, and drop the .sbs file on the upload area.</li>
-            <li>Check the file summary and the RF recorded for its time span. Keep SBS span, or choose UTC day or Custom.</li>
+            <li>In Gator, export the DGPS QC pages as SBS. If Gator split the export into several files, keep them all.</li>
+            <li>Select DGNSS in the top bar and drop all the .sbs files on the upload area, or drop them anywhere on the dashboard. You can add more files afterwards.</li>
+            <li>Check the file list, the warnings about gaps or overlaps, and the RF recorded for the time span. Keep SBS span, or choose UTC day (and the day) or Custom, up to 24 h.</li>
             <li>Select Generate report. When it is ready, select Download PDF, Open HTML or Evidence package.</li>
           </ol>
-          <p>The report checks each DGNSS against the control system and the threshold, and relates satellite loss and position error to RF interference recorded by rf-monitor. Systems, control and threshold are set once in Settings, Site.</p>
-          <button type="button" onClick={onOpenEvidence}>Open Evidence history</button>
+          <p>The report checks each DGNSS against the control system and the threshold, and relates satellite loss and position error to RF interference recorded by rf-monitor. Systems, control and threshold are set once in Settings, Site. Previous reports stay under DGNSS reports, and also in Evidence history.</p>
+          <button type="button" onClick={onOpenDgnss ?? onOpenEvidence}>Open DGNSS reports</button>
         </section>
 
         <section id="learning" className="help-task">

@@ -2,15 +2,18 @@
 import type { DataDomain } from "../../shared/types";
 import type { DgnssConfig, DgnssStatus, DgnssWindowRequest } from "../../shared/dgnss";
 import type { PipelineResult } from "./pipeline";
-import type { PositioningReportIdentity } from "./types";
+import type { PositioningReportIdentity, ReportWindow } from "./types";
 
 export interface DgnssWorkerInput {
-  sbsPath: string;
+  /** SBS files in time order; parsed one at a time and merged. */
+  sbsPaths: string[];
   outDir: string;
-  file: { name: string; bytes: number; sha256: string };
+  files: Array<{ name: string; bytes: number; sha256: string }>;
   config: DgnssConfig;
   identity: PositioningReportIdentity;
   window: DgnssWindowRequest;
+  /** Resolved by the service from the upload scans; only shots inside it are parsed. */
+  resolvedWindow: ReportWindow;
   evidenceRoot: string;
   dataDomain: DataDomain;
 }

@@ -1054,6 +1054,17 @@ export interface EvidenceArchivePage {
   sessions: EvidenceArchiveSession[];
 }
 
+/** Incidents drawer shortcut: newest incidents and the count still to review. */
+export interface RecentIncidentsPage {
+  generatedAt: string;
+  incidents: DetectionEvent[];
+  /** Field incidents from the last `reviewWindowHours` not yet marked reviewed. */
+  toReview: number;
+  reviewWindowHours: number;
+  /** Incidents this process still follows (notes and review go to the live record). */
+  liveIds: string[];
+}
+
 export interface EvidenceArchiveEventPage {
   generatedAt: string;
   sessionId: string;

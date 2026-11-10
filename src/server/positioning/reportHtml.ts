@@ -21,7 +21,7 @@ h1{margin:0;font-size:24px;line-height:1.2}
 h2{margin:0 0 8px;font-size:17px}
 h3{margin:14px 0 5px;font-size:14px}
 table{width:100%;border-collapse:collapse;font-size:12px;margin:0 0 6px}
-th,td{border:1px solid #9aa5b1;padding:3px 6px;text-align:left;vertical-align:top}
+th,td{border:1px solid #9aa5b1;padding:3px 6px;text-align:left;vertical-align:top;overflow-wrap:anywhere}
 thead th{background:#d6e6f5;font-weight:700}
 td.r,th.r{text-align:right;white-space:nowrap}td.c,th.c{text-align:center}
 td.status{font-weight:700;text-align:center}

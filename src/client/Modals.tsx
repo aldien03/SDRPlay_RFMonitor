@@ -21,11 +21,21 @@ function ModalShell({ title, children, onClose }: ModalShellProps) {
 export function NoteModal({ onClose, onSave }: { onClose: () => void; onSave: (text: string) => Promise<void> }) {
   const [text, setText] = useState("");
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string>();
+  const save = () => {
+    setSaving(true);
+    setError(undefined);
+    // On failure the dialog stays open with the text, so nothing typed is lost.
+    void onSave(text)
+      .catch((reason) => setError(reason instanceof Error ? reason.message : "The note was not saved. Try again."))
+      .finally(() => setSaving(false));
+  };
   return (
     <ModalShell title="Add incident note" onClose={onClose}>
       <label className="field-label" htmlFor="incident-note">Operator note</label>
-      <textarea id="incident-note" autoFocus rows={6} maxLength={2_000} value={text} onChange={(event) => setText(event.target.value)} placeholder="Add checks, equipment status, or actions taken." />
-      <div className="modal-actions"><button className="button secondary" type="button" onClick={onClose}>Cancel</button><button className="button primary" type="button" disabled={!text.trim() || saving} onClick={() => { setSaving(true); void onSave(text).finally(() => setSaving(false)); }}>{saving ? "Saving..." : "Save note"}</button></div>
+      <textarea id="incident-note" data-autofocus rows={6} maxLength={2_000} value={text} onChange={(event) => setText(event.target.value)} placeholder="Add checks, equipment status, or actions taken." />
+      {error ? <p className="field-error" role="alert">{error}</p> : null}
+      <div className="modal-actions"><button className="button secondary" type="button" onClick={onClose}>Cancel</button><button className="button primary" type="button" disabled={!text.trim() || saving} onClick={save}>{saving ? "Saving..." : "Save note"}</button></div>
     </ModalShell>
   );
 }

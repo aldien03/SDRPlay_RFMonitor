@@ -66,6 +66,8 @@ interface SettingsPageProps {
   startFocus: (bandId: string, centerHz: number | undefined, durationMs: number) => Promise<unknown>;
   stopFocus: () => Promise<unknown>;
   renderSystemHealth?: (controls: { openTab: (tab: SettingsTab) => void }) => React.ReactNode;
+  /** Leave Settings for the DGNSS reports drawer. */
+  onOpenDgnssReports?: () => void;
 }
 
 export type MaintenanceAction = "clear-test-data" | "restart-learning" | "delete-recordings" | "restart-software";
@@ -550,7 +552,7 @@ export function SettingsPage(props: SettingsPageProps) {
                 {tab === "health" ? (props.renderSystemHealth?.({ openTab: setTab }) ?? <SystemHealthPlaceholder />) : null}
                 {tab === "recording" ? <EvidenceSettings draft={draft} setDraft={setDraft} response={response} errors={fieldErrors} disabled={!unlocked} dataDomain={props.snapshot.dataDomain} onMaintenance={openMaintenance} /> : null}
                 {tab === "learning" ? <SignalLearningSettings response={response} unlocked={unlocked} targetStates={props.snapshot.targetStates} onMaintenance={openMaintenance} onBaselineAction={async (action, baseline) => { if (action === "restart") setPendingBaselineRestart(baseline); else await updateBaseline(action, baseline); }} onOpenTab={setTab} /> : null}
-                {tab === "site" ? <SiteSettings draft={draft} setDraft={setDraft} response={response} errors={fieldErrors} disabled={!unlocked} uploadLogo={props.uploadReportLogo} onToast={props.onToast} /> : null}
+                {tab === "site" ? <SiteSettings draft={draft} setDraft={setDraft} response={response} errors={fieldErrors} disabled={!unlocked} uploadLogo={props.uploadReportLogo} onToast={props.onToast} onOpenDgnssReports={props.onOpenDgnssReports} /> : null}
                 {tab === "advanced" ? <AdvancedSettings response={response} draft={draft} setDraft={setDraft} errors={fieldErrors} unlocked={unlocked} onMaintenance={openMaintenance} /> : null}
               </div>
             </>
@@ -971,7 +973,7 @@ function StarTrackFrequencies({ band, values, error, disabled, onChange }: { ban
   );
 }
 
-function SiteSettings({ draft, setDraft, response, errors, disabled, uploadLogo, onToast }: { draft: OperationalSettings; setDraft: (value: OperationalSettings) => void; response: SettingsRevision; errors: Record<string, string>; disabled: boolean; uploadLogo?: (file: File) => Promise<ReportLogo>; onToast: (message: string) => void }) {
+function SiteSettings({ draft, setDraft, response, errors, disabled, uploadLogo, onToast, onOpenDgnssReports }: { draft: OperationalSettings; setDraft: (value: OperationalSettings) => void; response: SettingsRevision; errors: Record<string, string>; disabled: boolean; uploadLogo?: (file: File) => Promise<ReportLogo>; onToast: (message: string) => void; onOpenDgnssReports?: () => void }) {
   const update = <K extends keyof OperationalSettings>(key: K, value: OperationalSettings[K]) => setDraft({ ...draft, [key]: value });
   return (
     <section className="settings-section narrow-settings" aria-labelledby="site-settings-title">
@@ -982,7 +984,7 @@ function SiteSettings({ draft, setDraft, response, errors, disabled, uploadLogo,
       <label className="form-field"><span>Display time zone</span><select disabled={disabled} value={draft.displayTimeZone} onChange={(event) => update("displayTimeZone", event.target.value)}>{timeZones(draft.displayTimeZone).map((zone) => <option key={zone} value={zone}>{zone}</option>)}</select>{errors.displayTimeZone ? <FieldError text={errors.displayTimeZone} /> : null}</label>
       <div className="read-only-grid"><span>Evidence timestamp</span><strong>UTC ISO-8601</strong><span>Dashboard endpoint</span><strong>{location.origin}</strong><span>SDRconnect</span><strong>{response.infrastructure.receiverUrls.join(", ")}</strong></div>
       <ReportIdentitySection draft={draft} setDraft={setDraft} disabled={disabled} errors={errors} uploadLogo={uploadLogo} onToast={onToast} />
-      <DgnssSettings unlocked={!disabled} onToast={onToast} />
+      <DgnssSettings unlocked={!disabled} onToast={onToast} onOpenReports={onOpenDgnssReports} />
     </section>
   );
 }

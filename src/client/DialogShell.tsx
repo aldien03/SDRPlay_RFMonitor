@@ -66,7 +66,7 @@ export function DialogShell({
     host.style.zIndex = String(1_000 + dialogStack.length);
     document.body.append(host);
     const hiddenSiblings: HiddenSiblingState[] = Array.from(document.body.children)
-      .filter((candidate): candidate is HTMLElement => candidate instanceof HTMLElement && candidate !== host)
+      .filter((candidate): candidate is HTMLElement => candidate instanceof HTMLElement && candidate !== host && !candidate.hasAttribute("data-rf-toast-layer"))
       .map((element) => ({ element, inert: element.inert, ariaHidden: element.getAttribute("aria-hidden") }));
     for (const sibling of hiddenSiblings) {
       sibling.element.inert = true;
@@ -77,7 +77,7 @@ export function DialogShell({
     const dialog = dialogRef.current;
     const focusable = () => dialog ? Array.from(dialog.querySelectorAll<HTMLElement>(FOCUSABLE))
       .filter((element) => !element.hidden && element.getAttribute("aria-hidden") !== "true") : [];
-    const preferred = dialog?.querySelector<HTMLElement>("[autofocus]") ?? focusable()[0] ?? dialog;
+    const preferred = dialog?.querySelector<HTMLElement>("[autofocus], [data-autofocus]") ?? focusable()[0] ?? dialog;
     preferred?.focus();
 
     const onKeyDown = (event: KeyboardEvent) => {

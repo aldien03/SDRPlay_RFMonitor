@@ -135,7 +135,8 @@ export function alertPresetDefinitions(): AlertPresetDefinition[] {
 }
 
 export function alertPresetLabel(choice: AlertPolicyChoice): string {
-  return choice === "custom" ? "Custom" : PRESET_COPY[choice].label;
+  // A record written by a newer or older release may name a preset this one does not know.
+  return choice === "custom" ? "Custom" : PRESET_COPY[choice]?.label ?? "Custom";
 }
 
 export function alertPolicySetting(preset: AlertPresetId): AlertPolicySetting {

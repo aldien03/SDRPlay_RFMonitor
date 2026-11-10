@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { SatelliteDish } from "lucide-react";
 import type { DgnssConfig, DgnssSystemConfig } from "../shared/dgnss";
 import { DgnssApiError, getDgnssConfig, saveDgnssConfig } from "./dgnssApi";
 
@@ -9,17 +10,15 @@ const COLUMNS: Array<{ key: keyof DgnssSystemConfig; label: string; placeholder:
   { key: "output", label: "Fugro output", placeholder: "G4" },
   { key: "receiver", label: "Receiver", placeholder: "Starpack A" },
   { key: "antenna", label: "Antenna", placeholder: "Calian" },
-  { key: "antennaGroup", label: "Splitter group", placeholder: "Calian" },
   { key: "beam", label: "Beam", placeholder: "EASAT" },
-  { key: "ip", label: "IP", placeholder: ".60" },
 ];
 
 function blankSystem(index: number): DgnssSystemConfig {
-  return { id: `DGPS${index + 1}`, output: "", receiver: "", antenna: "", antennaGroup: "", beam: "", ip: "" };
+  return { id: `DGPS${index + 1}`, output: "", receiver: "", antenna: "", beam: "" };
 }
 
 /** Settings › Site › DGNSS report. Saved on its own, with the Settings password. */
-export function DgnssSettings({ unlocked, onToast }: { unlocked: boolean; onToast: (message: string) => void }) {
+export function DgnssSettings({ unlocked, onToast, onOpenReports }: { unlocked: boolean; onToast: (message: string) => void; onOpenReports?: () => void }) {
   const [draft, setDraft] = useState<Editable>();
   const [revision, setRevision] = useState(0);
   const [configured, setConfigured] = useState(false);
@@ -63,7 +62,7 @@ export function DgnssSettings({ unlocked, onToast }: { unlocked: boolean; onToas
     setError(undefined);
     setFields({});
     try {
-      const response = await saveDgnssConfig({ ...draft, systems: draft.systems.map((system) => ({ ...system, ip: system.ip || undefined })) }, revision);
+      const response = await saveDgnssConfig(draft, revision);
       setRevision(response.config.revision);
       setConfigured(true);
       setDirty(false);
@@ -78,8 +77,11 @@ export function DgnssSettings({ unlocked, onToast }: { unlocked: boolean; onToas
 
   return (
     <section className="dgnss-settings" aria-labelledby="dgnss-settings-title">
-      <h2 id="dgnss-settings-title" className="settings-subheading">DGNSS report</h2>
-      <p className="protected-action-hint">Systems, control and limits used for every DGNSS report. Gator ids must match the SBS page names (DGPS1_QC → DGPS1). Solutions on one splitter share a group.{configured ? "" : " Not saved yet: reports cannot be generated until this is saved."}</p>
+      <div className="dgnss-settings-heading">
+        <h2 id="dgnss-settings-title" className="settings-subheading">DGNSS report</h2>
+        {onOpenReports ? <button type="button" className="dgnss-link" onClick={onOpenReports}><SatelliteDish size={13} aria-hidden="true" />Make a DGNSS report</button> : null}
+      </div>
+      <p className="protected-action-hint">Systems, control and limits used for every DGNSS report. Gator ids must match the SBS page names (DGPS1_QC → DGPS1). Systems on one antenna use the same antenna name.{configured ? "" : " Not saved yet: reports cannot be generated until this is saved."}</p>
       <div className="dgnss-table-scroll">
         <table className="dgnss-systems">
           <thead><tr>{COLUMNS.map((column) => <th key={column.key} scope="col">{column.label}</th>)}<th scope="col">Control</th><th scope="col"><span className="sr-only">Remove</span></th></tr></thead>

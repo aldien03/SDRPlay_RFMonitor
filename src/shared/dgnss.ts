@@ -5,11 +5,9 @@ export interface DgnssSystemConfig {
   id: string;
   output: string;
   receiver: string;
+  /** Systems on one physical antenna use the same antenna name; the report groups them by it. */
   antenna: string;
-  /** Solutions on one splitter share a group. */
-  antennaGroup: string;
   beam: string;
-  ip?: string;
 }
 
 export interface DgnssConfig {
@@ -41,7 +39,14 @@ export interface DgnssWindowRequest {
   /** UTC ISO-8601, custom only. */
   start?: string;
   end?: string;
+  /** "YYYY-MM-DD", utc-day only; defaults to the first day with Gator data. */
+  day?: string;
 }
+
+/** Most SBS files one report can combine. */
+export const DGNSS_MAX_FILES = 20;
+/** Longest time span a set of SBS files may cover; the report window itself is at most 24 h. */
+export const DGNSS_MAX_SET_SPAN_MS = 7 * 86_400_000;
 
 export interface DgnssUploadPreview {
   uploadId: string;
@@ -67,6 +72,54 @@ export interface DgnssUploadPreview {
   warnings: string[];
 }
 
+/** One uploaded file, as listed in a set preview. */
+export interface DgnssSbsFile {
+  uploadId: string;
+  fileName: string;
+  bytes: number;
+  sha256: string;
+  lineName: string;
+  startMs: number;
+  endMs: number;
+  shotCount: number;
+  intervalMs: number;
+  systemsFound: string[];
+}
+
+/** Several uploaded SBS files checked together, before a report is generated. */
+export interface DgnssSetPreview {
+  /** In time order. */
+  uploadIds: string[];
+  files: DgnssSbsFile[];
+  bytes: number;
+  /** Distinct Gator line names, joined. */
+  lineName: string;
+  lineNames: string[];
+  startMs: number;
+  endMs: number;
+  intervalMs: number;
+  /** Sum over files; shots repeated in overlapping files are counted once in the report. */
+  shotCount: number;
+  systemsFound: string[];
+  missingSystems: string[];
+  unknownSystems: string[];
+  /** UTC days ("YYYY-MM-DD") with Gator data. */
+  days: string[];
+  /** The SBS span itself is at most 24 h and can be the report window. */
+  spanFitsDay: boolean;
+  /** Spans between files without Gator data. */
+  gaps: Array<[number, number]>;
+  /** Spans where two files hold the same system. */
+  overlaps: Array<[number, number]>;
+  windows: { sbs: [number, number]; utcDay: [number, number] };
+  rf: {
+    sessionCoverage: number;
+    sessions: number;
+    targets: Array<{ id: string; label: string }>;
+  };
+  warnings: string[];
+}
+
 export type DgnssStatus = "PASS" | "FAIL" | "ALERT" | "CHECK" | "INFO";
 export type DgnssJobState = "queued" | "running" | "ready" | "failed" | "cancelled";
 
@@ -78,9 +131,13 @@ export interface DgnssReportSummary {
   progress?: number;
   createdAt: string;
   finishedAt?: string;
+  /** File name, or "N SBS files". */
   fileName: string;
   lineName: string;
+  /** SHA-256 of the SBS file; for several files, of their sorted SHA-256 list. */
   sbsSha256: string;
+  /** Every input file (absent on reports made before multi-file support). */
+  sbsFiles?: Array<{ name: string; sha256: string; bytes: number }>;
   window: { mode: DgnssWindowMode; startMs: number; endMs: number };
   status?: DgnssStatus;
   verdict?: string;
@@ -148,9 +205,7 @@ export function validateDgnssConfig(input: unknown): { config?: Omit<DgnssConfig
       output: text(row.output, `systems.${index}.output`, fields, true) ?? "",
       receiver: text(row.receiver, `systems.${index}.receiver`, fields, true) ?? "",
       antenna: text(row.antenna, `systems.${index}.antenna`, fields, true) ?? "",
-      antennaGroup: text(row.antennaGroup, `systems.${index}.antennaGroup`, fields, true) ?? "",
       beam: text(row.beam, `systems.${index}.beam`, fields, true) ?? "",
-      ...(text(row.ip, `systems.${index}.ip`, fields) ? { ip: text(row.ip, `systems.${index}.ip`, fields) } : {}),
     };
   });
   const controlId = typeof raw.controlId === "string" ? raw.controlId : "";

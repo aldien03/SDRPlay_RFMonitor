@@ -1,8 +1,9 @@
 import { Copy, Download, Eye, FileText, FolderArchive, Pause, Play, RefreshCw, RotateCcw, X } from "lucide-react";
-import { disturbedSummary } from "./incidentPresentation";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { disturbedSummary, incidentClock } from "./incidentPresentation";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DetectionEvent, EvidenceArchiveEventPage, EvidenceArchivePage, EvidenceArchiveSession, EvidenceLifecycle, EvidenceReplayBatch, EvidenceReplayFrame, MonitorSnapshot, MonitorStatus, SignalMetricSample, SpectrumFrame } from "../shared/types";
-import { dateTime, formatBytes, formatDuration, formatRange, timeOnly } from "./format";
+import { dateTime, formatBytes, formatDuration, frequencyRangeLabel, timeOnly } from "./format";
+import type { ReplayFocus } from "./useMonitor";
 import { SpectrumView, WaterfallView } from "./SpectrumViews";
 
 export interface DisplayOptions {
@@ -76,18 +77,50 @@ function replayMetrics(frame: SpectrumFrame | undefined, supplied: SignalMetricS
   };
 }
 
-function EvidenceReplay({
+export interface ForwardReplayState {
+  lastMs: number;
+  ids: Set<string>;
+}
+
+/**
+ * An incident replay plays forward in time. The recording index is only
+ * roughly ordered: when an alert fires, its saved pre-alert history is written
+ * again or late. Frames already shown, and frames older than the last one
+ * shown, are skipped. `state` carries over between batches.
+ */
+export function forwardOnlyFrames(frames: readonly EvidenceReplayFrame[], state: ForwardReplayState): EvidenceReplayFrame[] {
+  const kept: EvidenceReplayFrame[] = [];
+  for (const entry of frames) {
+    const at = Date.parse(entry.frame.timestamp);
+    if (state.ids.has(entry.frame.id) || !Number.isFinite(at) || at < state.lastMs) continue;
+    if (state.ids.size >= 4_096) state.ids.clear();
+    state.ids.add(entry.frame.id);
+    state.lastMs = at;
+    kept.push(entry);
+  }
+  return kept;
+}
+
+export function EvidenceReplay({
   session,
   displayTimeZone,
   getBatch,
   signalLabel,
   onClose,
+  startAt,
+  focusTargetId,
+  focusBandId,
 }: {
-  session: EvidenceArchiveSession;
+  session: Pick<EvidenceArchiveSession, "id" | "lifecycle" | "incompleteReasons">;
   displayTimeZone: string;
-  getBatch: (sessionId: string, cursor?: string, limit?: number) => Promise<EvidenceReplayBatch>;
+  getBatch: (sessionId: string, cursor?: string, limit?: number, from?: string, focus?: ReplayFocus) => Promise<EvidenceReplayBatch>;
   signalLabel: (bandId: string) => string;
   onClose: () => void;
+  /** Start near this time instead of the beginning of the session (opened from an incident). */
+  startAt?: string;
+  /** Only this capture window's frames (opened from an incident). */
+  focusTargetId?: string;
+  focusBandId?: string;
 }) {
   const [entries, setEntries] = useState<EvidenceReplayFrame[]>([]);
   const [index, setIndex] = useState(0);
@@ -98,18 +131,29 @@ function EvidenceReplay({
   const [speed, setSpeed] = useState(4);
   const [error, setError] = useState<string>();
   const [history, setHistory] = useState<SpectrumFrame[]>([]);
+  const forward = useRef<ForwardReplayState>({ lastMs: Number.NEGATIVE_INFINITY, ids: new Set() });
 
   const load = useCallback(async (cursor?: string, restart = false): Promise<boolean> => {
     setLoading(true);
     setError(undefined);
     try {
-      const batch = await getBatch(session.id, cursor, REPLAY_BATCH_SIZE);
-      setEntries(batch.frames);
+      const focus = focusTargetId || focusBandId ? { targetId: focusTargetId, bandId: focusBandId } : undefined;
+      if (restart || !cursor) forward.current = { lastMs: Number.NEGATIVE_INFINITY, ids: new Set() };
+      const keep = (frames: EvidenceReplayFrame[]) => focus ? forwardOnlyFrames(frames, forward.current) : frames;
+      let batch = await getBatch(session.id, cursor, REPLAY_BATCH_SIZE, cursor ? undefined : startAt, focus);
+      let frames = keep(batch.frames);
+      // A window-only replay can meet a stretch of other windows' frames, or of
+      // frames it has already shown; read on a little.
+      for (let hop = 0; focus && !frames.length && batch.nextCursor && hop < 32; hop += 1) {
+        batch = await getBatch(session.id, batch.nextCursor, REPLAY_BATCH_SIZE, undefined, focus);
+        frames = keep(batch.frames);
+      }
+      setEntries(frames);
       setIndex(0);
       setNextCursor(batch.nextCursor);
       setDone(batch.done);
       if (restart) setHistory([]);
-      return batch.frames.length > 0;
+      return frames.length > 0;
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
       setEntries([]);
@@ -118,7 +162,7 @@ function EvidenceReplay({
     } finally {
       setLoading(false);
     }
-  }, [getBatch, session.id]);
+  }, [getBatch, session.id, startAt, focusTargetId, focusBandId]);
 
   useEffect(() => {
     let mounted = true;
@@ -189,9 +233,9 @@ function EvidenceReplay({
         <div className="evidence-replay-waterfall"><WaterfallView frames={history} /></div>
       </div>
       <dl className="evidence-replay-facts">
-        <div><dt>Observed</dt><dd>{frame ? dateTime(frame.timestamp, displayTimeZone) : loading ? "Loading" : "No saved observations"}</dd></div>
+        <div><dt>Observed</dt><dd>{frame ? incidentClock(frame.timestamp, displayTimeZone) : loading ? "Loading" : "No saved observations"}</dd></div>
         <div><dt>Signal</dt><dd>{frame ? signalLabel(frame.bandId) : "—"}</dd></div>
-        <div><dt>Range</dt><dd>{frame ? formatRange(frame.startHz, frame.endHz) : "—"}</dd></div>
+        <div><dt>Range</dt><dd>{frame ? frequencyRangeLabel(frame.startHz, frame.endHz) : "—"}</dd></div>
         <div><dt>Level</dt><dd>{metrics ? `${Math.round(metrics.peakLevel)} / 255 relative` : "—"}</dd></div>
       </dl>
       <div className="evidence-replay-controls">
@@ -202,6 +246,14 @@ function EvidenceReplay({
       </div>
     </section>
   );
+}
+
+/** Band name for a replayed frame; bands outside the current scan fall back to their service name. */
+export function replaySignalLabel(snapshot: Pick<MonitorSnapshot, "bands" | "monitorFeeds" | "services">, bandId: string): string {
+  return snapshot.bands.find((band) => band.id === bandId)?.label
+    ?? snapshot.monitorFeeds.find((feed) => feed.id === bandId)?.label
+    ?? snapshot.services.find((service) => bandId.startsWith(`${service.service}-`) || bandId === service.service)?.label
+    ?? bandId;
 }
 
 export function EvidenceArchive({
@@ -333,9 +385,7 @@ export function EvidenceArchive({
                   session={session}
                   displayTimeZone={snapshot.displayTimeZone}
                   getBatch={getReplayBatch}
-                  signalLabel={(bandId) => snapshot.bands.find((band) => band.id === bandId)?.label
-                    ?? snapshot.monitorFeeds.find((feed) => feed.id === bandId)?.label
-                    ?? bandId}
+                  signalLabel={(bandId) => replaySignalLabel(snapshot, bandId)}
                   onClose={() => setReplaySessionId(undefined)}
                 />
               ) : null}

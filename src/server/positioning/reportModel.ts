@@ -16,7 +16,7 @@ export interface ReportTable {
   statusColumn?: number;
 }
 
-export type TableId = "project" | "result" | "events" | "motion" | "systems" | "stats" | "control" | "quality" | "lanes" | "incidents" | "evidence" | "rfSummary" | "rfEpisodes" | "relationship";
+export type TableId = "project" | "result" | "events" | "motion" | "systems" | "stats" | "control" | "timing" | "quality" | "lanes" | "incidents" | "evidence" | "sources" | "rfSummary" | "rfEpisodes" | "relationship";
 
 export interface KeyItem {
   name: string;
@@ -56,6 +56,9 @@ export interface PositioningReportModel {
   charts: ChartSpec[];
 }
 
+/** Shot timing at or above this (s, 95th percentile) is reported as a CHECK. */
+const TIMING_NOTE_S = 0.2;
+
 const fixed = (value: number | undefined, decimals: number) => (value !== undefined && Number.isFinite(value) ? value.toFixed(decimals) : "–");
 const pct = (fraction: number) => (Number.isFinite(fraction) ? `${(fraction * 100).toFixed(fraction >= 0.999 || fraction === 0 ? 0 : 1)}` : "–");
 
@@ -75,7 +78,8 @@ function duration(ms: number): string {
 export function buildPositioningReportModel(input: {
   analysis: PositioningAnalysis;
   identity: PositioningReportIdentity;
-  file: { name: string; bytes: number; sha256: string };
+  /** Input SBS files, in parse order (dataset.files has the same order). */
+  files: Array<{ name: string; bytes: number; sha256: string }>;
   generatedAt: Date;
   /** Spectrum-level RF analysis; without it only RF lane states are reported. */
   rf?: { lanes: RfLaneAnalysis[]; episodes: RfEpisode[]; sourceText: string };
@@ -86,20 +90,64 @@ export function buildPositioningReportModel(input: {
   const limit = limitText(thresholds.agreementM);
   const control = systems.find((system) => system.isControl)!;
   const others = systems.filter((system) => !system.isControl);
-  const worst = others.reduce((best, system) => ((system.vsControl?.max ?? 0) > (best.vsControl?.max ?? 0) ? system : best), others[0]);
-  const worstMax = worst?.vsControl?.max ?? 0;
+  const largest = (pick: (stats: NonNullable<(typeof others)[number]["vsControl"]>) => number) => {
+    const candidates = others.filter((system) => system.vsControl && Number.isFinite(pick(system.vsControl)));
+    const best = candidates.reduce<(typeof others)[number] | undefined>((top, system) => (!top || pick(system.vsControl!) > pick(top.vsControl!) ? system : top), undefined);
+    return best ? { system: best, value: pick(best.vsControl!) } : undefined;
+  };
+  const staticWorst = largest((stats) => (stats.static.n ? stats.static.max : Number.NaN));
+  const staticP95 = Math.max(0, ...others.map((system) => (system.vsControl?.static.n ? system.vsControl.static.p95 : 0)));
+  const crossWorst = largest((stats) => stats.underWay?.crossMax ?? Number.NaN);
+  const steadyWorst = largest((stats) => (stats.underWay ? Math.abs(stats.underWay.alongSteadyM) : Number.NaN));
+  const underWay = others.some((system) => system.vsControl?.underWay);
+  const failures = analysis.agreementFailures;
   const label = motion.state === "static" ? "Static" : motion.state === "dynamic" ? "Dynamic" : "Mixed";
   const name = (system: (typeof systems)[number]) => `${system.config.receiver} · ${system.config.output}`;
+  const coverage = analysis.positioningCoverage;
+  const gapText = (list: Array<[number, number]>) => (list.length <= 3 ? list.map(([from, to]) => `${span(from, to)} UTC`).join(", ") : `${list.length} gaps, longest ${duration(Math.max(...list.map(([from, to]) => to - from)))}`);
+  const multiFile = input.files.length > 1;
+  const continuityIssues = [
+    coverage.gaps.length ? `No Gator data ${gapText(coverage.gaps)}` : undefined,
+    dataset.conflictingShots ? `${dataset.conflictingShots.toLocaleString("en-GB")} repeated shot(s) differ between files; first file used` : undefined,
+  ].filter((entry): entry is string => Boolean(entry));
+  const continuityRow: string[] | undefined = multiFile || coverage.gaps.length || dataset.duplicateShots
+    ? [
+        "Gator data continuity",
+        "No gaps",
+        [
+          multiFile ? `${input.files.length} SBS files combined` : undefined,
+          ...continuityIssues,
+          dataset.duplicateShots ? `${dataset.duplicateShots.toLocaleString("en-GB")} repeated shot(s) counted once` : undefined,
+        ].filter(Boolean).join("; ") || "No gaps",
+        continuityIssues.length ? "CHECK" : "INFO",
+      ]
+    : undefined;
 
   // ---- result checks ----------------------------------------------------------
   const interference = events.filter((event) => event.kind === "rf-and-nav-common");
   const commonNoRf = events.filter((event) => event.kind === "nav-common-no-rf" || event.kind === "nav-common-rf-unknown");
   const chainEvents = events.filter((event) => ["antenna-group", "single-receiver", "single-solution", "correction-link"].includes(event.kind));
+  const timingEvents = events.filter((event) => event.kind === "position-timing");
+  // Shot timing under way: all systems against the smooth track, and each against the control.
+  const common = analysis.commonTiming;
+  const underWaySpeed = motion.shots.underWay.median;
+  const timingNotable = (seconds: number | undefined) => seconds !== undefined && Number.isFinite(seconds) && seconds >= TIMING_NOTE_S;
+  const relative = others.filter((system) => timingNotable(system.vsControl?.underWay?.timing.p95Seconds));
+  const relativeMax = Math.max(0, ...relative.map((system) => system.vsControl!.underWay!.timing.p95Seconds));
+  const timingCheck = timingNotable(common?.p95Seconds) || relative.length > 0;
+  const timingText = [
+    common && Number.isFinite(common.p95Seconds) ? `All systems up to ${common.p95Seconds.toFixed(1)} s off the shot time (${metres(common.p95Seconds * underWaySpeed * 0.514444)} at ${underWaySpeed.toFixed(1)} kn)` : undefined,
+    relative.length ? `${relative.map((system) => system.id).join(", ")} up to ${relativeMax.toFixed(1)} s from ${control.id}` : `All within ${TIMING_NOTE_S} s of ${control.id}`,
+    "across track unaffected",
+  ].filter(Boolean).join("; ");
   const rfEpisodes = analysis.lanes.flatMap((summary) => summary.lane.intervals.filter((interval) => interval.state === "anomaly").map((interval) => ({ lane: summary.lane, ...interval })));
   const rfLanesHit = [...new Set(rfEpisodes.map((episode) => episode.lane.shortLabel))];
   const gnssCoverage = Math.min(...analysis.lanes.filter((summary) => summary.lane.service === "gnss").map((summary) => summary.monitoredFraction));
   /** "E1" / "E1, E4" / "E1–E35 (35)" so long days stay readable. */
-  const ids = (list: typeof events) => (list.length <= 3 ? list.map((event) => event.id).join(", ") : `${list[0].id}–${list.at(-1)!.id} (${list.length})`);
+  const ids = (input: typeof events) => {
+    const list = [...input].sort((left, right) => Number(left.id.slice(1)) - Number(right.id.slice(1)));
+    return list.length <= 3 ? list.map((event) => event.id).join(", ") : `${list[0].id}–${list.at(-1)!.id} (${list.length})`;
+  };
   /** Same findings grouped: "PCALC changes on DGPS4 only ×35 (E1–E35 (35))". */
   const grouped = (list: typeof events) => [...new Map(list.map((event) => [event.title, list.filter((other) => other.title === event.title)])).entries()]
     .map(([title, group]) => (group.length > 1 ? `${title} ×${group.length} (${ids(group)})` : `${group[0].id} ${title}`))
@@ -120,14 +168,26 @@ export function buildPositioningReportModel(input: {
     columns: [{ title: "Check", width: 25 }, { title: "Criterion", width: 18 }, { title: "Result", width: 45 }, { title: "Status", width: 12, align: "center" }],
     statusColumn: 3,
     rows: [
-      ["CRP agreement with control", `≤ ${limit} from ${control.id}`, worst ? `Max ${metres(worstMax)} (${worst.id}); 95% ≤ ${metres(Math.max(...others.map((system) => system.vsControl?.p95 ?? 0)))}` : "–", worstMax <= thresholds.agreementM ? "PASS" : "FAIL"],
+      ...(underWay
+        ? [
+            ...(staticWorst ? [["CRP agreement, static", `≤ ${limit} from ${control.id} (below ${motion.alongTrackKnots} kn)`, `Max ${metres(staticWorst.value)} (${staticWorst.system.id}); 95% ≤ ${metres(staticP95)}`, staticWorst.value <= thresholds.agreementM ? "PASS" : "FAIL"]] : []),
+            [
+              "CRP agreement under way",
+              `≤ ${limit} across track; steady along track ≤ ${limit}`,
+              `Across-track max ${crossWorst ? `${metres(crossWorst.value)} (${crossWorst.system.id})` : "–"}; steady along-track ≤ ${steadyWorst ? `${metres(steadyWorst.value)} (${steadyWorst.system.id})` : "–"}`,
+              (crossWorst?.value ?? 0) <= thresholds.agreementM && (steadyWorst?.value ?? 0) <= thresholds.agreementM ? "PASS" : "FAIL",
+            ],
+            ["Position timing under way", "Aligned to the shot time", timingText, timingCheck ? "CHECK" : "PASS"],
+          ]
+        : [["CRP agreement with control", `≤ ${limit} from ${control.id}`, staticWorst ? `Max ${metres(staticWorst.value)} (${staticWorst.system.id}); 95% ≤ ${metres(staticP95)}` : "–", failures.length ? "FAIL" : "PASS"]]),
       ["Interference affecting positioning", "None", interference.length ? `${interference.length} event(s): ${ids(interference)}` : commonNoRf.length ? `Common degradation without RF evidence: ${ids(commonNoRf)}` : "None", interference.length ? "ALERT" : commonNoRf.length ? "CHECK" : "PASS"],
       input.rf ? jammingRow : ["RF anomalies (rf-monitor)", "None", rfEpisodes.length ? `${rfEpisodes.length} episode(s) on ${rfLanesHit.join(", ")}; ${duration(rfEpisodes.reduce((sum, episode) => sum + episode.toMs - episode.fromMs, 0))} total` : "None", rfEpisodes.length ? "INFO" : "PASS"],
       ["Single-chain anomalies", "None", chainEvents.length ? grouped(chainEvents) : "None", chainEvents.length ? "CHECK" : "PASS"],
-      ["Data coverage", "Full window", `Gator ${pct(analysis.positioningCoverage.fraction)}%; GNSS RF monitored ≥ ${pct(gnssCoverage)}%`, analysis.positioningCoverage.fraction >= 0.999 && gnssCoverage >= 0.9 ? "PASS" : "INFO"],
+      ["Data coverage", "Full window", `Gator ${pct(coverage.fraction)}%; GNSS RF monitored ≥ ${pct(gnssCoverage)}%`, coverage.fraction >= 0.999 && gnssCoverage >= 0.9 ? "PASS" : "INFO"],
+      ...(continuityRow ? [continuityRow] : []),
     ],
   };
-  const verdictStatus: Status = interference.length || worstImpact?.level === "alert" ? "ALERT" : worstMax > thresholds.agreementM ? "FAIL" : commonNoRf.length || chainEvents.length ? "CHECK" : "PASS";
+  const verdictStatus: Status = interference.length || worstImpact?.level === "alert" ? "ALERT" : failures.length ? "FAIL" : commonNoRf.length || chainEvents.length || timingEvents.length || timingCheck ? "CHECK" : "PASS";
 
   const eventsTable: ReportTable = {
     columns: [{ title: "ID", width: 5 }, { title: "Time (UTC)", width: 13 }, { title: "Finding", width: 25 }, { title: "Basis", width: 33 }, { title: "Action", width: 24 }],
@@ -138,14 +198,22 @@ export function buildPositioningReportModel(input: {
     }),
   };
 
+  const shotsAll = motion.shots.all.n;
+  const motionRow = (name: string, stats: typeof motion.shots.all, threshold: string) => [name, String(stats.n), fixed(stats.min, 2), fixed(stats.max, 2), fixed(stats.mean, 2), fixed(stats.median, 2), shotsAll ? fixed((stats.n / shotsAll) * 100, 1) : "–", threshold];
   const motionTable: ReportTable = {
-    columns: [{ title: "Period", width: 14 }, { title: "N", width: 10, align: "right" }, { title: "Min kn", width: 12, align: "right" }, { title: "Max kn", width: 12, align: "right" }, { title: "Mean kn", width: 12, align: "right" }, { title: "Median kn", width: 13, align: "right" }, { title: "% Moving", width: 13, align: "right" }, { title: "Threshold", width: 14, align: "right" }],
-    rows: [[label, String(motion.n), fixed(motion.minKnots, 3), fixed(motion.maxKnots, 3), fixed(motion.meanKnots, 3), fixed(motion.medianKnots, 3), fixed(motion.movingFraction * 100, 1), fixed(thresholds.movingKnots, 3)]],
+    columns: [{ title: "Period", width: 16 }, { title: "Shots", width: 10, align: "right" }, { title: "Min kn", width: 11, align: "right" }, { title: "Max kn", width: 11, align: "right" }, { title: "Mean kn", width: 11, align: "right" }, { title: "Median kn", width: 12, align: "right" }, { title: "% of shots", width: 13, align: "right" }, { title: "Speed", width: 16, align: "right" }],
+    rows: shotsAll
+      ? [
+          ...(motion.shots.static.n ? [motionRow("Static", motion.shots.static, `≤ ${thresholds.movingKnots} kn`)] : []),
+          ...(motion.shots.underWay.n ? [motionRow("Under way", motion.shots.underWay, `> ${thresholds.movingKnots} kn`)] : []),
+          motionRow(`All (${label.toLowerCase()})`, motion.shots.all, "–"),
+        ]
+      : [[label, String(motion.n), fixed(motion.minKnots, 2), fixed(motion.maxKnots, 2), fixed(motion.meanKnots, 2), fixed(motion.medianKnots, 2), fixed(motion.movingFraction * 100, 1), `> ${thresholds.movingKnots} kn`]],
   };
 
   const systemsTable: ReportTable = {
-    columns: [{ title: "System", width: 11 }, { title: "Entered Name", width: 25 }, { title: "Antenna (splitter)", width: 24 }, { title: "Beam", width: 10 }, { title: "IP", width: 8 }, { title: "Use", width: 14, align: "center" }],
-    rows: systems.map((system) => [system.id, name(system), `${system.config.antenna} (${system.config.antennaGroup})`, system.config.beam, system.config.ip ?? "–", system.isControl ? "Control" : "Comparison"]),
+    columns: [{ title: "System", width: 11 }, { title: "Entered Name", width: 25 }, { title: "Antenna", width: 24 }, { title: "Beam", width: 12 }, { title: "Use", width: 14, align: "center" }],
+    rows: systems.map((system) => [system.id, name(system), system.config.antenna, system.config.beam, system.isControl ? "Control" : "Comparison"]),
   };
 
   const basis = systems.find((system) => system.ellipse)?.ellipse?.basis;
@@ -158,12 +226,32 @@ export function buildPositioningReportModel(input: {
     }),
   };
 
-  const controlTable: ReportTable = {
-    columns: [{ title: "Sensor / Control", width: 22 }, { title: "N", width: 10, align: "right" }, { title: "Min (m)", width: 13, align: "right" }, { title: "Max (m)", width: 13, align: "right" }, { title: "Average (m)", width: 14, align: "right" }, { title: "95% (m)", width: 13, align: "right" }, { title: `≤ ${limit} (%)`, width: 15, align: "right" }],
-    rows: others.map((system) => {
-      const stats = system.vsControl!;
-      return [`${system.id} / ${control.id}`, String(stats.n), fixed(stats.min, 3), fixed(stats.max, 3), fixed(stats.mean, 3), fixed(stats.p95, 3), pct(stats.withinLimit)];
-    }),
+  const controlTable: ReportTable = underWay
+    ? {
+        columns: [{ title: "Sensor / Control", width: 17 }, { title: "Static N", width: 9, align: "right" }, { title: "Static max (m)", width: 10, align: "right" }, { title: "Static 95% (m)", width: 10, align: "right" }, { title: "Under way N", width: 10, align: "right" }, { title: "Across max (m)", width: 10, align: "right" }, { title: "Across 95% (m)", width: 10, align: "right" }, { title: "Steady along (m)", width: 11, align: "right" }, { title: "Timing 95% (s)", width: 10, align: "right" }],
+        rows: others.map((system) => {
+          const stats = system.vsControl!;
+          const moving = stats.underWay;
+          return [`${system.id} / ${control.id}`, String(stats.static.n), stats.static.n ? fixed(stats.static.max, 3) : "–", stats.static.n ? fixed(stats.static.p95, 3) : "–", String(moving?.n ?? 0), fixed(moving?.crossMax, 3), fixed(moving?.crossP95, 3), fixed(moving?.alongSteadyM, 3), fixed(moving?.timing.p95Seconds, 2)];
+        }),
+      }
+    : {
+        columns: [{ title: "Sensor / Control", width: 22 }, { title: "N", width: 10, align: "right" }, { title: "Min (m)", width: 13, align: "right" }, { title: "Max (m)", width: 13, align: "right" }, { title: "Average (m)", width: 14, align: "right" }, { title: "95% (m)", width: 13, align: "right" }, { title: `≤ ${limit} (%)`, width: 15, align: "right" }],
+        rows: others.map((system) => {
+          const stats = system.vsControl!;
+          return [`${system.id} / ${control.id}`, String(stats.n), fixed(stats.min, 3), fixed(stats.max, 3), fixed(stats.mean, 3), fixed(stats.p95, 3), pct(stats.withinLimit)];
+        }),
+      };
+
+  const timingTable: ReportTable = {
+    columns: [{ title: "System", width: 14 }, { title: "Under way shots", width: 11, align: "right" }, { title: "Timing 95% (s)", width: 11, align: "right" }, { title: "Largest (s)", width: 10, align: "right" }, { title: `Shots ≥ ${limitText(Math.min(0.2, thresholds.agreementM / 2))}`, width: 11, align: "right" }, { title: "Steady along (m)", width: 11, align: "right" }, { title: `To ${control.id} 95% (s)`, width: 11, align: "right" }, { title: `To ${control.id} largest (s)`, width: 12, align: "right" }],
+    rows: [
+      ...(common ? [["All (median)", String(common.n), fixed(common.p95Seconds, 2), fixed(common.maxSeconds, 2), String(common.excursions.length), fixed(common.steadyAlong, 3), "–", "–"]] : []),
+      ...systems.map((system) => {
+        const moving = system.vsControl?.underWay?.timing;
+        return [system.id, String(system.timing.n), fixed(system.timing.p95Seconds, 2), fixed(system.timing.maxSeconds, 2), String(system.timing.excursions.length), fixed(system.timing.steadyAlong, 3), system.isControl ? "Control" : fixed(moving?.p95Seconds, 2), system.isControl ? "–" : fixed(moving?.maxSeconds, 2)];
+      }),
+    ],
   };
 
   const qualityTable: ReportTable = {
@@ -171,7 +259,7 @@ export function buildPositioningReportModel(input: {
     rows: systems.map((system) => {
       const q = system.quality;
       const codes = q.pcalcCodes.map(([code, count]) => `${code}×${count}`).join(", ");
-      const flagged = [...system.flags.values()].filter((set) => set.size).length;
+      const flagged = [...system.flags.values()].filter((set) => [...set].some((indicator) => indicator !== "timing")).length;
       return [system.id, spreadText(q.sats, 0, true), spreadText(q.hdop, 1, false), spreadText(q.pdop, 1, false), spreadText(q.age, 0, false), q.pcalcUsual === undefined ? "Not output" : `${codes} (${q.pcalcChanges})`, flagged ? `${flagged} shots` : "None"];
     }),
   };
@@ -243,21 +331,42 @@ export function buildPositioningReportModel(input: {
   const evidence: ReportTable = {
     columns: [{ title: "Item", width: 22 }, { title: "Value", width: 78 }],
     rows: [
-      ["Gator SBS file", `${input.file.name} (${input.file.bytes.toLocaleString("en-GB")} bytes)`],
-      ["SBS SHA-256", input.file.sha256],
-      ["Gator line / shots", `${dataset.lineName} · ${dataset.shotCount.toLocaleString("en-GB")} shots × ${dataset.systems.length} systems at ${dataset.intervalMs / 1000} s`],
+      multiFile
+        ? ["Gator SBS files", `${input.files.length} files, ${input.files.reduce((sum, file) => sum + file.bytes, 0).toLocaleString("en-GB")} bytes; see SBS Source Files`]
+        : ["Gator SBS file", `${input.files[0]?.name ?? "–"} (${(input.files[0]?.bytes ?? 0).toLocaleString("en-GB")} bytes)`],
+      ...(multiFile ? [] : [["SBS SHA-256", input.files[0]?.sha256 ?? "–"]]),
+      ["Gator line / shots", `${dataset.lineName || "–"} · ${dataset.shotCount.toLocaleString("en-GB")} shots × ${dataset.systems.length} systems at ${dataset.intervalMs / 1000} s`],
       ["Report window (UTC)", `${utcDateTime(analysis.window.startMs)} – ${utcDateTime(analysis.window.endMs)} (${analysis.window.mode === "sbs" ? "SBS span" : analysis.window.mode === "utc-day" ? "UTC day" : "custom"})`],
-      ["Gator coverage", `${utcTime(analysis.positioningCoverage.fromMs)}–${utcTime(analysis.positioningCoverage.toMs)} UTC (${pct(analysis.positioningCoverage.fraction)}% of window)`],
+      ["Gator coverage", `${utcTime(coverage.fromMs)}–${utcTime(coverage.toMs)} UTC (${pct(coverage.fraction)}% of window)${coverage.gaps.length ? `; no data ${gapText(coverage.gaps)}` : ""}`],
+      ...(dataset.duplicateShots ? [["Repeated shots", `${dataset.duplicateShots.toLocaleString("en-GB")} counted once${dataset.conflictingShots ? `; ${dataset.conflictingShots.toLocaleString("en-GB")} differed, first file used` : ""}`]] : []),
       ["Control / threshold", `${control.id} (${name(control)}) / ${limit}`],
       ["RF evidence source", input.rf?.sourceText ?? (simulatedRf ? "SIMULATED (mock-up)" : "rf-monitor evidence store")],
       ["rf-monitor incidents", analysis.rf.incidents.length ? analysis.rf.incidents.map((incident) => incident.id).join(", ") : "None"],
     ],
   };
 
+  const sources: ReportTable = {
+    columns: [{ title: "#", width: 4, align: "right" }, { title: "File", width: 22 }, { title: "Gator line", width: 12 }, { title: "First obs (UTC)", width: 14 }, { title: "Last obs (UTC)", width: 14 }, { title: "Shots in window", width: 9, align: "right" }, { title: "SHA-256", width: 25 }],
+    rows: input.files.map((file, index) => {
+      const stats = dataset.files[index];
+      const used = stats && stats.epochs > 0;
+      return [
+        String(index + 1),
+        `${file.name} (${file.bytes.toLocaleString("en-GB")} bytes)`,
+        stats?.lineName || "–",
+        used ? utcDateTime(stats.startMs).replace(" UTC", "") : "Outside window",
+        used ? utcDateTime(stats.endMs).replace(" UTC", "") : "–",
+        used ? stats.epochs.toLocaleString("en-GB") : "0",
+        file.sha256,
+      ];
+    }),
+  };
+
   const absent = systems.filter((system) => system.absentFields.length).map((system) => `${system.id} ${system.absentFields.join("/")}`);
   const notes = [
     ...(input.rf ? [`RF: each frame typed with the rf-monitor Standard rules (wideband ≥ ${RF_RULES.widebandOccupancy * 100}% of band raised; partial-band block > ${RF_RULES.partialWidth * 100}%; noise floor median ≥ ${RF_RULES.noiseFloorSigma}×; narrowband peak ≥ ${RF_RULES.narrowbandPeakSigma}×). Episode = ${RF_RULES.alertVisits} of ${RF_RULES.alertWindow} frames raised, ends after ${RF_RULES.clearVisits} clear frames. Levels relative 0–255; dBm/SNR as reported by SDRconnect. Jamming-type = wideband, partial-band or noise-floor interference.`, "RF–navigation: per Gator shot, nearest RF frame within 5 s; satellite loss = median per antenna group, % of each system's own median; Spearman r at zero lag, best lag searched ±120 s. Impact = during episode minus 5 min before."] : []),
     `Positions: SST (vessel CRP) Easting/Northing reduced by Gator from each DGPS. Deltas = system − ${control.id} at the same shot.`,
+    ...(underWay ? [`Under way (≥ ${motion.alongTrackKnots} kn): offsets split along/across a reference track (median of all systems, local quadratic over ±15 s). Agreement = across track at every shot plus the steady (median) along-track offset. Along-track excursions from the steady offset are shot timing, reported as seconds of travel; excursions ≥ ${limitText(Math.min(0.2, thresholds.agreementM / 2))} are left out of the 2D statistics and delta figures; excursions within ${thresholds.timingStepMaxS} s of travel never count as offsets. Timing 95% ≥ ${TIMING_NOTE_S} s is a CHECK.`] : []),
     `Flags against each system's own median: #Sats < ${Math.round((1 - thresholds.satsDropFraction) * 100)}% and −${thresholds.satsDropMin}; HDOP > ${thresholds.hdopFactor}× and +${thresholds.hdopExcess}; Age > +${thresholds.ageExcessS} s; PCALC ≠ usual code; CRP > ${limit} from control (the control is flagged when most comparisons exceed together).`,
     `Ellipse: 95% (chi-square 5.991) on ${delta ? "deltas to control (vessel moving)" : "positions (vessel static)"}; Orient. = major-axis bearing from grid north. Flags < ${thresholds.mergeGapS / 60} min apart form one run; runs and RF anomalies < 1 min apart form one event.`,
     `[OK]/[AB] flags ignored. All-zero raw QC (${dataset.missingRawQcShots} end-of-line shot(s)) treated as missing.${absent.length ? ` Not output: ${absent.join(", ")}.` : ""}${systems.every((system) => system.heightConstant) ? " Antenna height held constant by Gator; not assessed." : ""}`,
@@ -282,30 +391,34 @@ export function buildPositioningReportModel(input: {
     { title: "", blocks: [{ table: "project" }, { table: "result", heading: "Verification Result" }, { table: "events", heading: "Events and Actions" }, { table: "motion", heading: "Vessel Motion Classification" }, { table: "systems", heading: "Systems Used" }, { table: "stats", heading: "Individual System Position Statistics (95% ellipse)" }] },
     ...rfPages,
     { title: `All Sensor Delta and Range Time Series Relative to ${control.id} (${name(control)})`, blocks: [{ chart: "delta-e" }, { chart: "delta-n" }, { chart: "delta-range" }] },
+    ...(underWay ? [{ title: `Under Way Agreement and Shot Timing Relative to ${control.id}`, blocks: [{ charts: ["uw-cross", "uw-along", "uw-timing"] }, { table: "timing", heading: "Shot Timing Under Way" }] as ReportBlock[] }] : []),
     { title: `All Sensor Delta Scatter Relative to ${control.id} (Control = 0)`, blocks: [{ pair: ["scatter-overview", "scatter-detail"], key: [...others.map((system) => ({ name: system.id, color: colorOf(analysis, system.id) })), { name: `Threshold (${limit})`, color: "#c8102e", dash: true }, { name: `Control ${control.id}`, color: "#14212e" }] }, { table: "control", heading: "Distance from Control Summary" }, { table: "quality", heading: "Solution Quality" }] },
     ...(input.rf ? [] : [{ title: "RF Environment (rf-monitor)", blocks: [{ chart: "evidence-timeline" }, { table: "lanes", heading: "RF Lane Coverage" }, { table: "incidents", heading: "rf-monitor Incidents" }] as ReportBlock[] }]),
     ...systems.map((system) => ({ title: `${system.id} Time Series (${name(system)})`, blocks: [{ charts: ["rf", "sats", "age", "pcalc", "hdop", "pdop"].map((key) => `sys-${system.id}-${key}`) }] as ReportBlock[] })),
     ...(motion.state !== "static" ? [{ title: "Vessel Speed Time Series", blocks: [{ chart: "speed" }] as ReportBlock[] }] : []),
-    { title: "Evidence and Method", blocks: [{ table: "evidence", heading: "Evidence" }, { notes: true, heading: "Method" }] },
+    { title: "Evidence and Method", blocks: [{ table: "evidence", heading: "Evidence" }, { table: "sources", heading: "SBS Source Files" }, { notes: true, heading: "Method" }] },
   ];
 
   return {
     title: `${label} DGNSS Position Verification Report`,
     subtitle: "with rf-monitor RF interference assessment",
-    firstObs: utcDateTime(dataset.startMs).replace(" UTC", ""),
-    lastObs: utcDateTime(dataset.endMs).replace(" UTC", ""),
-    source: `${input.file.name} (Gator line ${dataset.lineName})`,
+    firstObs: utcDateTime(coverage.intervals[0]?.[0] ?? dataset.startMs).replace(" UTC", ""),
+    lastObs: utcDateTime(coverage.intervals.length ? coverage.intervals.at(-1)![1] - dataset.intervalMs : dataset.endMs).replace(" UTC", ""),
+    source: multiFile
+      ? `${input.files.length} Gator SBS files (line${dataset.lineNames.length > 1 ? "s" : ""} ${dataset.lineName || "–"})`
+      : `${input.files[0]?.name ?? "SBS"} (Gator line ${dataset.lineName || "–"})`,
     generatedAt: input.generatedAt.toISOString(),
     generatedAtText: utcDateTime(input.generatedAt.getTime()).replace(" UTC", ""),
     vesselName: identity.vesselName,
     simulatedRf,
     verdict: [
-      worstMax <= thresholds.agreementM ? `All within ${limit} of ${control.id}` : `${others.filter((system) => (system.vsControl?.max ?? 0) > thresholds.agreementM).map((system) => system.id).join(", ")} beyond ${limit} of ${control.id}`,
+      failures.length ? `${failures.join(", ")} beyond ${limit} of ${control.id}` : `All within ${limit} of ${control.id}`,
+      ...(timingCheck && common ? [`Shot positions up to ${common.p95Seconds.toFixed(1)} s off the shot time under way`] : []),
       interference.length ? `GNSS interference affected positioning (${ids(interference)})` : "No interference affecting positioning",
-      ...(commonNoRf.length || chainEvents.length ? [`Check ${ids([...commonNoRf, ...chainEvents])}`] : []),
+      ...(commonNoRf.length || chainEvents.length || timingEvents.length ? [`Check ${ids([...commonNoRf, ...chainEvents, ...timingEvents])}`] : []),
     ].join(" · "),
     verdictStatus,
-    tables: { project, result, events: eventsTable, motion: motionTable, systems: systemsTable, stats: statsTable, control: controlTable, quality: qualityTable, lanes: laneTable, incidents: incidentTable, evidence, rfSummary, rfEpisodes: rfEpisodesTable, relationship: relationshipTable },
+    tables: { project, result, events: eventsTable, motion: motionTable, systems: systemsTable, stats: statsTable, control: controlTable, timing: timingTable, quality: qualityTable, lanes: laneTable, incidents: incidentTable, evidence, sources, rfSummary, rfEpisodes: rfEpisodesTable, relationship: relationshipTable },
     notes,
     pages,
     charts,

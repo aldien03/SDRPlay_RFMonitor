@@ -4,35 +4,42 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { gzipSync } from "node:zlib";
 import { validateDgnssConfig } from "../src/shared/dgnss";
-import { parseSbs } from "../src/server/positioning/sbs";
+import { mergeSbs, parseSbs, SbsParser, type SbsParseWindow } from "../src/server/positioning/sbs";
+import { reportWindow } from "../src/server/positioning/pipeline";
 import { analyseRf, defaultRfLanes, RfAccumulator } from "../src/server/positioning/rfAnalysis";
 import { streamSessionFrames } from "../src/server/positioning/evidenceSource";
 import { DgnssReportService, DgnssUserError } from "../src/server/positioning/service";
 import type { RfFrame } from "../src/server/positioning/rfEvidence";
 
 const SYSTEMS = [
-  { id: "DGPS1", output: "G4", receiver: "Starpack A", antenna: "Tualcom", antennaGroup: "Tualcom", beam: "EASAT" },
-  { id: "DGPS2", output: "G4", receiver: "Starpack A", antenna: "Tualcom", antennaGroup: "Tualcom", beam: "EASAT" },
-  { id: "DGPS3", output: "XP3", receiver: "Starpack B", antenna: "Calian", antennaGroup: "Calian", beam: "EASAT" },
-  { id: "DGPS4", output: "G4", receiver: "AsteRx", antenna: "Calian", antennaGroup: "Calian", beam: "ERSAT" },
+  { id: "DGPS1", output: "G4", receiver: "Starpack A", antenna: "Tualcom", beam: "EASAT" },
+  { id: "DGPS2", output: "G4", receiver: "Starpack A", antenna: "Tualcom", beam: "EASAT" },
+  { id: "DGPS3", output: "XP3", receiver: "Starpack B", antenna: "Calian", beam: "EASAT" },
+  { id: "DGPS4", output: "G4", receiver: "AsteRx", antenna: "Calian", beam: "ERSAT" },
 ];
 
-/** A small Gator SBS export: pages per DGPS, value + Quality column pairs. */
-function sbsText(options: { shots?: number; startSeconds?: number; systems?: number } = {}): string {
+/**
+ * A small Gator SBS export: pages per DGPS, value + Quality column pairs.
+ * Shot n is at start + (n - 1) x 5 s, so files cut from one export share times and values.
+ */
+function sbsText(options: { shots?: number; startSeconds?: number; systems?: number; firstShot?: number; firstPage?: number; zeroTail?: boolean; lineName?: string } = {}): string {
   const shots = options.shots ?? 60;
+  const first = options.firstShot ?? 1;
   const start = options.startSeconds ?? Date.parse("2026-11-10T08:00:00Z") / 1000;
+  const zeroTail = options.zeroTail ?? true;
   const lines: string[] = [];
-  for (let page = 1; page <= (options.systems ?? 4); page += 1) {
+  const firstPage = options.firstPage ?? 1;
+  for (let page = firstPage; page < firstPage + (options.systems ?? 4); page += 1) {
     const qc = `SSTDG${page}_QC`;
-    lines.push("# Line name\t314-08.00.00", `Page ${page}\tDGPS${page}_QC\tAll Shots`);
+    lines.push(`# Line name\t${options.lineName ?? "314-08.00.00"}`, `Page ${page}\tDGPS${page}_QC\tAll Shots`);
     const fields = [
       `${qc} SST Latitude`, `${qc} SST Longitude`, `${qc} SST Height`, `${qc} SST Easting`, `${qc} SST Northing`,
       `${qc} SSTDG${page} Latitude`, `${qc} SSTDG${page} Longitude`, `${qc} SSTDG${page} Height`, `${qc} SSTDG${page} Easting`, `${qc} SSTDG${page} Northing`,
       `Raw: SST_DGPS${page} PDOP`, `Raw: SST_DGPS${page} HDOP`, `Raw: SST_DGPS${page} PCALC`, `Raw: SST_DGPS${page} Unit Variance`, `Raw: SST_DGPS${page} NSats Tracked`, `Raw: SST_DGPS${page} Age Correction`,
     ];
     lines.push(["Shot", "Raw Time", "Time", "Date", ...fields.flatMap((field) => [field, "Quality"])].join("\t"), "");
-    for (let shot = 1; shot <= shots; shot += 1) {
-      const last = shot > shots - 2;
+    for (let shot = first; shot < first + shots; shot += 1) {
+      const last = zeroTail && shot >= first + shots - 2;
       const wobble = Math.sin(shot + page) * 0.02;
       const values = [34.6, 33.0, 0, 501612 + page * 0.01 + wobble, 3834773 + wobble, 34.6, 33.0, 25.9, 501611.5, 3834773.6,
         last ? 0 : 1.2, last ? 0 : 0.7, last ? 0 : 5, 0, last ? 0 : 20 + page, last ? 0 : 6];
@@ -78,6 +85,69 @@ describe("Gator SBS parser", () => {
 
   it("rejects files that are not SBS exports", () => {
     expect(() => parseSbs("Time,Easting,Northing\n1,2,3\n")).toThrow(/No DGNSS pages/);
+  });
+});
+
+describe("combining split Gator files", () => {
+  const T0 = Date.parse("2026-11-10T08:00:00Z");
+  const part = (text: string, window?: SbsParseWindow) => {
+    const parser = new SbsParser(window);
+    for (const line of text.split("\n")) parser.line(line);
+    return parser.part();
+  };
+
+  it("joins a contiguous split into one dataset with one coverage span", () => {
+    const dataset = mergeSbs([part(sbsText({ shots: 60, zeroTail: false })), part(sbsText({ firstShot: 61, shots: 60, zeroTail: false }))]);
+    expect(dataset.systems.map((system) => system.id)).toEqual(["DGPS1", "DGPS2", "DGPS3", "DGPS4"]);
+    expect(dataset.shotCount).toBe(120);
+    expect(dataset.intervalMs).toBe(5000);
+    expect(dataset.coverage).toHaveLength(1);
+    expect(dataset.duplicateShots).toBe(0);
+    expect(dataset.files.map((file) => file.epochs)).toEqual([60, 60]);
+  });
+
+  it("keeps a shot repeated by overlapping files once and counts it", () => {
+    const dataset = mergeSbs([part(sbsText({ shots: 60, zeroTail: false })), part(sbsText({ firstShot: 41, shots: 80, zeroTail: false }))]);
+    expect(dataset.shotCount).toBe(120);
+    expect(dataset.duplicateShots).toBe(20 * 4);
+    expect(dataset.conflictingShots).toBe(0);
+    const times = dataset.systems[0].shots.map((shot) => shot.timeMs);
+    expect(new Set(times).size).toBe(times.length);
+    expect([...times].sort((left, right) => left - right)).toEqual(times);
+  });
+
+  it("marks a gap between files and counts repeated shots whose values differ", () => {
+    const dataset = mergeSbs([part(sbsText({ shots: 60 })), part(sbsText({ firstShot: 59, shots: 60, zeroTail: false })), part(sbsText({ firstShot: 201, shots: 20, zeroTail: false }))]);
+    expect(dataset.coverage).toHaveLength(2);
+    expect(dataset.coverage[0][1]).toBe(T0 + 117 * 5000 + 999 + 5000);
+    expect(dataset.conflictingShots).toBe(2 * 4);
+  });
+
+  it("joins files holding different systems for the same period", () => {
+    const dataset = mergeSbs([part(sbsText({ systems: 2 })), part(sbsText({ systems: 2, firstPage: 3 }))]);
+    expect(dataset.systems.map((system) => system.id)).toEqual(["DGPS1", "DGPS2", "DGPS3", "DGPS4"]);
+    expect(dataset.duplicateShots).toBe(0);
+  });
+
+  it("treats a page repeated inside one file as one system", () => {
+    const dataset = parseSbs(`${sbsText({ shots: 30, zeroTail: false })}${sbsText({ firstShot: 31, shots: 30 })}`);
+    expect(dataset.systems).toHaveLength(4);
+    expect(dataset.shotCount).toBe(60);
+    expect(dataset.missingRawQcShots).toBe(2);
+  });
+
+  it("parses only the shots inside a window", () => {
+    const dataset = parseSbs(sbsText(), { fromMs: T0 + 100_000, toMs: T0 + 200_000 });
+    expect(dataset.shotCount).toBe(20);
+    expect(dataset.startMs).toBeGreaterThanOrEqual(T0 + 100_000);
+  });
+
+  it("allows the SBS span window only up to 24 h and checks the chosen day", () => {
+    const long = { startMs: T0, endMs: T0 + 30 * 3_600_000, intervalMs: 5000 };
+    expect(() => reportWindow(long, { mode: "sbs" })).toThrow(/more than 24 h/);
+    expect(reportWindow(long, { mode: "utc-day", day: "2026-11-11" }).startMs).toBe(Date.parse("2026-11-11T00:00:00Z"));
+    expect(() => reportWindow(long, { mode: "utc-day", day: "2026-11-14" })).toThrow(/no Gator data/);
+    expect(() => reportWindow(long, { mode: "utc-day", day: "11/11/2026" })).toThrow(/Choose a UTC day/);
   });
 });
 
@@ -135,6 +205,15 @@ describe("streaming RF analysis", () => {
   });
 });
 
+async function finished(svc: DgnssReportService, id: string) {
+  let report = (await svc.get(id))!;
+  for (let tries = 0; tries < 400 && (report.state === "queued" || report.state === "running"); tries += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    report = (await svc.get(id))!;
+  }
+  return report;
+}
+
 describe("DGNSS report service", () => {
   async function service(configure = true) {
     const root = await tempDir();
@@ -165,12 +244,8 @@ describe("DGNSS report service", () => {
     expect(preview.systemsFound).toEqual(["DGPS1", "DGPS2", "DGPS3", "DGPS4"]);
     expect(preview.rf.sessionCoverage).toBe(0);
     expect(preview.warnings.join(" ")).toMatch(/positioning only/);
-    const queued = await svc.generate(preview.uploadId, { mode: "sbs" });
-    let report = queued;
-    for (let tries = 0; tries < 200 && (report.state === "queued" || report.state === "running"); tries += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      report = (await svc.get(queued.id))!;
-    }
+    const queued = await svc.generate([preview.uploadId], { mode: "sbs" });
+    const report = await finished(svc, queued.id);
     expect(report.state).toBe("ready");
     expect(report.status).toBeDefined();
     expect(report.facts?.pages).toBeGreaterThan(3);
@@ -187,7 +262,65 @@ describe("DGNSS report service", () => {
     await expect(svc.upload(Buffer.from("not,an,sbs\n"), "x.csv")).rejects.toThrow(/Not a Gator SBS export/);
     const preview = await svc.upload(Buffer.from(sbsText()), "line.sbs");
     expect(preview.warnings[0]).toMatch(/not set up/);
-    await expect(svc.generate(preview.uploadId, { mode: "sbs" })).rejects.toBeInstanceOf(DgnssUserError);
+    await expect(svc.generate([preview.uploadId], { mode: "sbs" })).rejects.toBeInstanceOf(DgnssUserError);
     await expect(svc.saveConfig({ systems: SYSTEMS, controlId: "DGPS1", agreementM: 0.5, movingKnots: 0.5 }, 7, "127.0.0.1")).rejects.toThrow(/changed elsewhere/);
+  });
+
+  it("combines split files across midnight into one report for a chosen UTC day", async () => {
+    const { svc } = await service();
+    const start = Date.parse("2026-11-10T23:50:00Z") / 1000;
+    const a = await svc.upload(gzipSync(Buffer.from(sbsText({ startSeconds: start, shots: 60, zeroTail: false }))), "part-a.sbs");
+    const c = await svc.upload(Buffer.from(sbsText({ startSeconds: start, firstShot: 161, shots: 60 })), "part-c.sbs");
+    const b = await svc.upload(gzipSync(Buffer.from(sbsText({ startSeconds: start, firstShot: 61, shots: 60, zeroTail: false }))), "part-b.sbs");
+    const again = await svc.upload(Buffer.from(sbsText({ startSeconds: start, shots: 60, zeroTail: false })), "part-a-copy.sbs");
+
+    const preview = await svc.previewSet([c.uploadId, a.uploadId, b.uploadId, again.uploadId]);
+    expect(preview.files.map((file) => file.fileName)).toEqual(["part-a.sbs", "part-b.sbs", "part-c.sbs"]);
+    expect(preview.days).toEqual(["2026-11-10", "2026-11-11"]);
+    expect(preview.spanFitsDay).toBe(true);
+    expect(preview.gaps).toHaveLength(1);
+    expect(preview.overlaps).toHaveLength(0);
+    expect(preview.warnings.join(" ")).toMatch(/Same file added twice/);
+    expect(preview.warnings.join(" ")).toMatch(/No Gator data/);
+
+    const queued = await svc.generate(preview.uploadIds, { mode: "utc-day", day: "2026-11-11" });
+    expect(queued.window.startMs).toBe(Date.parse("2026-11-11T00:00:00Z"));
+    expect(queued.fileName).toBe("3 SBS files");
+    expect(queued.sbsFiles?.map((file) => file.name)).toEqual(["part-a.sbs", "part-b.sbs", "part-c.sbs"]);
+    const report = await finished(svc, queued.id);
+    expect(report.error).toBeUndefined();
+    expect(report.state).toBe("ready");
+    const html = await readFile((await svc.file(report.id, "html"))!.path, "utf8");
+    expect(html).toContain("SBS Source Files");
+    expect(html).toContain("Gator data continuity");
+    expect(html).toContain("Outside window");
+    expect(html).toContain("3 Gator SBS files");
+    const zip = await readFile((await svc.file(report.id, "package"))!.path);
+    for (const name of ["input/01_part-a.sbs", "input/02_part-b.sbs", "input/03_part-c.sbs", "manifest.json", "SHA256SUMS.txt"]) expect(zip.includes(Buffer.from(name))).toBe(true);
+  }, 30_000);
+
+  it("needs a UTC day or custom window when the files cover more than 24 h", async () => {
+    const { svc } = await service();
+    const day1 = await svc.upload(Buffer.from(sbsText()), "day1.sbs");
+    const day2 = await svc.upload(Buffer.from(sbsText({ startSeconds: Date.parse("2026-11-11T09:00:00Z") / 1000 })), "day2.sbs");
+    const preview = await svc.previewSet([day1.uploadId, day2.uploadId]);
+    expect(preview.spanFitsDay).toBe(false);
+    expect(preview.warnings.join(" ")).toMatch(/Choose a UTC day/);
+    await expect(svc.generate(preview.uploadIds, { mode: "sbs" })).rejects.toThrow(/more than 24 h/);
+    await expect(svc.previewSet([])).rejects.toThrow(/at least one/);
+  });
+
+  it("loads a saved table that still has the removed IP and splitter group columns", async () => {
+    const root = await tempDir();
+    const configPath = path.join(root, "dgnss-report-v1.json");
+    await writeFile(configPath, JSON.stringify({ schemaVersion: 1, revision: 3, controlId: "DGPS1", agreementM: 0.5, movingKnots: 0.5, systems: SYSTEMS.map((system) => ({ ...system, antennaGroup: system.antenna, ip: ".60" })) }));
+    const svc = await DgnssReportService.open({
+      root: path.join(root, "dgnss"), configPath, evidenceRoot: path.join(root, "evidence"), dataDomain: "field", retentionMs: 86_400_000,
+      identity: () => ({ vesselName: "Test vessel" }), targetLabel: (id) => id, canStart: () => true, audit: async () => undefined,
+    });
+    const response = svc.configResponse(false);
+    expect(response.configured).toBe(true);
+    expect(response.config.revision).toBe(3);
+    expect(Object.keys(response.config.systems[0]).sort()).toEqual(["antenna", "beam", "id", "output", "receiver"]);
   });
 });
