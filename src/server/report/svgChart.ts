@@ -54,6 +54,7 @@ export function chartToSvg(spec: ChartSpec, options: { standalone?: boolean; idP
     const x1 = scaleX(spec, region.from);
     const x2 = scaleX(spec, region.to);
     out.push(`<rect x="${Math.min(x1, x2).toFixed(1)}" y="${box.top}" width="${Math.max(1, Math.abs(x2 - x1)).toFixed(1)}" height="${box.height}" fill="${region.color}" fill-opacity="${region.opacity}"/>`);
+    if (region.label && Math.abs(x2 - x1) > 90) out.push(`<text x="${(Math.min(x1, x2) + 6).toFixed(1)}" y="${box.top + box.height - 8}" font-size="11" fill="${REPORT_COLORS.muted}">${xml(region.label)}</text>`);
   }
   for (const series of spec.series) {
     if (series.kind === "band") {

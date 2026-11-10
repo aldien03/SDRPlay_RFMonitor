@@ -54,6 +54,7 @@ import { detectorQualificationPlan } from "../shared/detectorQualification";
 import { sha256Canonical } from "./syntheticValidation";
 import { StabilityIncidentStore } from "./stabilityIncidentStore";
 import { createShutdownCoordinator, guardUpgradeSocket, guardWebSocket } from "./processSafety";
+import { DgnssReportService, DgnssUserError, MAX_UPLOAD_BYTES as DGNSS_MAX_UPLOAD_BYTES } from "./positioning/service";
 
 const streamingStartedAt = Date.now();
 const streamingCounters = {
@@ -155,6 +156,25 @@ const exportQueue = new ExportJobQueue<ExportRequest>({
   onOutputsReleased: (paths) => monitor.protectExportArtifacts(paths, false),
   onOutputsDiscarded: (paths) => monitor.discardExportArtifacts(paths),
   maxProtectedOutputBytes: protectedExportByteLimit,
+});
+const dgnssReports = await DgnssReportService.open({
+  root: path.join(config.dataRoots[config.dataDomain].root, "dgnss-reports"),
+  configPath: path.join(path.dirname(config.settingsPaths.operational), "dgnss-report-v1.json"),
+  evidenceRoot: config.storageRoot,
+  dataDomain: config.dataDomain,
+  retentionMs: config.retentionPolicy.retentionMs,
+  identity: () => {
+    const settings = settingsStore.settings;
+    const identity = settings.reportIdentity ?? {};
+    return { companyName: identity.companyName, vesselName: identity.vesselName ?? settings.siteName, clientName: identity.clientName, survey: identity.projectReference };
+  },
+  targetLabel: (targetId) => config.bandCatalog.captureTargets.find((target) => target.id === targetId)?.label ?? targetId,
+  canStart: () => currentResourceHealth().admitExports !== false,
+  audit: async (action, reason, address) => {
+    await settingsStore.recordOperationalAction(action, "admin", address, reason);
+  },
+  // Bundled build: dist/server-node/dgnss-report-worker.js beside index.js; source run: the .ts module.
+  workerUrl: import.meta.url.endsWith(".ts") ? new URL("./positioning/worker.ts", import.meta.url) : new URL("./dgnss-report-worker.js", import.meta.url),
 });
 const diagnosticsCollector = new DiagnosticsCollector({ runtimeProvider: diagnosticsRuntimeSample });
 const app = express();
@@ -1922,6 +1942,107 @@ app.get("/api/alert-preview", (_request, response) => {
   response.setHeader("Cache-Control", "no-store");
   response.json(monitor.getAlertPreview());
 });
+
+// ---- DGNSS report (Gator SBS + rf-monitor RF evidence) --------------------------
+const dgnssUploadParser = express.raw({ type: () => true, limit: DGNSS_MAX_UPLOAD_BYTES });
+
+function dgnssFailure(response: express.Response, error: unknown): void {
+  if (error instanceof DgnssUserError) {
+    response.status(error.status).json({ error: error.message, ...(error.fields ? { fields: error.fields } : {}) });
+    return;
+  }
+  console.error("DGNSS request failed", error);
+  response.status(500).json({ error: "The request could not be completed. Try again." });
+}
+
+function dgnssDownloadName(name: string): string {
+  return `attachment; filename="${name.replace(/[^A-Za-z0-9._-]/g, "_")}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+}
+
+app.get("/api/dgnss/config", (request, response) => {
+  response.json(dgnssReports.configResponse(adminSession(request).unlocked));
+});
+
+app.put("/api/dgnss/config", async (request, response) => {
+  if (!requireAdmin(request, response)) return;
+  try {
+    await dgnssReports.saveConfig(request.body?.config, request.body?.expectedRevision, clientAddress(request));
+    response.json(dgnssReports.configResponse(true));
+  } catch (error) {
+    dgnssFailure(response, error);
+  }
+});
+
+app.post("/api/dgnss/uploads", (request, response, next) => {
+  dgnssUploadParser(request, response, (error?: unknown) => {
+    if (error) {
+      const tooLarge = (error as { type?: string }).type === "entity.too.large";
+      response.status(tooLarge ? 413 : 400).json({ error: tooLarge ? "The file is too large. Export up to 24 h from Gator." : "The upload could not be read. Try again." });
+      return;
+    }
+    next();
+  });
+}, async (request, response) => {
+  try {
+    const rawName = typeof request.headers["x-file-name"] === "string" ? request.headers["x-file-name"] : "upload.sbs";
+    let fileName = "upload.sbs";
+    try {
+      fileName = decodeURIComponent(rawName);
+    } catch {
+      fileName = rawName;
+    }
+    if (!Buffer.isBuffer(request.body)) throw new DgnssUserError("Choose an SBS file to upload", 400);
+    response.json(await dgnssReports.upload(request.body, fileName));
+  } catch (error) {
+    dgnssFailure(response, error);
+  }
+});
+
+app.get("/api/dgnss/reports", async (_request, response) => {
+  response.json({ reports: await dgnssReports.list() });
+});
+
+app.post("/api/dgnss/reports", async (request, response) => {
+  try {
+    response.status(202).json(await dgnssReports.generate(request.body?.uploadId, request.body?.window));
+  } catch (error) {
+    dgnssFailure(response, error);
+  }
+});
+
+app.get("/api/dgnss/reports/:reportId", async (request, response) => {
+  const report = await dgnssReports.get(String(request.params.reportId));
+  if (!report) response.status(404).json({ error: "Report not found" });
+  else response.json(report);
+});
+
+app.post("/api/dgnss/reports/:reportId/cancel", (request, response) => {
+  const report = dgnssReports.cancel(String(request.params.reportId));
+  if (!report) response.status(404).json({ error: "Report not found" });
+  else response.json(report);
+});
+
+for (const [suffix, kind] of [["report.pdf", "pdf"], ["report.html", "html"], ["package.zip", "package"]] as const) {
+  app.get(`/api/dgnss/reports/:reportId/${suffix}`, async (request, response) => {
+    const file = await dgnssReports.file(String(request.params.reportId), kind);
+    if (!file) {
+      response.status(404).json({ error: "Report file not found" });
+      return;
+    }
+    response.setHeader("Content-Type", file.type);
+    if (kind === "html") {
+      response.setHeader("Content-Security-Policy", REPORT_CSP);
+      response.setHeader("X-Frame-Options", "SAMEORIGIN");
+      if (request.query.download === "1") response.setHeader("Content-Disposition", dgnssDownloadName(file.name));
+      else response.setHeader("Content-Disposition", `inline; filename="${file.name.replace(/[^A-Za-z0-9._-]/g, "_")}"`);
+    } else {
+      response.setHeader("Content-Disposition", dgnssDownloadName(file.name));
+    }
+    response.sendFile(file.path, { dotfiles: "deny", headers: { "Cache-Control": "no-store" } }, (error) => {
+      if (error && !response.headersSent) response.status(500).json({ error: "Download failed. Try again." });
+    });
+  });
+}
 
 app.get("/api/evidence/archive", async (request, response) => {
   const offset = typeof request.query.offset === "string" ? Number(request.query.offset) : 0;

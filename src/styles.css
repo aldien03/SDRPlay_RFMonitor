@@ -3174,3 +3174,98 @@ body { color: var(--text); background: var(--background); }
 .sensitivity-panel .correction-watch-note { margin: 4px 0 12px; }
 .sensitivity-preview th, .sensitivity-preview td { font-size: var(--type-body); }
 .sensitivity-preview thead th { font-size: var(--type-meta); }
+
+/* ---- Evidence history: Sessions | DGNSS reports, and the DGNSS report panel ---- */
+.archive-tabs { display: flex; overflow: hidden; background: #fff; border: 1px solid #c7d1da; border-radius: 4px; }
+.archive-tabs button { flex: 1; min-height: 34px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 0 10px; border: 0; border-left: 1px solid #c7d1da; color: #075fae; background: #fff; font: inherit; font-size: var(--type-caption); font-weight: 800; letter-spacing: .05em; text-transform: uppercase; cursor: pointer; }
+.archive-tabs button:first-child { border-left: 0; }
+.archive-tabs button[aria-selected="true"] { color: #fff; background: #17304c; }
+.dgnss-config { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 13px; border-bottom: 1px solid #d8e0e6; color: #344a58; background: #f7f9fa; font-size: var(--type-caption); }
+.dgnss-config b { color: #17304c; }
+.dgnss-config.missing { color: #6b4a00; background: #fff8e5; box-shadow: inset 3px 0 0 #d59a21; }
+.dgnss-link { display: inline-flex; align-items: center; gap: 4px; padding: 0; border: 0; color: #075fae; background: none; font: inherit; font-size: var(--type-caption); font-weight: 800; cursor: pointer; }
+.dgnss-card { margin: 9px; overflow: hidden; background: #fff; border: 1px solid #c7d1da; border-radius: 4px; box-shadow: 0 1px 2px rgba(14, 35, 53, .04); }
+.dgnss-card > header { min-height: 44px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 10px; border-bottom: 1px solid #e0e6eb; }
+.dgnss-card .evidence-session-title > svg { color: #2f638b; }
+.dgnss-step { display: grid; grid-template-columns: 20px minmax(0, 1fr); gap: 8px; padding: 10px; border-top: 1px solid #e3e8ec; }
+.dgnss-card > header + .dgnss-step { border-top: 0; }
+.dgnss-step-no { width: 20px; height: 20px; display: grid; place-items: center; border-radius: 50%; color: #fff; background: #17304c; font-size: var(--type-caption); font-weight: 800; }
+.dgnss-step-no.done { background: var(--green); }
+.dgnss-step-no.off { background: #b9c4cd; }
+.dgnss-step h3 { margin: 2px 0 6px; color: #17304c; font-size: var(--type-body); }
+.dgnss-dropzone { min-height: 92px; display: grid; place-content: center; justify-items: center; gap: 4px; padding: 12px; border: 2px dashed #9fb9cf; border-radius: 4px; color: #17304c; background: #f5f9fc; text-align: center; cursor: pointer; }
+.dgnss-dropzone.dragging { border-color: #075fae; background: #e6f1fb; }
+.dgnss-dropzone[aria-busy="true"] { cursor: progress; }
+.dgnss-dropzone > svg { color: #2f638b; }
+.dgnss-dropzone strong { font-size: var(--type-body); }
+.dgnss-dropzone span, .dgnss-dropzone u { font-size: var(--type-caption); }
+.dgnss-dropzone > span:not(.dgnss-progress) { color: #5a6876; }
+.dgnss-dropzone u { color: #075fae; font-weight: 700; }
+.dgnss-progress { width: 220px; height: 8px; display: block; overflow: hidden; border-radius: 4px; background: #e3e8ec; }
+.dgnss-progress.large { width: 100%; margin: 4px 0 6px; }
+.dgnss-progress b { height: 100%; display: block; background: #075fae; transition: width .3s ease; }
+.dgnss-spin { animation: dgnss-spin 1.1s linear infinite; }
+@keyframes dgnss-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .dgnss-spin { animation: none; } .dgnss-progress b { transition: none; } }
+.dgnss-file { display: flex; align-items: center; gap: 8px; padding: 7px 9px; border: 1px solid #e0e6eb; background: #f7f9fa; }
+.dgnss-file > svg { flex: 0 0 auto; color: #2f638b; }
+.dgnss-file > div { min-width: 0; flex: 1; }
+.dgnss-file strong, .dgnss-file small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dgnss-file strong { color: #17304c; font-size: var(--type-meta); }
+.dgnss-file small { margin-top: 2px; color: #657482; font: var(--type-micro)/1.3 var(--mono); }
+.evidence-session-facts.dgnss-facts { grid-template-columns: 1fr 1.6fr .8fr .9fr; margin: 7px 0 0; }
+.dgnss-card > .evidence-session-facts.dgnss-facts { margin: 8px 10px; }
+.dgnss-coverage { margin-top: 8px; border: 1px solid #e0e6eb; }
+.dgnss-coverage-title { display: flex; justify-content: space-between; padding: 5px 7px; color: #3b5060; background: #f7f9fa; border-bottom: 1px solid #e0e6eb; font-size: var(--type-micro); font-weight: 800; letter-spacing: .04em; text-transform: uppercase; }
+.dgnss-coverage p { margin: 0; padding: 0 7px 6px; color: #304858; font-size: var(--type-caption); }
+.dgnss-lane { display: grid; grid-template-columns: 70px minmax(0, 1fr) 80px; align-items: center; gap: 8px; padding: 5px 7px; color: #21384b; font-size: var(--type-caption); }
+.dgnss-lane i { height: 8px; display: block; overflow: hidden; border-radius: 2px; background: #e3e8ec; }
+.dgnss-lane i b { height: 100%; display: block; background: #8cc7a0; }
+.dgnss-lane span:last-child { text-align: right; font-weight: 700; }
+.dgnss-warnings { margin: 7px 0 0; padding: 0; list-style: none; display: grid; gap: 3px; }
+.dgnss-warnings li { display: flex; align-items: flex-start; gap: 5px; padding: 5px 7px; color: #6b4a00; background: #fff8e5; border-left: 3px solid #d59a21; font-size: var(--type-caption); line-height: 1.35; }
+.dgnss-warnings svg { flex: 0 0 auto; margin-top: 1px; }
+.dgnss-seg { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); overflow: hidden; border: 1px solid #9fb9cf; border-radius: 3px; }
+.dgnss-seg label { position: relative; display: grid; gap: 2px; padding: 6px 8px; border-left: 1px solid #9fb9cf; background: #fff; cursor: pointer; }
+.dgnss-seg label:first-child { border-left: 0; }
+.dgnss-seg label.on { background: #eef6fc; box-shadow: inset 0 -3px 0 #075fae; }
+.dgnss-seg input { position: absolute; opacity: 0; pointer-events: none; }
+.dgnss-seg label:focus-within { outline: 2px solid var(--focus-ring); outline-offset: -2px; }
+.dgnss-seg strong { color: #075fae; font-size: var(--type-caption); }
+.dgnss-seg small { color: #5a6876; font-size: var(--type-micro); }
+.dgnss-seg input:disabled + strong { color: #8a96a2; }
+.dgnss-custom { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 6px; }
+.dgnss-custom label { display: grid; gap: 3px; color: #3b5060; font-size: var(--type-micro); font-weight: 800; text-transform: uppercase; }
+.dgnss-custom input { min-height: 28px; padding: 0 6px; border: 1px solid #b9c7d2; border-radius: 2px; font: var(--type-caption) var(--mono); }
+.dgnss-generate { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.dgnss-generate span, .dgnss-stage { color: #5a6876; font-size: var(--type-caption); }
+.dgnss-stage { display: flex; align-items: center; gap: 6px; margin: 0 0 8px; color: #155b9b; font-weight: 700; }
+.dgnss-verdict { margin: 0; padding: 8px 10px; border-bottom: 1px solid #e0e6eb; color: #17304c; font-size: var(--type-meta); font-weight: 700; line-height: 1.35; }
+.dgnss-chip { flex: 0 0 auto; padding: 3px 7px; border: 1px solid; border-radius: 10px; font-size: var(--type-micro); font-weight: 800; text-transform: uppercase; }
+.dgnss-chip.pass { color: #196c3a; background: #eaf7ee; border-color: #b8dec3; }
+.dgnss-chip.check { color: #755500; background: #fff8e5; border-color: #dec987; }
+.dgnss-chip.alert { color: #a52020; background: #fff0f0; border-color: #e9bcbc; }
+.dgnss-chip.info { color: #155b9b; background: #edf5fa; border-color: #b9d2e3; }
+.dgnss-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px 10px; border-top: 1px solid #e3e8ec; }
+.dgnss-actions a, .dgnss-actions button { min-height: 30px; display: inline-flex; align-items: center; gap: 6px; padding: 0 9px; color: #075fae; background: #fff; border: 1px solid #9fb9cf; border-radius: 3px; font: inherit; font-size: var(--type-caption); font-weight: 700; text-decoration: none; cursor: pointer; }
+.dgnss-actions a.primary { color: #fff; background: #075fae; border-color: #075fae; }
+.dgnss-actions code { margin-left: auto; color: #657482; font: var(--type-micro)/1.3 var(--mono); }
+.dgnss-notice { display: flex; gap: 8px; margin: 0 9px 9px; padding: 9px 10px; border-left: 3px solid; font-size: var(--type-caption); line-height: 1.4; }
+.dgnss-notice > svg { flex: 0 0 auto; margin-top: 1px; }
+.dgnss-notice strong { display: block; font-size: var(--type-meta); }
+.dgnss-notice.error { color: #9d3030; background: #fff3f3; border-color: #d82020; }
+.dgnss-notice .dgnss-link { color: inherit; }
+.dgnss-list-title { display: flex; align-items: center; justify-content: space-between; margin: 4px 9px 0; color: #3b5060; font-size: var(--type-micro); font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
+.dgnss-list-title em { color: #8a96a2; font-style: normal; font-weight: 400; letter-spacing: 0; text-transform: none; }
+.dgnss-hidden-note { display: flex; align-items: center; gap: 4px; margin: 0; padding: 0 10px 9px; color: #196c3a; font-size: var(--type-caption); }
+.dgnss-settings { margin-top: 22px; }
+.dgnss-table-scroll { overflow-x: auto; border: 1px solid #d6dee5; }
+.dgnss-systems { width: 100%; min-width: 680px; border-collapse: collapse; background: #fff; font-size: var(--type-body); }
+.dgnss-systems th, .dgnss-systems td { padding: 4px 5px; border-bottom: 1px solid #e3e8ec; text-align: left; vertical-align: top; }
+.dgnss-systems th { color: #3b5060; background: #eef3f7; font-size: var(--type-micro); font-weight: 800; letter-spacing: .04em; text-transform: uppercase; white-space: nowrap; }
+.dgnss-systems td.center { text-align: center; vertical-align: middle; }
+.dgnss-systems input:not([type="radio"]) { width: 100%; min-width: 64px; min-height: 26px; padding: 0 5px; border: 1px solid #c3cbd3; border-radius: 2px; color: #17304c; font: inherit; }
+.dgnss-systems input:disabled { border-color: transparent; background: transparent; }
+.dgnss-systems input[aria-invalid="true"] { border-color: var(--red-dark); }
+.dgnss-add { margin: 8px 0 14px; }
+.dgnss-settings-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 10px; color: #5a6876; font-size: var(--type-meta); }

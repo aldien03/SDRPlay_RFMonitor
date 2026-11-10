@@ -5,7 +5,7 @@ import { REPORT_COLORS, REPORT_FONT_STACK } from "./theme";
 
 const C = REPORT_COLORS;
 
-const STYLE = `
+export const REPORT_STYLE = `
 :root{color-scheme:light}
 *{box-sizing:border-box}
 html{background:#e7ecf0}
@@ -168,5 +168,5 @@ export function renderIncidentReportHtml(model: IncidentReportModel): string {
 
   sections.push(section(++index, "terms", "Limitations and terms", `<ul>${model.limitations.map((line) => `<li>${e(line)}</li>`).join("")}</ul><h3>Terms used</h3>${facts(model.glossary)}`));
 
-  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="generator" content="RF Monitor"><title>${e(model.title)} · ${e(model.reference)}</title><style>${STYLE}</style></head><body><article class="paper">${cover}<main>${sections.join("")}</main><footer class="report-footer">${e(model.reference)} · generated ${e(model.generatedAtText)} · RF data can show interference, not intent. Relative, uncalibrated levels.</footer></article></body></html>`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="generator" content="RF Monitor"><title>${e(model.title)} · ${e(model.reference)}</title><style>${REPORT_STYLE}</style></head><body><article class="paper">${cover}<main>${sections.join("")}</main><footer class="report-footer">${e(model.reference)} · generated ${e(model.generatedAtText)} · RF data can show interference, not intent. Relative, uncalibrated levels.</footer></article></body></html>`;
 }

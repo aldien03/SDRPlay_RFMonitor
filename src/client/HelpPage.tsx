@@ -1,4 +1,4 @@
-import { AlertTriangle, ArrowLeft, ClockAlert, Database, HeartPulse, Radio, RotateCcw, SlidersHorizontal, TestTube2 } from "lucide-react";
+import { AlertTriangle, ArrowLeft, ClockAlert, Database, HeartPulse, Radio, RotateCcw, SatelliteDish, SlidersHorizontal, TestTube2 } from "lucide-react";
 import { presentOperatorSummary } from "../shared/operatorSummary";
 import type { MonitorSnapshot } from "../shared/types";
 import { SurfaceAlertBanner } from "./SurfaceAlertBanner";
@@ -39,6 +39,7 @@ export function HelpPage({ snapshot, onClose, onOpenHealth, onOpenRecording, onO
           <a href="#data"><HeartPulse size={18} aria-hidden="true" /> Restore RF data</a>
           <a href="#coverage"><ClockAlert size={18} aria-hidden="true" /> Coverage late</a>
           <a href="#recording"><Database size={18} aria-hidden="true" /> Check recording</a>
+          <a href="#dgnss"><SatelliteDish size={18} aria-hidden="true" /> Make a DGNSS report</a>
           <a href="#learning"><RotateCcw size={18} aria-hidden="true" /> Signal learning</a>
           <a href="#test"><TestTube2 size={18} aria-hidden="true" /> Run a test</a>
         </nav>
@@ -105,6 +106,18 @@ export function HelpPage({ snapshot, onClose, onOpenHealth, onOpenRecording, onO
           </ol>
           <p>Incident images are saved automatically and deleted after the number of days set in Settings, Recording.</p>
           <button type="button" onClick={onOpenRecording}>Open Recording</button>
+        </section>
+
+        <section id="dgnss" className="help-task">
+          <div><SatelliteDish size={20} aria-hidden="true" /><h2>Make a DGNSS report</h2></div>
+          <ol>
+            <li>In Gator, export the DGPS QC pages as SBS (up to 24 h).</li>
+            <li>Open Evidence history, select DGNSS reports, and drop the .sbs file on the upload area.</li>
+            <li>Check the file summary and the RF recorded for its time span. Keep SBS span, or choose UTC day or Custom.</li>
+            <li>Select Generate report. When it is ready, select Download PDF, Open HTML or Evidence package.</li>
+          </ol>
+          <p>The report checks each DGNSS against the control system and the threshold, and relates satellite loss and position error to RF interference recorded by rf-monitor. Systems, control and threshold are set once in Settings, Site.</p>
+          <button type="button" onClick={onOpenEvidence}>Open Evidence history</button>
         </section>
 
         <section id="learning" className="help-task">

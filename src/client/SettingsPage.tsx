@@ -40,6 +40,7 @@ import {
   type SoftwareRestartResponse,
 } from "./useMonitor";
 import { DialogShell } from "./DialogShell";
+import { DgnssSettings } from "./DgnssSettings";
 import { SurfaceAlertBanner } from "./SurfaceAlertBanner";
 
 export type SettingsTab = "monitoring" | "health" | "recording" | "site" | "advanced" | "learning";
@@ -981,6 +982,7 @@ function SiteSettings({ draft, setDraft, response, errors, disabled, uploadLogo,
       <label className="form-field"><span>Display time zone</span><select disabled={disabled} value={draft.displayTimeZone} onChange={(event) => update("displayTimeZone", event.target.value)}>{timeZones(draft.displayTimeZone).map((zone) => <option key={zone} value={zone}>{zone}</option>)}</select>{errors.displayTimeZone ? <FieldError text={errors.displayTimeZone} /> : null}</label>
       <div className="read-only-grid"><span>Evidence timestamp</span><strong>UTC ISO-8601</strong><span>Dashboard endpoint</span><strong>{location.origin}</strong><span>SDRconnect</span><strong>{response.infrastructure.receiverUrls.join(", ")}</strong></div>
       <ReportIdentitySection draft={draft} setDraft={setDraft} disabled={disabled} errors={errors} uploadLogo={uploadLogo} onToast={onToast} />
+      <DgnssSettings unlocked={!disabled} onToast={onToast} />
     </section>
   );
 }

@@ -59,6 +59,7 @@ export function drawChartPdf(page: PDFPage, spec: ChartSpec, x: number, top: num
     const x1 = Math.max(box.left, Math.min(scaleX(spec, region.from), scaleX(spec, region.to)));
     const x2 = Math.min(box.left + box.width, Math.max(scaleX(spec, region.from), scaleX(spec, region.to)));
     page.drawRectangle({ x: toPdfX(x1), y: toPdfY(box.top + box.height), width: Math.max(0.6, (x2 - x1) * scale), height: box.height * scale, color: color(region.color), opacity: region.opacity });
+    if (region.label && x2 - x1 > 90) text(region.label, x1 + 6, box.top + box.height - 8, 11, { color: REPORT_COLORS.muted });
   }
   for (const series of spec.series) {
     if (series.kind === "band") {

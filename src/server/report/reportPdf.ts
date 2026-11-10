@@ -5,23 +5,23 @@ import { drawChartPdf } from "./pdfChart";
 import { pdfSafe } from "./format";
 import { hexToRgb01, REPORT_COLORS } from "./theme";
 
-const A4 = { width: 595.28, height: 841.89 };
-const MARGIN = { left: 46, right: 46, top: 62, bottom: 54 };
-const CONTENT_WIDTH = A4.width - MARGIN.left - MARGIN.right;
+export const A4 = { width: 595.28, height: 841.89 };
+export const MARGIN = { left: 46, right: 46, top: 62, bottom: 54 };
+export const CONTENT_WIDTH = A4.width - MARGIN.left - MARGIN.right;
 
 function color(hex: string) {
   const [r, g, b] = hexToRgb01(hex);
   return rgb(r, g, b);
 }
 
-interface Fonts {
+export interface Fonts {
   regular: PDFFont;
   bold: PDFFont;
   mono: PDFFont;
 }
 
 /** Word wrap with a hard break for very long tokens such as hashes. */
-function wrap(value: string, font: PDFFont, size: number, width: number): string[] {
+export function wrap(value: string, font: PDFFont, size: number, width: number): string[] {
   const lines: string[] = [];
   for (const paragraph of pdfSafe(value).split("\n")) {
     let current = "";
@@ -49,7 +49,7 @@ function wrap(value: string, font: PDFFont, size: number, width: number): string
   return lines;
 }
 
-class Layout {
+export class Layout {
   page!: PDFPage;
   y = 0;
   readonly pages: PDFPage[] = [];

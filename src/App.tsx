@@ -1,7 +1,8 @@
-import { CalendarDays, Database, Flag, X } from "lucide-react";
+import { CalendarDays, Database, Flag, FolderArchive, SatelliteDish, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Header } from "./client/Header";
 import { EvidenceArchive, OptionsPanel, type DisplayOptions } from "./client/BottomPanels";
+import { DgnssReports } from "./client/DgnssReports";
 import { IncidentPanel, type PackageDownloadInfo } from "./client/MonitorPanels";
 import { IncidentReportDialog } from "./client/IncidentReportDialog";
 import { NoteModal } from "./client/Modals";
@@ -246,6 +247,8 @@ export function App() {
       throw reason;
     }
   };
+
+  const [evidenceView, setEvidenceView] = useState<"sessions" | "dgnss">("sessions");
 
   const openDetails = (view: DetailsView) => {
     setDetailsView(view);
@@ -509,7 +512,17 @@ export function App() {
               onCopy={(text) => copyText(text).then(() => showTemporaryToast("SHA-256 copied."))}
               exporting={Boolean(selectedEvent && exportingEventId === selectedEvent.id)}
             /> : null}
-            {activeDrawer === "evidence" ? <EvidenceArchive snapshot={snapshot} getArchive={getEvidenceArchive} getSessionEvents={getEvidenceSessionEvents} getReplayBatch={getEvidenceReplayBatch} onOpenIncident={openArchivedIncident} onExportEvent={(archiveEvent) => exportEventPackage(archiveEvent, false)} onExportSession={handleSessionExport} /> : null}
+            {activeDrawer === "evidence" ? (
+              <>
+                <div className="archive-tabs" role="tablist" aria-label="Evidence history views">
+                  <button type="button" role="tab" aria-selected={evidenceView === "sessions"} onClick={() => setEvidenceView("sessions")}><FolderArchive size={14} aria-hidden="true" />Sessions</button>
+                  <button type="button" role="tab" aria-selected={evidenceView === "dgnss"} onClick={() => setEvidenceView("dgnss")}><SatelliteDish size={14} aria-hidden="true" />DGNSS reports</button>
+                </div>
+                {evidenceView === "sessions"
+                  ? <EvidenceArchive snapshot={snapshot} getArchive={getEvidenceArchive} getSessionEvents={getEvidenceSessionEvents} getReplayBatch={getEvidenceReplayBatch} onOpenIncident={openArchivedIncident} onExportEvent={(archiveEvent) => exportEventPackage(archiveEvent, false)} onExportSession={handleSessionExport} />
+                  : <DgnssReports onOpenSettings={() => openSettings("site")} />}
+              </>
+            ) : null}
           </div>
         </DialogShell>
       ) : null}
