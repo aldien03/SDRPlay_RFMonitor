@@ -100,6 +100,8 @@ const WIN_ANSI_EXTRAS = new Set([
 const PDF_REPLACEMENTS: Record<string, string> = {
   "≥": ">=",
   "≤": "<=",
+  // Without this, NFD stripping would turn "≠" into "=" and invert the meaning.
+  "≠": "!=",
   "−": "-",
   "→": "->",
   "←": "<-",

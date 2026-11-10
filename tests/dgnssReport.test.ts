@@ -291,12 +291,12 @@ describe("DGNSS report service", () => {
     expect(report.error).toBeUndefined();
     expect(report.state).toBe("ready");
     const html = await readFile((await svc.file(report.id, "html"))!.path, "utf8");
-    expect(html).toContain("SBS Source Files");
+    expect(html).toContain("A2 · SBS source files");
     expect(html).toContain("Gator data continuity");
     expect(html).toContain("Outside window");
     expect(html).toContain("3 Gator SBS files");
     const zip = await readFile((await svc.file(report.id, "package"))!.path);
-    for (const name of ["input/01_part-a.sbs", "input/02_part-b.sbs", "input/03_part-c.sbs", "manifest.json", "SHA256SUMS.txt"]) expect(zip.includes(Buffer.from(name))).toBe(true);
+    for (const name of ["input/01_part-a.sbs", "input/02_part-b.sbs", "input/03_part-c.sbs", "data/dgps-statistics.csv", "data/events.csv", "data/rf-coverage.csv", "data/sbs-files.csv", "manifest.json", "SHA256SUMS.txt"]) expect(zip.includes(Buffer.from(name))).toBe(true);
   }, 30_000);
 
   it("needs a UTC day or custom window when the files cover more than 24 h", async () => {

@@ -336,6 +336,8 @@ describe("client incident report", () => {
 
   it("keeps PDF text inside the standard font and formats frequencies to the resolution", () => {
     expect(pdfSafe("≥ 6σ − Ωmega Ελλάδα")).toBe(">= 6sigma - ?mega ??????");
+    // "≠" must never lose its stroke and become "=".
+    expect(pdfSafe("PCALC ≠ 5")).toBe("PCALC != 5");
     expect(frequencyRange([1_574_940_000, 1_576_110_000], 19_560)).toBe("1574.94–1576.11 MHz");
   });
 

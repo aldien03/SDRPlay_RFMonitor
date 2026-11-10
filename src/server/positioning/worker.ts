@@ -48,6 +48,7 @@ async function run(input: DgnssWorkerInput): Promise<void> {
     sampleHeap();
     await writeFile(path.join(input.outDir, "report.pdf"), result.pdf, { mode: 0o640 });
     await writeFile(path.join(input.outDir, "report.html"), result.html, { mode: 0o640 });
+    for (const file of result.model.dataFiles) await writeFile(path.join(input.outDir, file.name), file.content, { mode: 0o640 });
     await post({
       type: "done",
       status: result.status,

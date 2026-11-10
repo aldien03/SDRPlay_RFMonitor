@@ -8,7 +8,7 @@
  */
 import type { SbsDataset, SbsShot, SbsSystem } from "./sbs";
 import type { PositioningSystemConfig, PositioningThresholds, ReportWindow, RfEvidence, RfLane, RfLaneState } from "./types";
-import { alongCross, medianOf, referenceTrack, timingProfile, type OffsetSample, type TimingProfile, type TimingRule, type TimingStep, type TrackPoint } from "./underWay";
+import { alongCross, medianOf, referenceTrack, timingProfile, type OffsetSample, type TimingProfile, type TimingRule, type TrackPoint } from "./underWay";
 
 export type { TimingProfile, TimingStep } from "./underWay";
 
@@ -28,7 +28,7 @@ export interface SpreadStats {
   n: number;
 }
 
-export type NavIndicator = "offset" | "sats" | "hdop" | "age" | "pcalc" | "timing";
+export type NavIndicator = "offset" | "sats" | "hdop" | "age" | "pcalc";
 
 export const INDICATOR_LABEL: Record<NavIndicator, string> = {
   offset: "CRP beyond agreement limit",
@@ -36,7 +36,6 @@ export const INDICATOR_LABEL: Record<NavIndicator, string> = {
   hdop: "HDOP raised",
   age: "Correction age raised",
   pcalc: "PCALC change",
-  timing: "Position timing step",
 };
 
 export interface DistanceStats {
@@ -136,8 +135,7 @@ export type EventKind =
   | "correction-link"
   | "single-solution"
   | "rf-only"
-  | "rf-no-nav-data"
-  | "position-timing";
+  | "rf-no-nav-data";
 
 export type EventLevel = "alert" | "check" | "info";
 
@@ -536,7 +534,6 @@ export function analysePositioning(input: {
       set.add(indicator);
       flags.set(time, set);
     };
-    for (const step of timing.excursions) flag(step.timeMs, "timing");
     for (const shot of shots) {
       if (offsetFlagged(system.id, shot.timeMs)) flag(shot.timeMs, "offset");
       if (shot.nsats !== null && quality.sats) {
@@ -647,7 +644,6 @@ export function analysePositioning(input: {
     return (stats.static.n > 0 && stats.static.max > limit)
       || (stats.underWay !== undefined && (stats.underWay.crossMax > limit || Math.abs(stats.underWay.alongSteadyM) > limit));
   }).map((system) => system.id);
-  const timingSystems = systems.filter((system) => system.timing.excursions.length).map((system) => system.id);
   let verdict: string;
   let verdictLevel: PositioningAnalysis["verdictLevel"];
   if (events.some((event) => event.kind === "rf-and-nav-common")) {
@@ -657,7 +653,7 @@ export function analysePositioning(input: {
     verdict = `${exceeding.join(", ")} exceeded ${limitText(thresholds.agreementM)} from control ${controlId}`;
     verdictLevel = "check";
   } else {
-    verdict = `All comparisons within ${limitText(thresholds.agreementM)} of control ${controlId}${timingSystems.length ? `; shot positions not time-aligned under way (${timingSystems.join(", ")})` : ""}; no interference affected positioning`;
+    verdict = `All comparisons within ${limitText(thresholds.agreementM)} of control ${controlId}; no interference affected positioning`;
     verdictLevel = events.some((event) => event.level === "check") ? "check" : "ok";
   }
   return { controlId, dataset, window, thresholds, systems, times, meanCrp, motion, positioningCoverage, flagRuns, events, rf, lanes: laneSummaries, agreementFailures: exceeding, commonTiming, verdict, verdictLevel };
@@ -665,7 +661,7 @@ export function analysePositioning(input: {
 
 /**
  * The distance the agreement check uses, per shot: 2D while static, across
- * track under way (along-track timing is reported separately).
+ * track under way (along-track differences from the logging interval are not assessed).
  */
 export function agreementDistances(system: Pick<SystemAnalysis, "vsControl">): Array<[number, number]> {
   const stats = system.vsControl;
@@ -732,8 +728,7 @@ function correlate(input: {
 }): CorrelatedEvent[] {
   const joinMs = 60_000;
   const items: ClusterItem[] = [
-    // Timing steps are not degradation; they form their own events below.
-    ...input.flagRuns.filter((run) => run.indicator !== "timing").map((run) => ({ fromMs: run.fromMs, toMs: run.toMs, run })),
+    ...input.flagRuns.map((run) => ({ fromMs: run.fromMs, toMs: run.toMs, run })),
     ...input.lanes.flatMap((lane) => lane.intervals.filter((interval) => interval.state === "anomaly").map((interval) => ({ fromMs: interval.fromMs, toMs: interval.toMs, lane }))),
   ].sort((left, right) => left.fromMs - right.fromMs);
 
@@ -861,41 +856,7 @@ function correlate(input: {
     return { fromMs, toMs, kind, level, title, evidence, systems: allNav, indicators, rfLanes: rfShort, rfCoverage: Math.max(0, rfCoverage), explanation, action };
   });
 
-  // Shot positions not time-aligned under way: one event per period, across all systems.
-  const timingRuns = input.flagRuns.filter((run) => run.indicator === "timing").sort((left, right) => left.fromMs - right.fromMs);
-  const timingClusters: NavFlagRun[][] = [];
-  for (const run of timingRuns) {
-    const last = timingClusters.at(-1);
-    if (last && run.fromMs <= Math.max(...last.map((entry) => entry.toMs)) + input.thresholds.mergeGapS * 1000) last.push(run);
-    else timingClusters.push([run]);
-  }
-  const timingEvents: Array<Omit<CorrelatedEvent, "id">> = timingClusters.map((cluster) => {
-    const fromMs = Math.min(...cluster.map((run) => run.fromMs));
-    const toMs = Math.max(...cluster.map((run) => run.toMs));
-    const counts = new Map<string, number>();
-    for (const run of cluster) counts.set(run.systemId, (counts.get(run.systemId) ?? 0) + run.shots);
-    const ranked = [...counts.entries()].sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]));
-    const steps = input.systems.flatMap((system) => system.timing.excursions.filter((step) => step.timeMs >= fromMs && step.timeMs < toMs));
-    const seconds = steps.map((step) => Math.abs(step.seconds)).sort((left, right) => left - right);
-    const typical = seconds.length ? `up to ${percentile(seconds, 0.95).toFixed(1)} s` : "–";
-    const largest = steps.reduce<TimingStep | undefined>((best, step) => (!best || Math.abs(step.alongM) > Math.abs(best.alongM) ? step : best), undefined);
-    return {
-      fromMs,
-      toMs,
-      kind: "position-timing" as const,
-      level: "check" as const,
-      title: "Shot positions not time-aligned under way",
-      evidence: "Navigation only" as const,
-      systems: ranked.map(([id]) => id).sort(),
-      indicators: [INDICATOR_LABEL.timing],
-      rfLanes: [],
-      rfCoverage: 0,
-      explanation: `Positions ${typical} of travel off the shot time along track (shots ≥ ${limitText(Math.min(0.2, input.thresholds.agreementM / 2))}: ${ranked.map(([id, count]) => `${id} ${count}`).join(", ")}${largest ? `; largest ${Math.abs(largest.alongM).toFixed(2)} m at ${largest.knots.toFixed(1)} kn` : ""}); across track normal. Not a position error.`,
-      action: "Check that Gator time-tags each position input and interpolates it to the shot time (receiver output rate, PPS/ZDA, latency).",
-    };
-  });
-
-  return [...navEvents, ...timingEvents]
+  return navEvents
     .sort((left, right) => left.fromMs - right.fromMs || left.toMs - right.toMs)
     .map((event, index) => ({ ...event, id: `E${index + 1}` }));
 }
